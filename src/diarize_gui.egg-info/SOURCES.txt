@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/diarize_gui/__init__.py
+src/diarize_gui/__main__.py
+src/diarize_gui/gui.py
+src/diarize_gui/pipeline.py
+src/diarize_gui/recorder.py
+src/diarize_gui/utils.py
+src/diarize_gui.egg-info/PKG-INFO
+src/diarize_gui.egg-info/SOURCES.txt
+src/diarize_gui.egg-info/dependency_links.txt
+src/diarize_gui.egg-info/entry_points.txt
+src/diarize_gui.egg-info/requires.txt
+src/diarize_gui.egg-info/top_level.txt

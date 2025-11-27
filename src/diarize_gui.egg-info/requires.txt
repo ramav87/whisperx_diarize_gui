@@ -1,0 +1,6 @@
+whisperx
+torch
+torchaudio
+sounddevice
+soundfile
+pyannote.audio

@@ -1,0 +1,44 @@
+Metadata-Version: 2.4
+Name: diarize-gui
+Version: 0.1.0
+Summary: Simple Tkinter GUI for WhisperX transcription + diarization with recording on macOS (and others).
+Author: Rama Vasudevan
+License: MIT
+Project-URL: Homepage, https://example.com/diarize-gui
+Project-URL: Repository, https://example.com/diarize-gui.git
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: whisperx
+Requires-Dist: torch
+Requires-Dist: torchaudio
+Requires-Dist: sounddevice
+Requires-Dist: soundfile
+Requires-Dist: pyannote.audio
+
+# diarize-gui
+
+A simple Tkinter GUI for recording or loading audio, then running
+[WhisperX](https://github.com/m-bain/whisperX) transcription + diarization.
+Designed for Mac M1 but should work elsewhere with compatible dependencies.
+
+## Features
+
+- Select **existing audio** (mp3/wav/m4a/…)
+- Or **record directly** from a microphone
+- Choose **output folder**
+- Select **Whisper model size** (`tiny` → `large-v2`)
+- Toggle `condition_on_previous_text` for Whisper
+- Run WhisperX:
+  - transcription
+  - alignment
+  - diarization (using `pyannote.audio`)
+- Save:
+  - `<basename>_diarized.txt` – human-readable transcript with speaker tags
+  - `<basename>_diarized.json` – full WhisperX result (segments, speakers, timestamps)
+
+## Installation
+
+```bash
+git clone <your-repo-url>
+cd whisperx_diarize_gui
+pip install -e .

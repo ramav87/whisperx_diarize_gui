@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diarize-gui"
+version = "0.1.0"
+description = "Simple Tkinter GUI for WhisperX transcription + diarization with recording on macOS (and others)."
+authors = [
+  { name = "Rama Vasudevan" },
+]
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+dependencies = [
+  "whisperx",
+  "torch",
+  "torchaudio",
+  "sounddevice",
+  "soundfile",
+  "pyannote.audio",
+]
+
+[project.urls]
+Homepage = "https://example.com/diarize-gui"
+Repository = "https://example.com/diarize-gui.git"
+
+[project.scripts]
+diarize-gui = "diarize_gui.gui:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
