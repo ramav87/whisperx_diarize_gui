@@ -14,11 +14,26 @@ class DiarizationApp:
         self.master = master
         master.title("WhisperX Diarization (with Recording)")
 
+        # Profile selection
+        self.profile_frame = tk.Frame(master)
+        self.profile_frame.pack(padx=10, pady=(5, 5), fill="x")
+
+        self.profile_label = tk.Label(self.profile_frame, text="Profile: (none)")
+        self.profile_label.pack(side="left")
+
+        self.profile_button = tk.Button(
+            self.profile_frame,
+            text="Set profile...",
+            command=self.set_profile,
+        )
+        self.profile_button.pack(side="right")
+
+
         self.audio_path = None
         self.output_dir = None
         self.is_recording = False
         self.has_result = False
-        
+        self.profile_name = None
 
         # Status + progress
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -190,6 +205,23 @@ class DiarizationApp:
             return int(idx_str)
         except Exception:
             return None
+
+    def set_profile(self):
+        name = simpledialog.askstring(
+            "Set profile",
+            "Enter profile name (e.g. 'rama', 'spanish_B2', etc.):",
+            parent=self.master,
+        )
+        if not name:
+            return
+
+        name = name.strip()
+        if not name:
+            return
+
+        self.profile_name = name
+        self.profile_label.config(text=f"Profile: {name}")
+
 
     # ---------- File / folder selection ----------
 
@@ -399,8 +431,10 @@ class DiarizationApp:
             self._set_status("Running LLM analysis...")
             self._set_progress(10)
 
-            # You can override model/url via env vars if desired
             analysis_text = self.pipeline.analyze_with_llm(prompt)
+
+            # Save lesson under current profile (if any)
+            self._save_lesson_record(prompt, analysis_text)
 
             # Show result in a scrollable window
             self._show_analysis_window(analysis_text)
@@ -409,6 +443,7 @@ class DiarizationApp:
             self._set_status("Analysis error")
             self._set_progress(0.0)
             self._show_error("Error during analysis", str(e))
+
 
     def _show_analysis_window(self, text: str):
         def create_window():
@@ -443,6 +478,42 @@ class DiarizationApp:
             self._show_info("Export speaker WAVs", f"Speaker files saved in:\n{path}")
         except Exception as e:
             self._show_error("Error exporting speaker audio", str(e))
+
+    def analyze_transcript(self):
+        if not self.has_result:
+            self._show_error("Error", "No result available. Run diarization first.")
+            return
+
+        default_prompt = (
+            "Actúa como un profesor experto de español que analiza una transcripción de una clase 1-a-1.\n\n"
+            "Tareas:\n"
+            "1. Resume brevemente (en español) lo que pasó en la clase (tema, actividades, tono).\n"
+            "2. Identifica los errores del estudiante (gramática, vocabulario, uso de tiempos verbales, preposiciones, "
+            "concordancia, etc.). Cita el fragmento original, propón una versión corregida y explica brevemente el porqué.\n"
+            "3. Señala los puntos fuertes del estudiante.\n"
+            "4. Sugiere 3-5 objetivos concretos para la próxima clase.\n"
+            "5. Da 5–10 frases de ejemplo que el estudiante podría practicar.\n\n"
+            "IMPORTANTE:\n"
+            "- El estudiante es de nivel B1–B2.\n"
+            "- Escribe toda tu respuesta en español.\n"
+            "- Asume que SPEAKER_00 es el estudiante y SPEAKER_01 es el profesor.\n"
+        )
+
+        prompt = simpledialog.askstring(
+            "LLM analysis prompt",
+            "Edita el prompt si quieres, luego pulsa OK:",
+            initialvalue=default_prompt,
+            parent=self.master,
+        )
+        if not prompt:
+            return
+
+        thread = threading.Thread(
+            target=self._run_analysis_thread,
+            args=(prompt,),
+        )
+        thread.daemon = True
+        thread.start()
 
     # ---------- Status & progress (thread-safe) ----------
 
@@ -481,6 +552,62 @@ class DiarizationApp:
             self.export_speaker_button.config(state="disabled")
             self.analyze_button.config(state="disabled")    # NEW
         self.master.after(0, disable)
+
+    def _save_lesson_record(self, prompt: str, analysis_text: str):
+        """
+        Save transcript + LLM feedback + metadata to a per-profile JSON file.
+        """
+        import os
+        from datetime import datetime
+        import json
+
+        if not self.profile_name:
+            # no profile -> skip saving silently, or show a gentle warning
+            self._show_error(
+                "No profile",
+                "No profile is set. Set a profile if you want to track progress over time."
+            )
+            return
+
+        # base dir: ~/.whisperx_diarize_gui/profiles/<profile>/lessons
+        base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
+        profile_dir = os.path.join(base_dir, "profiles", self.profile_name)
+        lesson_dir = os.path.join(profile_dir, "lessons")
+        os.makedirs(lesson_dir, exist_ok=True)
+
+        # timestamp-based filename
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"lesson_{ts}.json"
+        path = os.path.join(lesson_dir, filename)
+
+        # get transcript text from pipeline
+        try:
+            transcript_text = self.pipeline.get_transcript_text(include_speaker=True)
+        except Exception as e:
+            transcript_text = f"<<Error getting transcript: {e}>>"
+
+        # capture env model info (if any)
+        import os as _os
+        llm_model = _os.environ.get("LLM_ANALYSIS_MODEL", "")
+        llm_url = _os.environ.get("LLM_ANALYSIS_URL", "")
+
+        record = {
+            "timestamp": ts,
+            "profile": self.profile_name,
+            "audio_path": self.audio_path,
+            "output_dir": self.output_dir,
+            "llm_model": llm_model,
+            "llm_url": llm_url,
+            "llm_prompt": prompt,
+            "llm_response": analysis_text,
+            "transcript_text": transcript_text,
+        }
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+
+        # Optional: let the user know
+        self._show_info("Lesson saved", f"Lesson record saved to:\n{path}")
 
 
 

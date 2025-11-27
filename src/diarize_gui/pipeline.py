@@ -184,6 +184,24 @@ class DiarizationPipelineRunner:
         self._set_progress(100)
         return txt_path, json_path
 
+    def get_transcript_text(self, include_speaker: bool = True) -> str:
+        """
+        Public wrapper to get the plain-text transcript from last_result.
+        """
+        if not self.last_result or "segments" not in self.last_result:
+            raise ValueError("No transcription result available.")
+        lines = []
+        for seg in self.last_result["segments"]:
+            text = seg.get("text", "").strip()
+            if not text:
+                continue
+            speaker = seg.get("speaker", "")
+            if include_speaker and speaker:
+                lines.append(f"{speaker}: {text}")
+            else:
+                lines.append(text)
+        return "\n".join(lines)
+
     def analyze_with_llm(
         self,
         user_prompt: str,
@@ -280,27 +298,6 @@ class DiarizationPipelineRunner:
                 end = format_timestamp(seg.get("end"))
                 text = seg.get("text", "").strip()
                 f.write(f"[{speaker} {start}-{end}] {text}\n")
-
-    def export_srt(self):
-        if not self.has_result:
-            self._show_error("Error", "No result available. Run diarization first.")
-            return
-
-        default_name = "diarized.srt"
-        path = filedialog.asksaveasfilename(
-            title="Save SRT file",
-            defaultextension=".srt",
-            filetypes=[("SRT subtitles", "*.srt"), ("All files", "*.*")],
-            initialfile=default_name,
-        )
-        if not path:
-            return
-
-        try:
-            self.pipeline.export_srt(path)
-            self._show_info("Export SRT", f"SRT saved to:\n{path}")
-        except Exception as e:
-            self._show_error("Error exporting SRT", str(e))
 
     def _srt_timestamp(self, seconds: Optional[float]) -> str:
         if seconds is None:
