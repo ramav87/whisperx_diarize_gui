@@ -28,7 +28,6 @@ class DiarizationApp:
         )
         self.profile_button.pack(side="right")
 
-
         self.audio_path = None
         self.output_dir = None
         self.is_recording = False
@@ -608,9 +607,6 @@ class DiarizationApp:
 
         # Optional: let the user know
         self._show_info("Lesson saved", f"Lesson record saved to:\n{path}")
-
-
-
 
 def main():
     root = tk.Tk()
