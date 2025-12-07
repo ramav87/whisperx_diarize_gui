@@ -184,8 +184,132 @@ class DiarizationApp:
         )
         self.progress_bar.pack(padx=10, pady=(0, 10), fill="x")
 
-    # ---------- Device helpers ----------
+        # Prompt for profile on startup
+        self.master.after(0, self._prompt_profile_on_startup)
 
+    #------Profile Loading--------
+    def _load_existing_profiles(self):
+        base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
+        profiles_dir = os.path.join(base_dir, "profiles")
+        if not os.path.isdir(profiles_dir):
+            return []
+        names = []
+        for name in os.listdir(profiles_dir):
+            full = os.path.join(profiles_dir, name)
+            if os.path.isdir(full):
+                names.append(name)
+        names.sort()
+        return names
+
+    def _prompt_profile_on_startup(self):
+        """
+        On app startup, prompt the user to select an existing profile
+        or create a new one.
+        """
+        existing = self._load_existing_profiles()
+
+        win = tk.Toplevel(self.master)
+        win.title("Select profile")
+        win.geometry("400x300")
+        win.transient(self.master)
+        win.grab_set()  # make it modal
+
+        tk.Label(
+            win,
+            text="Select your profile or create a new one:",
+        ).pack(padx=10, pady=(10, 5), anchor="w")
+
+        # Listbox for existing profiles
+        list_frame = tk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+
+        self._profile_listbox = tk.Listbox(list_frame, height=8)
+        self._profile_listbox.pack(side="left", fill="both", expand=True)
+
+        scroll = tk.Scrollbar(list_frame, command=self._profile_listbox.yview)
+        scroll.pack(side="right", fill="y")
+        self._profile_listbox.configure(yscrollcommand=scroll.set)
+
+        for name in existing:
+            self._profile_listbox.insert("end", name)
+
+        # New profile entry
+        new_frame = tk.Frame(win)
+        new_frame.pack(fill="x", padx=10, pady=(5, 5))
+
+        tk.Label(new_frame, text="New profile name (optional):").pack(anchor="w")
+        new_entry = tk.Entry(new_frame)
+        new_entry.pack(fill="x")
+
+        # Buttons
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(fill="x", padx=10, pady=(10, 10))
+
+        chosen = {"name": None}
+
+        def on_ok():
+            # Prefer new profile name if provided
+            new_name = new_entry.get().strip()
+            if new_name:
+                chosen["name"] = new_name
+            else:
+                sel = self._profile_listbox.curselection()
+                if sel:
+                    chosen["name"] = self._profile_listbox.get(sel[0])
+                else:
+                    messagebox.showerror(
+                        "Profile required",
+                        "Please select an existing profile or enter a new profile name.",
+                        parent=win,
+                    )
+                    return
+            win.destroy()
+
+        def on_cancel():
+            # If user cancels everything, we can either leave profile as None
+            # or force them to choose; here we'll just leave as None.
+            win.destroy()
+
+        ok_btn = tk.Button(btn_frame, text="OK", command=on_ok)
+        ok_btn.pack(side="right", padx=(5, 0))
+        cancel_btn = tk.Button(btn_frame, text="Cancel", command=on_cancel)
+        cancel_btn.pack(side="right")
+
+        # Double-click support: choose selected profile
+        def on_double_click(event):
+            sel = self._profile_listbox.curselection()
+            if not sel:
+                return
+            chosen["name"] = self._profile_listbox.get(sel[0])
+            win.destroy()
+
+        self._profile_listbox.bind("<Double-Button-1>", on_double_click)
+
+        # Center on parent
+        self.master.update_idletasks()
+        x = self.master.winfo_rootx()
+        y = self.master.winfo_rooty()
+        w = self.master.winfo_width()
+        h = self.master.winfo_height()
+        win.update_idletasks()
+        ww = win.winfo_width()
+        wh = win.winfo_height()
+        win.geometry(f"+{x + (w - ww) // 2}+{y + (h - wh) // 2}")
+
+        # Block until closed
+        self.master.wait_window(win)
+
+        # After dialog closes, set profile if chosen
+        if chosen["name"]:
+            self.profile_name = chosen["name"]
+            self.profile_label.config(text=f"Profile: {self.profile_name}")
+        else:
+            # If still None, you can either leave it or force a fallback
+            # We'll just leave "(none)" and let user set it later.
+            pass
+
+
+    #---------- Device helpers ----------
     def _populate_device_menu(self):
         menu = self.device_menu["menu"]
         menu.delete(0, "end")
@@ -452,12 +576,47 @@ class DiarizationApp:
         spk_label = tk.Label(spk_frame, text="Select speaker IDs that correspond to YOU (student):")
         spk_label.pack(anchor="w")
 
+        # Character count label
+        self._char_count_label = tk.Label(spk_frame, text="Selected student text: 0 characters")
+        self._char_count_label.pack(anchor="w", pady=(2, 5))
+
         self._analysis_speaker_vars = {}
+
+        # We'll define update_char_count first so we can use it as Checkbutton command
+        def update_char_count():
+            selected = [spk for spk, var in self._analysis_speaker_vars.items() if var.get()]
+            try:
+                text = self.pipeline.get_transcript_text(
+                    include_speaker=True,
+                    speaker_filters=selected if selected else None,
+                    max_chars=None,  # full length, no truncation
+                )
+            except Exception as e:
+                text = ""
+            length = len(text)
+
+            # Keep this in sync with DEFAULT_MAX_CHARS in pipeline.py
+            max_chars = 8000
+            if length <= max_chars:
+                msg = f"Selected student text: {length} characters (max {max_chars}; OK)"
+            else:
+                msg = f"Selected student text: {length} characters (max {max_chars}; WILL BE TRUNCATED)"
+            self._char_count_label.config(text=msg)
+
+        # Now create the checkboxes
         for spk in speakers:
             var = tk.BooleanVar(value=(spk == "SPEAKER_00"))  # default guess
-            cb = tk.Checkbutton(spk_frame, text=spk, variable=var)
+            cb = tk.Checkbutton(
+                spk_frame,
+                text=spk,
+                variable=var,
+                command=update_char_count,  # update count when toggled
+            )
             cb.pack(anchor="w")
             self._analysis_speaker_vars[spk] = var
+
+        # Call once to initialize the count with default selection
+        update_char_count()
 
         # Prompt + language
         right_frame = tk.Frame(mid_frame)

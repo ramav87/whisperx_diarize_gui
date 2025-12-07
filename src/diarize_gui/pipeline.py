@@ -13,6 +13,7 @@ from .utils import detect_device, format_timestamp
 StatusCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
 TIME_PATTERN = re.compile(r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\.(?P<ms>\d{3})")
+DEFAULT_MAX_CHARS = 8000
 
 def parse_time_to_seconds(t: str) -> float:
     """
@@ -300,7 +301,7 @@ class DiarizationPipelineRunner:
         api_url: Optional[str] = None,
         api_key: Optional[str] = None,
         speakers: Optional[List[str]] = None,
-        max_chars: int = 8000,
+        max_chars: int = DEFAULT_MAX_CHARS,
     ) -> str:
         """
         Call a local/remote LLM to analyze the last transcript.
