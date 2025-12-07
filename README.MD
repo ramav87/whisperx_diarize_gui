@@ -15,12 +15,12 @@ This application allows you to record or load audio, transcribe it using Whisper
    ```bash
    export HUGGINGFACE_TOKEN="your_hf_token_here"
 
-Usage Workflow
-1. Profile Selection
+## Usage Workflow
+1. **Profile Selection**
 
 On launch, select an existing profile (e.g., "Spanish_Lessons") or create a new one. This saves your lesson history separately.
 
-2. Audio Input
+2. **Audio Input**
 
 Recording:
 
@@ -34,7 +34,7 @@ Existing File:
 
 Click Select Existing Audio File to load .mp3, .wav, or .m4a files.
 
-3. Run Transcription
+3. **Run Transcription**
 
 Select Output Folder: Choose where files will be saved.
 
@@ -44,7 +44,7 @@ Run: Click Run Transcription + Diarization.
 
 Note: The first run may take time to download the Whisper models.
 
-4. LLM Analysis
+4. **LLM Analysis**
 
 Once transcription is done, the Analyze transcript with LLM button becomes active.
 
@@ -60,6 +60,6 @@ Edit Prompt: You can customize the instructions sent to the AI.
 
 Click OK (Analyze). The result will appear in a new window and be saved to your history.
 
-5. Review History
+5. **Review History**
 
 Click View lesson history at the top to see past transcripts and AI feedback.
