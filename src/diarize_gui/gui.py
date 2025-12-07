@@ -657,36 +657,9 @@ class DiarizationApp:
             self._show_error("Error", "No result available. Run diarization first.")
             return
 
-            default_prompt = (
-            "Eres un profesor experto de español analizando la transcripción de una clase 1-a-1.\n\n"
-            "INSTRUCCIONES (muy importantes):\n"
-            "1. NO hagas un resumen general largo. Como máximo, una o dos frases de resumen.\n"
-            "2. El objetivo principal es analizar el español del ESTUDIANTE (no del profesor).\n"
-            "3. Céntrate en:\n"
-            "   - Errores gramaticales (tiempos verbales, concordancia, preposiciones, pronombres, etc.)\n"
-            "   - Errores o carencias de vocabulario\n"
-            "   - Frases que suenan poco naturales y cómo mejorarlas\n"
-            "4. Para cada tipo de error, haz esto:\n"
-            "   - Cita el fragmento original del estudiante.\n"
-            "   - Propón una versión corregida o más natural.\n"
-            "   - Explica brevemente por qué es mejor.\n"
-            "5. Después, menciona los puntos fuertes del estudiante (qué hace bien).\n"
-            "6. Termina con 3-5 objetivos concretos para la próxima clase y 5-10 frases de ejemplo para practicar.\n\n"
-            "Formato sugerido:\n"
-            "A) Resumen (1-2 frases máximo)\n"
-            "B) Errores y correcciones (en viñetas)\n"
-            "C) Puntos fuertes\n"
-            "D) Objetivos para la próxima clase\n"
-            "E) Frases de ejemplo para practicar\n\n"
-            "Escribe TODA la respuesta en español y no incluyas la transcripción completa (solo fragmentos cuando sea necesario).\n"
-            "Asume que SPEAKER_00 es el estudiante.\n"
-            )
-
-
         prompt = simpledialog.askstring(
             "LLM analysis prompt",
             "Edita el prompt si quieres, luego pulsa OK:",
-            initialvalue=default_prompt,
             parent=self.master,
         )
         if not prompt:
