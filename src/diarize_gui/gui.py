@@ -55,6 +55,14 @@ class DiarizationApp:
         )
         self.audio_button.pack(padx=10, pady=5, fill="x")
 
+                # Load existing diarized TXT
+        self.load_txt_button = tk.Button(
+            master,
+            text="Load diarized TXT for analysis",
+            command=self.load_diarized_txt,
+        )
+        self.load_txt_button.pack(padx=10, pady=5, fill="x")
+
         # Output folder
         self.output_label = tk.Label(master, text="Output folder: (none selected)")
         self.output_label.pack(padx=10, pady=5, anchor="w")
@@ -286,6 +294,47 @@ class DiarizationApp:
             )
 
     # ---------- Diarization ----------
+    def load_diarized_txt(self):
+        """
+        Let the user pick an existing diarized TXT file and
+        load it into the pipeline so that LLM analysis can run
+        without processing audio.
+        """
+        path = filedialog.askopenfilename(
+            title="Select diarized TXT file",
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            self.pipeline.load_segments_from_txt(path)
+            self.audio_path = None  # no underlying audio (optional)
+            self.output_dir = os.path.dirname(path)
+
+            # update labels so it's clear we're working from TXT
+            self.audio_label.config(
+                text=f"Loaded TXT: {os.path.basename(path)}"
+            )
+            self.output_label.config(
+                text=f"Output folder: {self.output_dir}"
+            )
+
+            # we have a 'result' now (from TXT, not from pipeline)
+            self.has_result = True
+
+            # enable exports and analysis—speaker WAVs won't work without diar_df
+            self._enable_export_buttons()
+
+            # status update
+            self._set_status("Diarized TXT loaded; ready for analysis.")
+
+        except Exception as e:
+            self._show_error("Error loading TXT", str(e))
+
 
     def run_diarization(self):
         if self.is_recording:
@@ -676,8 +725,13 @@ class DiarizationApp:
         def enable():
             self.export_srt_button.config(state="normal")
             self.export_txt_button.config(state="normal")
-            self.export_speaker_button.config(state="normal")
-            self.analyze_button.config(state="normal")      # NEW
+            self.analyze_button.config(state="normal")
+
+            # Only enable speaker WAVs if we have diarization dataframe (from full pipeline)
+            if self.pipeline.last_diar_df is not None:
+                self.export_speaker_button.config(state="normal")
+            else:
+                self.export_speaker_button.config(state="disabled")
         self.master.after(0, enable)
 
     def _disable_export_buttons(self):
@@ -685,8 +739,9 @@ class DiarizationApp:
             self.export_srt_button.config(state="disabled")
             self.export_txt_button.config(state="disabled")
             self.export_speaker_button.config(state="disabled")
-            self.analyze_button.config(state="disabled")    # NEW
+            self.analyze_button.config(state="disabled")
         self.master.after(0, disable)
+
 
     def _save_lesson_record(self, prompt: str, analysis_text: str):
         """
