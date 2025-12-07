@@ -1,18 +1,31 @@
 import os
 import json
+import re
 from typing import Callable, Optional, List
-
 import numpy as np
 import pandas as pd
 import soundfile as sf
 import whisperx
 from pyannote.audio import Pipeline
 import requests  # NEW
-
 from .utils import detect_device, format_timestamp
 
 StatusCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
+TIME_PATTERN = re.compile(r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\.(?P<ms>\d{3})")
+
+def parse_time_to_seconds(t: str) -> float:
+    """
+    Parse 'HH:MM:SS.mmm' into seconds as float.
+    """
+    m = TIME_PATTERN.match(t.strip())
+    if not m:
+        return 0.0
+    h = int(m.group("h"))
+    m_ = int(m.group("m"))
+    s = int(m.group("s"))
+    ms = int(m.group("ms"))
+    return h * 3600 + m_ * 60 + s + ms / 1000.0
 
 
 class DiarizationPipelineRunner:
@@ -64,6 +77,59 @@ class DiarizationPipelineRunner:
             else:
                 lines.append(text)
         return "\n".join(lines)
+
+    def load_segments_from_txt(self, txt_path: str):
+        """
+        Load a diarized TXT file of the form:
+        [SPEAKER_00 00:00:00.031 - 00:00:04.017] text...
+
+        and populate last_result with segments so that
+        analysis/export can work without running the full pipeline.
+        """
+        if not os.path.isfile(txt_path):
+            raise FileNotFoundError(f"TXT file not found: {txt_path}")
+
+        segments = []
+        pattern = re.compile(
+            r"^\[(?P<speaker>\S+)\s+(?P<start>\d{2}:\d{2}:\d{2}\.\d{3})\s*-\s*"
+            r"(?P<end>\d{2}:\d{2}:\d{2}\.\d{3})\]\s*(?P<text>.*)$"
+        )
+
+        with open(txt_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                m = pattern.match(line)
+                if not m:
+                    # skip unrecognized lines
+                    continue
+                speaker = m.group("speaker")
+                start_s = parse_time_to_seconds(m.group("start"))
+                end_s = parse_time_to_seconds(m.group("end"))
+                text = m.group("text")
+
+                segments.append(
+                    {
+                        "start": float(start_s),
+                        "end": float(end_s),
+                        "speaker": speaker,
+                        "text": text,
+                    }
+                )
+
+        if not segments:
+            raise ValueError("No segments could be parsed from TXT file.")
+
+        # minimal last_result structure
+        self.last_result = {"segments": segments}
+        self.last_diar_df = None
+        self.last_audio_path = None
+        self.last_output_dir = os.path.dirname(txt_path)
+
+        # let the UI know we did something
+        self._set_status("Loaded segments from TXT")
+        self._set_progress(100)
 
 
     def process_audio(
