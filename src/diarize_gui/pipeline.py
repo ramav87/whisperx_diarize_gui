@@ -7,7 +7,7 @@ import pandas as pd
 import soundfile as sf
 import whisperx
 from pyannote.audio import Pipeline
-import requests  # NEW
+import requests
 from .utils import detect_device, format_timestamp
 
 StatusCallback = Callable[[str], None]
@@ -60,10 +60,6 @@ class DiarizationPipelineRunner:
             self.progress_callback(value)
 
     def _build_transcript_text(self, include_speaker: bool = True) -> str:
-        """
-        Build a plain-text transcript from the last_result.
-        Each line: optional SPEAKER + text.
-        """
         if not self.last_result or "segments" not in self.last_result:
             raise ValueError("No transcription result available for analysis.")
 
@@ -80,13 +76,6 @@ class DiarizationPipelineRunner:
         return "\n".join(lines)
 
     def load_segments_from_txt(self, txt_path: str):
-        """
-        Load a diarized TXT file of the form:
-        [SPEAKER_00 00:00:00.031 - 00:00:04.017] text...
-
-        and populate last_result with segments so that
-        analysis/export can work without running the full pipeline.
-        """
         if not os.path.isfile(txt_path):
             raise FileNotFoundError(f"TXT file not found: {txt_path}")
 
@@ -103,7 +92,6 @@ class DiarizationPipelineRunner:
                     continue
                 m = pattern.match(line)
                 if not m:
-                    # skip unrecognized lines
                     continue
                 speaker = m.group("speaker")
                 start_s = parse_time_to_seconds(m.group("start"))
@@ -122,13 +110,11 @@ class DiarizationPipelineRunner:
         if not segments:
             raise ValueError("No segments could be parsed from TXT file.")
 
-        # minimal last_result structure
         self.last_result = {"segments": segments}
         self.last_diar_df = None
         self.last_audio_path = None
         self.last_output_dir = os.path.dirname(txt_path)
 
-        # let the UI know we did something
         self._set_status("Loaded segments from TXT")
         self._set_progress(100)
 
@@ -140,23 +126,16 @@ class DiarizationPipelineRunner:
         model_size: str = "small",
         hf_token: Optional[str] = None,
         ):
-        """
-        Run transcription + alignment + diarization on the given audio file.
-
-        Returns (txt_path, json_path) on success and stores last_result internally.
-        """
         if hf_token is None or not hf_token.strip():
             raise ValueError(
                 "HUGGINGFACE_TOKEN is not set. Please export it or pass it explicitly."
             )
 
-        # remember for export functions
         self.last_audio_path = audio_path
         self.last_output_dir = output_dir
         self.last_result = None
         self.last_diar_df = None
 
-        # ---- Device & model setup ----
         self._set_status("Detecting device...")
         self._set_progress(5)
         device = detect_device()
@@ -168,17 +147,14 @@ class DiarizationPipelineRunner:
             model_size, device=device, compute_type=compute_type
         )
 
-        # ---- Load audio ----
         self._set_status("Loading audio...")
         self._set_progress(25)
         audio = whisperx.load_audio(audio_path)
 
-        # ---- Transcription ----
         self._set_status("Transcribing...")
         self._set_progress(50)
         result = model.transcribe(audio)
 
-        # ---- Alignment ----
         self._set_status("Loading alignment model...")
         self._set_progress(60)
         align_model, metadata = whisperx.load_align_model(
@@ -196,7 +172,6 @@ class DiarizationPipelineRunner:
             return_char_alignments=False,
         )
 
-        # ---- Diarization (pyannote → DataFrame → whisperx) ----
         self._set_status("Running diarization (this may take a while)...")
         self._set_progress(85)
 
@@ -222,11 +197,9 @@ class DiarizationPipelineRunner:
         self._set_status("Assigning speakers to words/segments...")
         result = whisperx.assign_word_speakers(diarize_df, result)
 
-        # store for later exports
         self.last_result = result
         self.last_diar_df = diarize_df
 
-        # ---- Save outputs ----
         self._set_status("Saving output files...")
         self._set_progress(95)
         os.makedirs(output_dir, exist_ok=True)
@@ -234,7 +207,6 @@ class DiarizationPipelineRunner:
         txt_path = os.path.join(output_dir, f"{basename}_diarized.txt")
         json_path = os.path.join(output_dir, f"{basename}_diarized.json")
 
-        # 1) Human-readable txt
         with open(txt_path, "w", encoding="utf-8") as f:
             for seg in result.get("segments", []):
                 speaker = seg.get("speaker", "UNKNOWN")
@@ -243,7 +215,6 @@ class DiarizationPipelineRunner:
                 text = seg.get("text", "").strip()
                 f.write(f"[{speaker} {start} - {end}] {text}\n")
 
-        # 2) Full JSON
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
@@ -257,13 +228,6 @@ class DiarizationPipelineRunner:
         speaker_filters: Optional[List[str]] = None,
         max_chars: Optional[int] = None,
         ) -> str:
-        """
-        Build a plain-text transcript from the last_result.
-
-        - include_speaker: prefix each line with SPEAKER_XX:
-        - speaker_filters: if set (e.g. ['SPEAKER_00', 'SPEAKER_02']), only include those speakers.
-        - max_chars: if set, truncate to the LAST max_chars characters (keep the tail).
-        """
         if not self.last_result or "segments" not in self.last_result:
             raise ValueError("No transcription result available.")
 
@@ -291,26 +255,47 @@ class DiarizationPipelineRunner:
             transcript = transcript[-max_chars:]
 
         return transcript
+    
+    # --- NEW: Check model availability ---
+    def check_ollama_model_availability(self, model_name: str, api_url: str) -> bool:
+        """
+        Returns True if model_name is found in local Ollama tags.
+        Returns False otherwise (or if Ollama is unreachable).
+        """
+        # Usually api_url is http://localhost:11434/api/generate
+        # We need the tags endpoint: http://localhost:11434/api/tags
+        base_url = api_url.rsplit("/api/", 1)[0]
+        tags_url = f"{base_url}/api/tags"
 
-
+        try:
+            resp = requests.get(tags_url, timeout=3)
+            if resp.status_code != 200:
+                return False
+            data = resp.json()
+            # data['models'] is a list of dicts: [{'name': 'mistral:latest', ...}, ...]
+            available_models = [m.get("name", "") for m in data.get("models", [])]
+            
+            # Simple check: exact match or match before colon
+            # e.g. "mistral" matches "mistral:latest"
+            for avail in available_models:
+                if avail == model_name:
+                    return True
+                if ":" in avail and avail.split(":")[0] == model_name:
+                    return True
+            return False
+        except Exception:
+            # If Ollama is down or network error, assume False
+            return False
 
     def analyze_with_llm(
         self,
         user_prompt: str,
-        model: Optional[str] = None,
+        model: Optional[str] = "mistral",
         api_url: Optional[str] = None,
         api_key: Optional[str] = None,
         speakers: Optional[List[str]] = None,
         max_chars: int = DEFAULT_MAX_CHARS,
     ) -> str:
-        """
-        Call a local/remote LLM to analyze the last transcript.
-
-        - user_prompt: your instruction text
-        - speakers: list of speakers to include (e.g. ['SPEAKER_00', 'SPEAKER_02']).
-          If None, all speakers are included.
-        - max_chars: approximate upper bound on transcript length.
-        """
         if not user_prompt.strip():
             raise ValueError("Prompt is empty.")
 
@@ -332,6 +317,8 @@ class DiarizationPipelineRunner:
         api_url = api_url or os.environ.get(
             "LLM_ANALYSIS_URL", "http://localhost:11434/api/generate"
         )
+        
+        # Override env var if model is passed
         model = model or os.environ.get("LLM_ANALYSIS_MODEL", "mistral")
 
         headers = {}
@@ -344,7 +331,7 @@ class DiarizationPipelineRunner:
             "stream": False,
         }
 
-        self._set_status("Calling analysis model...")
+        self._set_status(f"Calling analysis model ({model})...")
         self._set_progress(50)
 
         import requests
@@ -371,14 +358,8 @@ class DiarizationPipelineRunner:
         self._set_progress(100)
         return text
 
-
-
-
-    # ---------- Export helpers ----------
+    # ---------- Export helpers (unchanged) ----------
     def export_txt(self, txt_path: str):
-        """
-        Export a simple speaker-labeled plain text file.
-        """
         if not self.last_result or "segments" not in self.last_result:
             raise ValueError("No transcription result available for TXT export.")
 
@@ -406,9 +387,6 @@ class DiarizationPipelineRunner:
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
     def export_srt(self, srt_path: str):
-        """
-        Export last_result as an SRT subtitle file with speaker labels.
-        """
         if not self.last_result or "segments" not in self.last_result:
             raise ValueError("No transcription result available for SRT export.")
 
@@ -433,17 +411,13 @@ class DiarizationPipelineRunner:
                 idx += 1
 
     def export_speaker_audios(self, output_dir: str):
-        """
-        Export separate WAV files for each speaker by concatenating their segments.
-        """
         if self.last_diar_df is None or self.last_audio_path is None:
             raise ValueError("No diarization/audio available for speaker export.")
 
         os.makedirs(output_dir, exist_ok=True)
 
-        # load mono 16 kHz audio via whisperx
         audio = whisperx.load_audio(self.last_audio_path)
-        sr = 16000  # whisperx.load_audio default
+        sr = 16000
 
         basename = os.path.splitext(os.path.basename(self.last_audio_path))[0]
 
@@ -461,4 +435,3 @@ class DiarizationPipelineRunner:
             speaker_audio = np.concatenate(chunks)
             out_path = os.path.join(output_dir, f"{basename}_{speaker}.wav")
             sf.write(out_path, speaker_audio, sr)
-
