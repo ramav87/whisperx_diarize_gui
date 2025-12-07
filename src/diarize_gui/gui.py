@@ -7,8 +7,6 @@ from tkinter import ttk  # for Progressbar
 from .recorder import AudioRecorder
 from .pipeline import DiarizationPipelineRunner
 
-
-
 class DiarizationApp:
     def __init__(self, master: tk.Tk):
         self.master = master
@@ -27,6 +25,14 @@ class DiarizationApp:
             command=self.set_profile,
         )
         self.profile_button.pack(side="right")
+
+                # View history for current profile
+        self.history_button = tk.Button(
+            master,
+            text="View lesson history",
+            command=self.view_history,
+        )
+        self.history_button.pack(padx=10, pady=(0, 5), fill="x")
 
         self.audio_path = None
         self.output_dir = None
@@ -417,6 +423,225 @@ class DiarizationApp:
                 text=f"Audio file (recorded): {os.path.basename(recorded_file)}"
             )
 
+    #-----History Viewer-----
+    def view_history(self):
+        """
+        Show a window listing all saved lessons for the current profile.
+        Selecting a lesson lets you open transcript + feedback.
+        """
+        if not self.profile_name:
+            self._show_error(
+                "No profile",
+                "No profile is set. Please select or create a profile first."
+            )
+            return
+
+        base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
+        profile_dir = os.path.join(base_dir, "profiles", self.profile_name)
+        lesson_dir = os.path.join(profile_dir, "lessons")
+
+        if not os.path.isdir(lesson_dir):
+            self._show_error(
+                "No lessons",
+                f"No lessons found for profile '{self.profile_name}'."
+            )
+            return
+
+        import json
+        from datetime import datetime
+
+        lessons = []
+        for fname in os.listdir(lesson_dir):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(lesson_dir, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+
+            ts = data.get("timestamp", "")
+            audio_path = data.get("audio_path", "")
+            llm_model = data.get("llm_model", "")
+
+            # Build a readable label
+            # Try to make timestamp human-friendly
+            try:
+                dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+                ts_human = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts_human = ts
+
+            audio_name = os.path.basename(audio_path) if audio_path else "(no audio)"
+            label = f"{ts_human}  |  {audio_name}  |  {llm_model}"
+
+            lessons.append(
+                {
+                    "path": path,
+                    "label": label,
+                    "timestamp": ts,
+                    "audio_name": audio_name,
+                    "llm_model": llm_model,
+                    "data": data,
+                }
+            )
+
+        if not lessons:
+            self._show_error(
+                "No lessons",
+                f"No valid lesson records found for profile '{self.profile_name}'."
+            )
+            return
+
+        # Sort by timestamp descending (latest first)
+        lessons.sort(key=lambda x: x["timestamp"], reverse=True)
+        self._history_lessons = lessons  # store for callbacks
+
+        # Create history window
+        win = tk.Toplevel(self.master)
+        win.title(f"Lesson history – {self.profile_name}")
+        win.geometry("700x400")
+
+        tk.Label(
+            win,
+            text=f"Lessons for profile '{self.profile_name}':",
+        ).pack(anchor="w", padx=10, pady=(10, 5))
+
+        list_frame = tk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+
+        self._history_listbox = tk.Listbox(list_frame, height=15)
+        self._history_listbox.pack(side="left", fill="both", expand=True)
+
+        scroll = tk.Scrollbar(list_frame, command=self._history_listbox.yview)
+        scroll.pack(side="right", fill="y")
+        self._history_listbox.configure(yscrollcommand=scroll.set)
+
+        # Fill listbox
+        for lesson in lessons:
+            self._history_listbox.insert("end", lesson["label"])
+
+        # Buttons
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(fill="x", padx=10, pady=(5, 10))
+
+        def on_open():
+            sel = self._history_listbox.curselection()
+            if not sel:
+                messagebox.showerror("No selection", "Please select a lesson to open.")
+                return
+            idx = sel[0]
+            lesson = self._history_lessons[idx]
+            self._open_lesson_detail(lesson)
+
+        def on_close():
+            win.destroy()
+
+        open_btn = tk.Button(btn_frame, text="Open lesson", command=on_open)
+        open_btn.pack(side="right", padx=(5, 0))
+        close_btn = tk.Button(btn_frame, text="Close", command=on_close)
+        close_btn.pack(side="right")
+
+        # Double-click support
+        def on_double_click(event):
+            sel = self._history_listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            lesson = self._history_lessons[idx]
+            self._open_lesson_detail(lesson)
+
+        self._history_listbox.bind("<Double-Button-1>", on_double_click)
+
+    #---Lesson details Window----
+    def _open_lesson_detail(self, lesson_record: dict):
+        """
+        Open a window showing transcript text and LLM feedback
+        for a given lesson record.
+        """
+        data = lesson_record.get("data", {})
+        transcript_text = data.get("transcript_text", "(no transcript_text in record)")
+        llm_response = data.get("llm_response", "(no llm_response in record)")
+        llm_prompt = data.get("llm_prompt", "")
+        ts = data.get("timestamp", "")
+        audio_path = data.get("audio_path", "")
+        llm_model = data.get("llm_model", "")
+
+        win = tk.Toplevel(self.master)
+        title = f"Lesson detail – {ts}"
+        if audio_path:
+            title += f" – {os.path.basename(audio_path)}"
+        win.title(title)
+        win.geometry("1000x700")
+
+        # Top: metadata
+        meta_frame = tk.Frame(win)
+        meta_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        meta_lines = []
+        meta_lines.append(f"Profile: {self.profile_name}")
+        if ts:
+            meta_lines.append(f"Timestamp: {ts}")
+        if audio_path:
+            meta_lines.append(f"Audio: {audio_path}")
+        if llm_model:
+            meta_lines.append(f"LLM model: {llm_model}")
+
+        tk.Label(meta_frame, text=" | ".join(meta_lines), wraplength=900, justify="left").pack(
+            anchor="w"
+        )
+
+        # Middle: two panes (Transcript / Feedback)
+        main_frame = tk.Frame(win)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+
+        # Left: transcript
+        left_frame = tk.Frame(main_frame)
+        left_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+
+        tk.Label(left_frame, text="Transcript (student + others, stored at analysis time):").pack(
+            anchor="w"
+        )
+
+        transcript_box = tk.Text(left_frame, wrap="word")
+        transcript_box.pack(side="left", fill="both", expand=True)
+
+        t_scroll = tk.Scrollbar(left_frame, command=transcript_box.yview)
+        t_scroll.pack(side="right", fill="y")
+        transcript_box.configure(yscrollcommand=t_scroll.set)
+
+        transcript_box.insert("1.0", transcript_text)
+        transcript_box.config(state="disabled")
+
+        # Right: feedback
+        right_frame = tk.Frame(main_frame)
+        right_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
+
+        tk.Label(right_frame, text="LLM feedback:").pack(anchor="w")
+
+        feedback_box = tk.Text(right_frame, wrap="word")
+        feedback_box.pack(side="left", fill="both", expand=True)
+
+        f_scroll = tk.Scrollbar(right_frame, command=feedback_box.yview)
+        f_scroll.pack(side="right", fill="y")
+        feedback_box.configure(yscrollcommand=f_scroll.set)
+
+        feedback_box.insert("1.0", llm_response)
+        feedback_box.config(state="disabled")
+
+        # Optional: show prompt in a separate window or below
+        if llm_prompt:
+            prompt_frame = tk.Frame(win)
+            prompt_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+            tk.Label(prompt_frame, text="Prompt used for this analysis:").pack(anchor="w")
+
+            prompt_box = tk.Text(prompt_frame, wrap="word", height=5)
+            prompt_box.pack(fill="x")
+            prompt_box.insert("1.0", llm_prompt)
+            prompt_box.config(state="disabled")
+
     # ---------- Diarization ----------
     def load_diarized_txt(self):
         """
@@ -596,7 +821,7 @@ class DiarizationApp:
             length = len(text)
 
             # Keep this in sync with DEFAULT_MAX_CHARS in pipeline.py
-            max_chars = 8000
+            max_chars = 20000
             if length <= max_chars:
                 msg = f"Selected student text: {length} characters (max {max_chars}; OK)"
             else:

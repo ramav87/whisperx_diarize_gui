@@ -13,7 +13,7 @@ from .utils import detect_device, format_timestamp
 StatusCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
 TIME_PATTERN = re.compile(r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\.(?P<ms>\d{3})")
-DEFAULT_MAX_CHARS = 8000
+DEFAULT_MAX_CHARS = 20000
 
 def parse_time_to_seconds(t: str) -> float:
     """
