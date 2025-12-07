@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Callable, Optional
+from typing import Callable, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -184,23 +184,48 @@ class DiarizationPipelineRunner:
         self._set_progress(100)
         return txt_path, json_path
 
-    def get_transcript_text(self, include_speaker: bool = True) -> str:
+    def get_transcript_text(
+        self,
+        include_speaker: bool = True,
+        speaker_filters: Optional[List[str]] = None,
+        max_chars: Optional[int] = None,
+        ) -> str:
         """
-        Public wrapper to get the plain-text transcript from last_result.
+        Build a plain-text transcript from the last_result.
+
+        - include_speaker: prefix each line with SPEAKER_XX:
+        - speaker_filters: if set (e.g. ['SPEAKER_00', 'SPEAKER_02']), only include those speakers.
+        - max_chars: if set, truncate to the LAST max_chars characters (keep the tail).
         """
         if not self.last_result or "segments" not in self.last_result:
             raise ValueError("No transcription result available.")
+
+        allowed = set(speaker_filters) if speaker_filters else None
+
         lines = []
         for seg in self.last_result["segments"]:
             text = seg.get("text", "").strip()
             if not text:
                 continue
+
             speaker = seg.get("speaker", "")
+
+            if allowed is not None and speaker not in allowed:
+                continue
+
             if include_speaker and speaker:
                 lines.append(f"{speaker}: {text}")
             else:
                 lines.append(text)
-        return "\n".join(lines)
+
+        transcript = "\n".join(lines)
+
+        if max_chars is not None and len(transcript) > max_chars:
+            transcript = transcript[-max_chars:]
+
+        return transcript
+
+
 
     def analyze_with_llm(
         self,
@@ -208,34 +233,39 @@ class DiarizationPipelineRunner:
         model: Optional[str] = None,
         api_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        speakers: Optional[List[str]] = None,
+        max_chars: int = 8000,
     ) -> str:
         """
         Call a local/remote LLM to analyze the last transcript.
 
-        - user_prompt: the instruction you write (in Spanish/English)
-        - model: optional model name (e.g. 'mixtral'); falls back to env var
-        - api_url: endpoint URL; falls back to env var (e.g. Ollama)
-        - api_key: optional bearer token if your server needs it
-
-        Returns the LLM's text response.
+        - user_prompt: your instruction text
+        - speakers: list of speakers to include (e.g. ['SPEAKER_00', 'SPEAKER_02']).
+          If None, all speakers are included.
+        - max_chars: approximate upper bound on transcript length.
         """
         if not user_prompt.strip():
             raise ValueError("Prompt is empty.")
 
-        transcript = self._build_transcript_text(include_speaker=True)
+        transcript = self.get_transcript_text(
+            include_speaker=True,
+            speaker_filters=speakers,
+            max_chars=max_chars,
+        )
 
-        # Compose final prompt
+        speakers_str = ", ".join(speakers) if speakers else "TODOS"
         combined_prompt = (
             user_prompt.strip()
-            + "\n\n--- TRANSCRIPCIÓN DIARIZADA ---\n"
+            + "\n\n--- TRANSCRIPCIÓN FILTRADA (speakers: "
+            + speakers_str
+            + ") ---\n"
             + transcript
         )
 
-        # Get config from env if not provided
         api_url = api_url or os.environ.get(
             "LLM_ANALYSIS_URL", "http://localhost:11434/api/generate"
         )
-        model = model or os.environ.get("LLM_ANALYSIS_MODEL", "mixtral")
+        model = model or os.environ.get("LLM_ANALYSIS_MODEL", "mistral")
 
         headers = {}
         if api_key:
@@ -244,25 +274,20 @@ class DiarizationPipelineRunner:
         payload = {
             "model": model,
             "prompt": combined_prompt,
-            # Ollama-style; if you use OpenAI-style, we handle that below
             "stream": False,
         }
 
         self._set_status("Calling analysis model...")
         self._set_progress(50)
 
+        import requests
         resp = requests.post(api_url, json=payload, headers=headers, timeout=600)
         resp.raise_for_status()
         data = resp.json()
 
-        # Try to be compatible with both Ollama and OpenAI-style responses
         text = None
-
-        # Ollama: { "response": "...", "done": true, ... }
         if isinstance(data, dict) and "response" in data:
             text = data["response"]
-
-        # OpenAI chat/completions style
         if text is None and "choices" in data:
             try:
                 text = data["choices"][0]["message"]["content"]
@@ -278,6 +303,8 @@ class DiarizationPipelineRunner:
         self._set_status("Analysis done")
         self._set_progress(100)
         return text
+
+
 
 
     # ---------- Export helpers ----------

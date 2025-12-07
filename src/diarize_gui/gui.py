@@ -353,6 +353,129 @@ class DiarizationApp:
             self._disable_export_buttons()
             self._show_error("Error during processing", str(e))
 
+    def _open_analysis_setup_window(self, speakers):
+        """
+        Show a window where the user can:
+        - Browse the full transcript
+        - Select which speakers correspond to the student
+        - Edit the analysis prompt
+        """
+        win = tk.Toplevel(self.master)
+        win.title("Review transcript & select student speakers")
+        win.geometry("900x600")
+
+        # Top: transcript view
+        top_frame = tk.Frame(win)
+        top_frame.pack(side="top", fill="both", expand=True, padx=10, pady=5)
+
+        transcript_label = tk.Label(top_frame, text="Transcripción completa (todas las voces):")
+        transcript_label.pack(anchor="w")
+
+        transcript_text = tk.Text(top_frame, wrap="word")
+        transcript_text.pack(side="left", fill="both", expand=True)
+
+        scroll1 = tk.Scrollbar(top_frame, command=transcript_text.yview)
+        scroll1.pack(side="right", fill="y")
+        transcript_text.configure(yscrollcommand=scroll1.set)
+
+        # Fill transcript (all speakers, no truncation)
+        try:
+            full_transcript = self.pipeline.get_transcript_text(
+                include_speaker=True,
+                speaker_filters=None,
+                max_chars=None,
+            )
+        except Exception as e:
+            full_transcript = f"<<Error building transcript: {e}>>"
+
+        transcript_text.insert("1.0", full_transcript)
+        transcript_text.config(state="disabled")
+
+        # Middle: speaker selection + prompt
+        mid_frame = tk.Frame(win)
+        mid_frame.pack(side="top", fill="both", expand=False, padx=10, pady=5)
+
+        # Speaker checkboxes
+        spk_frame = tk.Frame(mid_frame)
+        spk_frame.pack(side="left", fill="y", padx=(0, 10))
+
+        spk_label = tk.Label(spk_frame, text="Selecciona los speakers que eres TÚ (estudiante):")
+        spk_label.pack(anchor="w")
+
+        self._analysis_speaker_vars = {}
+        for spk in speakers:
+            var = tk.BooleanVar(value=(spk == "SPEAKER_00"))  # default guess
+            cb = tk.Checkbutton(spk_frame, text=spk, variable=var)
+            cb.pack(anchor="w")
+            self._analysis_speaker_vars[spk] = var
+
+        # Prompt text box
+        prompt_frame = tk.Frame(mid_frame)
+        prompt_frame.pack(side="left", fill="both", expand=True)
+
+        prompt_label = tk.Label(prompt_frame, text="Prompt para el análisis (puedes editarlo):")
+        prompt_label.pack(anchor="w")
+
+        default_prompt = (
+            "Eres un profesor experto de español analizando la transcripción de una clase 1-a-1.\n\n"
+            "INSTRUCCIONES (muy importantes):\n"
+            "1. NO hagas un resumen general largo. Como máximo, una o dos frases de resumen.\n"
+            "2. El objetivo principal es analizar el español del ESTUDIANTE (no del profesor).\n"
+            "3. Céntrate en:\n"
+            "   - Errores gramaticales (tiempos verbales, concordancia, preposiciones, pronombres, etc.)\n"
+            "   - Errores o carencias de vocabulario\n"
+            "   - Frases que suenan poco naturales y cómo mejorarlas\n"
+            "4. Para cada tipo de error, haz esto:\n"
+            "   - Cita el fragmento original del estudiante.\n"
+            "   - Propón una versión corregida o más natural.\n"
+            "   - Explica brevemente por qué es mejor.\n"
+            "5. Después, menciona los puntos fuertes del estudiante (qué hace bien).\n"
+            "6. Termina con 3-5 objetivos concretos para la próxima clase y 5-10 frases de ejemplo para practicar.\n\n"
+            "Escribe TODA la respuesta en español y no incluyas la transcripción completa (solo fragmentos cuando sea necesario).\n"
+        )
+
+        prompt_text = tk.Text(prompt_frame, wrap="word", height=12)
+        prompt_text.pack(side="left", fill="both", expand=True)
+
+        scroll2 = tk.Scrollbar(prompt_frame, command=prompt_text.yview)
+        scroll2.pack(side="right", fill="y")
+        prompt_text.configure(yscrollcommand=scroll2.set)
+
+        prompt_text.insert("1.0", default_prompt)
+
+        # Bottom: buttons
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(side="bottom", fill="x", padx=10, pady=10)
+
+        def on_ok():
+            # Collect selected speakers
+            selected = [spk for spk, var in self._analysis_speaker_vars.items() if var.get()]
+            if not selected:
+                messagebox.showerror("Error", "Selecciona al menos un speaker que corresponda al estudiante.")
+                return
+
+            prompt = prompt_text.get("1.0", "end").strip()
+            if not prompt:
+                messagebox.showerror("Error", "El prompt no puede estar vacío.")
+                return
+
+            win.destroy()
+            # Run analysis in background
+            thread = threading.Thread(
+                target=self._run_analysis_thread,
+                args=(prompt, selected),
+            )
+            thread.daemon = True
+            thread.start()
+
+        def on_cancel():
+            win.destroy()
+
+        ok_btn = tk.Button(btn_frame, text="OK (analizar)", command=on_ok)
+        ok_btn.pack(side="right", padx=(5, 0))
+        cancel_btn = tk.Button(btn_frame, text="Cancelar", command=on_cancel)
+        cancel_btn.pack(side="right")
+
     # ---------- Export callbacks ----------
     def export_txt(self):
         if not self.has_result:
@@ -398,39 +521,40 @@ class DiarizationApp:
 
 
     # ---------- LLM analysis ----------
-
     def analyze_transcript(self):
         if not self.has_result:
             self._show_error("Error", "No result available. Run diarization first.")
             return
 
-        # Let you provide the prompt each time
-        prompt = simpledialog.askstring(
-            "LLM analysis prompt",
-            "Enter the instruction for the model.\n"
-            "For example:\n"
-            "«Analiza esta transcripción de mi clase de español y dame retroalimentación detallada "
-            "sobre mis errores gramaticales, vocabulario y pronunciación (en la medida de lo posible "
-            "a partir del texto). Haz sugerencias concretas de mejora.»",
-            parent=self.master,
-        )
-        if not prompt:
+        # Build list of speakers from last_result
+        if not self.pipeline.last_result or "segments" not in self.pipeline.last_result:
+            self._show_error("Error", "No segments available for analysis.")
             return
 
-        # Run in background thread to keep UI responsive
-        thread = threading.Thread(
-            target=self._run_analysis_thread,
-            args=(prompt,),
-        )
-        thread.daemon = True
-        thread.start()
+        speakers = []
+        for seg in self.pipeline.last_result["segments"]:
+            spk = seg.get("speaker", "")
+            if spk and spk not in speakers:
+                speakers.append(spk)
+        speakers.sort()
 
-    def _run_analysis_thread(self, prompt: str):
+        if not speakers:
+            self._show_error("Error", "No speaker labels found in transcript.")
+            return
+
+        # Create setup window
+        self._open_analysis_setup_window(speakers)
+
+
+    def _run_analysis_thread(self, prompt: str, speakers):
         try:
             self._set_status("Running LLM analysis...")
             self._set_progress(10)
 
-            analysis_text = self.pipeline.analyze_with_llm(prompt)
+            analysis_text = self.pipeline.analyze_with_llm(
+                prompt,
+                speakers=speakers,
+            )
 
             # Save lesson under current profile (if any)
             self._save_lesson_record(prompt, analysis_text)
@@ -442,6 +566,7 @@ class DiarizationApp:
             self._set_status("Analysis error")
             self._set_progress(0.0)
             self._show_error("Error during analysis", str(e))
+
 
 
     def _show_analysis_window(self, text: str):
@@ -483,20 +608,31 @@ class DiarizationApp:
             self._show_error("Error", "No result available. Run diarization first.")
             return
 
-        default_prompt = (
-            "Actúa como un profesor experto de español que analiza una transcripción de una clase 1-a-1.\n\n"
-            "Tareas:\n"
-            "1. Resume brevemente (en español) lo que pasó en la clase (tema, actividades, tono).\n"
-            "2. Identifica los errores del estudiante (gramática, vocabulario, uso de tiempos verbales, preposiciones, "
-            "concordancia, etc.). Cita el fragmento original, propón una versión corregida y explica brevemente el porqué.\n"
-            "3. Señala los puntos fuertes del estudiante.\n"
-            "4. Sugiere 3-5 objetivos concretos para la próxima clase.\n"
-            "5. Da 5–10 frases de ejemplo que el estudiante podría practicar.\n\n"
-            "IMPORTANTE:\n"
-            "- El estudiante es de nivel B1–B2.\n"
-            "- Escribe toda tu respuesta en español.\n"
-            "- Asume que SPEAKER_00 es el estudiante y SPEAKER_01 es el profesor.\n"
-        )
+            default_prompt = (
+            "Eres un profesor experto de español analizando la transcripción de una clase 1-a-1.\n\n"
+            "INSTRUCCIONES (muy importantes):\n"
+            "1. NO hagas un resumen general largo. Como máximo, una o dos frases de resumen.\n"
+            "2. El objetivo principal es analizar el español del ESTUDIANTE (no del profesor).\n"
+            "3. Céntrate en:\n"
+            "   - Errores gramaticales (tiempos verbales, concordancia, preposiciones, pronombres, etc.)\n"
+            "   - Errores o carencias de vocabulario\n"
+            "   - Frases que suenan poco naturales y cómo mejorarlas\n"
+            "4. Para cada tipo de error, haz esto:\n"
+            "   - Cita el fragmento original del estudiante.\n"
+            "   - Propón una versión corregida o más natural.\n"
+            "   - Explica brevemente por qué es mejor.\n"
+            "5. Después, menciona los puntos fuertes del estudiante (qué hace bien).\n"
+            "6. Termina con 3-5 objetivos concretos para la próxima clase y 5-10 frases de ejemplo para practicar.\n\n"
+            "Formato sugerido:\n"
+            "A) Resumen (1-2 frases máximo)\n"
+            "B) Errores y correcciones (en viñetas)\n"
+            "C) Puntos fuertes\n"
+            "D) Objetivos para la próxima clase\n"
+            "E) Frases de ejemplo para practicar\n\n"
+            "Escribe TODA la respuesta en español y no incluyas la transcripción completa (solo fragmentos cuando sea necesario).\n"
+            "Asume que SPEAKER_00 es el estudiante.\n"
+            )
+
 
         prompt = simpledialog.askstring(
             "LLM analysis prompt",
