@@ -407,17 +407,18 @@ class DiarizationApp:
         Show a window where the user can:
         - Browse the full transcript
         - Select which speakers correspond to the student
-        - Edit the analysis prompt
+        - Choose feedback language
+        - Edit the analysis prompt (in English or Spanish)
         """
         win = tk.Toplevel(self.master)
         win.title("Review transcript & select student speakers")
-        win.geometry("900x600")
+        win.geometry("900x650")
 
         # Top: transcript view
         top_frame = tk.Frame(win)
         top_frame.pack(side="top", fill="both", expand=True, padx=10, pady=5)
 
-        transcript_label = tk.Label(top_frame, text="Transcripción completa (todas las voces):")
+        transcript_label = tk.Label(top_frame, text="Full transcript (all speakers):")
         transcript_label.pack(anchor="w")
 
         transcript_text = tk.Text(top_frame, wrap="word")
@@ -440,7 +441,7 @@ class DiarizationApp:
         transcript_text.insert("1.0", full_transcript)
         transcript_text.config(state="disabled")
 
-        # Middle: speaker selection + prompt
+        # Middle: speaker selection + prompt + language choice
         mid_frame = tk.Frame(win)
         mid_frame.pack(side="top", fill="both", expand=False, padx=10, pady=5)
 
@@ -448,7 +449,7 @@ class DiarizationApp:
         spk_frame = tk.Frame(mid_frame)
         spk_frame.pack(side="left", fill="y", padx=(0, 10))
 
-        spk_label = tk.Label(spk_frame, text="Selecciona los speakers que eres TÚ (estudiante):")
+        spk_label = tk.Label(spk_frame, text="Select speaker IDs that correspond to YOU (student):")
         spk_label.pack(anchor="w")
 
         self._analysis_speaker_vars = {}
@@ -458,32 +459,58 @@ class DiarizationApp:
             cb.pack(anchor="w")
             self._analysis_speaker_vars[spk] = var
 
-        # Prompt text box
-        prompt_frame = tk.Frame(mid_frame)
-        prompt_frame.pack(side="left", fill="both", expand=True)
+        # Prompt + language
+        right_frame = tk.Frame(mid_frame)
+        right_frame.pack(side="left", fill="both", expand=True)
 
-        prompt_label = tk.Label(prompt_frame, text="Prompt para el análisis (puedes editarlo):")
+        # Language choice
+        lang_frame = tk.Frame(right_frame)
+        lang_frame.pack(fill="x", pady=(0, 5))
+
+        tk.Label(lang_frame, text="Feedback language:").pack(side="left")
+        self._analysis_lang_var = tk.StringVar(value="EN")  # EN or ES
+
+        tk.Radiobutton(
+            lang_frame,
+            text="English",
+            variable=self._analysis_lang_var,
+            value="EN",
+        ).pack(side="left", padx=(5, 0))
+
+        tk.Radiobutton(
+            lang_frame,
+            text="Spanish",
+            variable=self._analysis_lang_var,
+            value="ES",
+        ).pack(side="left", padx=(5, 0))
+
+        # Prompt text box
+        prompt_frame = tk.Frame(right_frame)
+        prompt_frame.pack(side="top", fill="both", expand=True)
+
+        prompt_label = tk.Label(prompt_frame, text="Analysis prompt (you can edit this):")
         prompt_label.pack(anchor="w")
 
+        # Default prompt in ENGLISH, but describing Spanish analysis
         default_prompt = (
-            "Eres un profesor experto de español analizando la transcripción de una clase 1-a-1.\n\n"
-            "INSTRUCCIONES (muy importantes):\n"
-            "1. NO hagas un resumen general largo. Como máximo, una o dos frases de resumen.\n"
-            "2. El objetivo principal es analizar el español del ESTUDIANTE (no del profesor).\n"
-            "3. Céntrate en:\n"
-            "   - Errores gramaticales (tiempos verbales, concordancia, preposiciones, pronombres, etc.)\n"
-            "   - Errores o carencias de vocabulario\n"
-            "   - Frases que suenan poco naturales y cómo mejorarlas\n"
-            "4. Para cada tipo de error, haz esto:\n"
-            "   - Cita el fragmento original del estudiante.\n"
-            "   - Propón una versión corregida o más natural.\n"
-            "   - Explica brevemente por qué es mejor.\n"
-            "5. Después, menciona los puntos fuertes del estudiante (qué hace bien).\n"
-            "6. Termina con 3-5 objetivos concretos para la próxima clase y 5-10 frases de ejemplo para practicar.\n\n"
-            "Escribe TODA la respuesta en español y no incluyas la transcripción completa (solo fragmentos cuando sea necesario).\n"
+            "You are an expert Spanish teacher analyzing a transcript of a 1-on-1 Spanish lesson.\n\n"
+            "Your job is NOT to give a long general summary. Instead, focus mainly on the student's Spanish.\n\n"
+            "Please do the following:\n"
+            "1. VERY brief summary (1–2 sentences max) of what the student talked about.\n"
+            "2. Identify the student's mistakes and weaknesses in Spanish (grammar, verb tenses, agreement, "
+            "prepositions, pronouns, word order, vocabulary, etc.). For each important issue:\n"
+            "   - Quote the original sentence or short fragment.\n"
+            "   - Give a corrected or more natural version.\n"
+            "   - Briefly explain why your version is better.\n"
+            "3. Highlight the student's strengths (what they are doing well: fluency, use of connectors, "
+            "advanced structures, etc.).\n"
+            "4. Suggest 3–5 very concrete goals for the next lessons.\n"
+            "5. Provide 5–10 example sentences the student could practice, based on their errors.\n\n"
+            "Assume that only the selected speaker IDs correspond to the student. "
+            "Do NOT include the full transcript in your answer, only short quotes when needed.\n"
         )
 
-        prompt_text = tk.Text(prompt_frame, wrap="word", height=12)
+        prompt_text = tk.Text(prompt_frame, wrap="word", height=14)
         prompt_text.pack(side="left", fill="both", expand=True)
 
         scroll2 = tk.Scrollbar(prompt_frame, command=prompt_text.yview)
@@ -500,13 +527,21 @@ class DiarizationApp:
             # Collect selected speakers
             selected = [spk for spk, var in self._analysis_speaker_vars.items() if var.get()]
             if not selected:
-                messagebox.showerror("Error", "Selecciona al menos un speaker que corresponda al estudiante.")
+                messagebox.showerror("Error", "Please select at least one speaker that corresponds to the student.")
                 return
 
             prompt = prompt_text.get("1.0", "end").strip()
             if not prompt:
-                messagebox.showerror("Error", "El prompt no puede estar vacío.")
+                messagebox.showerror("Error", "Prompt cannot be empty.")
                 return
+
+            lang = self._analysis_lang_var.get()  # 'EN' or 'ES'
+
+            # Append explicit language instruction
+            if lang == "EN":
+                prompt += "\n\nIMPORTANT: Write all your feedback in ENGLISH (but you may quote Spanish phrases as needed)."
+            else:
+                prompt += "\n\nIMPORTANTE: Escribe TODA tu respuesta en ESPAÑOL."
 
             win.destroy()
             # Run analysis in background
@@ -520,9 +555,9 @@ class DiarizationApp:
         def on_cancel():
             win.destroy()
 
-        ok_btn = tk.Button(btn_frame, text="OK (analizar)", command=on_ok)
+        ok_btn = tk.Button(btn_frame, text="OK (analyze)", command=on_ok)
         ok_btn.pack(side="right", padx=(5, 0))
-        cancel_btn = tk.Button(btn_frame, text="Cancelar", command=on_cancel)
+        cancel_btn = tk.Button(btn_frame, text="Cancel", command=on_cancel)
         cancel_btn.pack(side="right")
 
     # ---------- Export callbacks ----------
