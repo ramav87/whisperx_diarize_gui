@@ -616,8 +616,6 @@ class DiarizationApp:
             self._set_progress(0.0)
             self._show_error("Error during analysis", str(e))
 
-
-
     def _show_analysis_window(self, text: str):
         def create_window():
             win = tk.Toplevel(self.master)
@@ -652,7 +650,7 @@ class DiarizationApp:
         except Exception as e:
             self._show_error("Error exporting speaker audio", str(e))
 
-    def analyze_transcript(self):
+    """def analyze_transcript(self):
         if not self.has_result:
             self._show_error("Error", "No result available. Run diarization first.")
             return
@@ -670,7 +668,7 @@ class DiarizationApp:
             args=(prompt,),
         )
         thread.daemon = True
-        thread.start()
+        thread.start()"""
 
     # ---------- Status & progress (thread-safe) ----------
 
