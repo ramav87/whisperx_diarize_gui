@@ -620,14 +620,17 @@ class DiarizationApp:
     def _open_analysis_setup_window(self, speakers):
         win = tk.Toplevel(self.master)
         win.title("Review transcript & select student speakers")
-        win.geometry("900x700")
+        win.geometry("900x750")  # Slightly taller to fit everything
 
-        # Top: transcript view
+        # --- Top: Transcript View ---
         top_frame = tk.Frame(win)
         top_frame.pack(side="top", fill="both", expand=True, padx=10, pady=5)
-        tk.Label(top_frame, text="Full transcript:").pack(anchor="w")
+        
+        tk.Label(top_frame, text="Full transcript (all speakers):").pack(anchor="w")
+        
         transcript_text = tk.Text(top_frame, wrap="word")
         transcript_text.pack(side="left", fill="both", expand=True)
+        
         scroll1 = tk.Scrollbar(top_frame, command=transcript_text.yview)
         scroll1.pack(side="right", fill="y")
         transcript_text.configure(yscrollcommand=scroll1.set)
@@ -637,131 +640,183 @@ class DiarizationApp:
                 include_speaker=True, speaker_filters=None, max_chars=None
             )
         except Exception as e:
-            full_transcript = f"<<Error: {e}>>"
+            full_transcript = f"<<Error building transcript: {e}>>"
+
         transcript_text.insert("1.0", full_transcript)
         transcript_text.config(state="disabled")
 
-        # Middle: speakers + prompts
+        # --- Middle: Speaker Selection & Settings ---
         mid_frame = tk.Frame(win)
         mid_frame.pack(side="top", fill="both", expand=False, padx=10, pady=5)
 
+        # 1. Left Column: Speakers
         spk_frame = tk.Frame(mid_frame)
         spk_frame.pack(side="left", fill="y", padx=(0, 10))
+
         tk.Label(spk_frame, text="Select student speakers:").pack(anchor="w")
-        self._char_count_label = tk.Label(spk_frame, text="Selected: 0 chars")
+        
+        # Character count label (RESTORED WARNING LOGIC)
+        self._char_count_label = tk.Label(spk_frame, text="Selected student text: 0 chars", fg="black")
         self._char_count_label.pack(anchor="w", pady=(2, 5))
 
         self._analysis_speaker_vars = {}
 
+        # Define update function with warning logic
         def update_char_count():
             selected = [spk for spk, var in self._analysis_speaker_vars.items() if var.get()]
             try:
                 text = self.pipeline.get_transcript_text(
-                    include_speaker=True, speaker_filters=selected if selected else None, max_chars=None
+                    include_speaker=True,
+                    speaker_filters=selected if selected else None,
+                    max_chars=None,  # Get full length to check against limit
                 )
             except Exception:
                 text = ""
-            self._char_count_label.config(text=f"Selected: {len(text)} chars")
+            
+            length = len(text)
+            max_chars = 20000  # Sync with pipeline.DEFAULT_MAX_CHARS
 
+            if length <= max_chars:
+                msg = f"Selected: {length} chars (max {max_chars}; OK)"
+                self._char_count_label.config(text=msg, fg="black")
+            else:
+                msg = f"Selected: {length} chars (max {max_chars}; WILL BE TRUNCATED)"
+                self._char_count_label.config(text=msg, fg="red")
+
+        # Create checkboxes
         for spk in speakers:
+            # Default to checking SPEAKER_00 as a guess, or unchecked
             var = tk.BooleanVar(value=(spk == "SPEAKER_00"))
-            cb = tk.Checkbutton(spk_frame, text=spk, variable=var, command=update_char_count)
+            cb = tk.Checkbutton(
+                spk_frame,
+                text=spk,
+                variable=var,
+                command=update_char_count,  # update count when toggled
+            )
             cb.pack(anchor="w")
             self._analysis_speaker_vars[spk] = var
+
+        # Initialize count
         update_char_count()
 
+        # 2. Right Column: LLM Settings & Prompt
         right_frame = tk.Frame(mid_frame)
         right_frame.pack(side="left", fill="both", expand=True)
 
-        # --- LLM Settings Row ---
+        # LLM Settings Row (Lang + Model)
         llm_settings_frame = tk.Frame(right_frame)
         llm_settings_frame.pack(fill="x", pady=(0, 5))
 
-        # Language
+        # Language Selection
         tk.Label(llm_settings_frame, text="Lang:").pack(side="left")
-        self._analysis_lang_var = tk.StringVar(value="EN")
-        tk.Radiobutton(llm_settings_frame, text="EN", variable=self._analysis_lang_var, value="EN").pack(side="left")
-        tk.Radiobutton(llm_settings_frame, text="ES", variable=self._analysis_lang_var, value="ES").pack(side="left", padx=(0, 15))
+        self._analysis_lang_var = tk.StringVar(value="EN")  # EN or ES
 
-        # Model Selector
+        tk.Radiobutton(
+            llm_settings_frame,
+            text="English",
+            variable=self._analysis_lang_var,
+            value="EN",
+        ).pack(side="left", padx=(5, 0))
+
+        tk.Radiobutton(
+            llm_settings_frame,
+            text="Spanish",
+            variable=self._analysis_lang_var,
+            value="ES",
+        ).pack(side="left", padx=(5, 15))
+
+        # Model Selector (NEW FEATURE)
         tk.Label(llm_settings_frame, text="Ollama Model:").pack(side="left")
         self._model_var = tk.StringVar(value="mistral")
         
-        # Suggested models
         suggested_models = ["mistral", "mixtral", "gemma:2b", "gemma:7b", "gemma2", "phi", "llama2", "llama3"]
-        self._model_combo = ttk.Combobox(llm_settings_frame, textvariable=self._model_var, values=suggested_models, width=15)
+        self._model_combo = ttk.Combobox(
+            llm_settings_frame, 
+            textvariable=self._model_var, 
+            values=suggested_models,
+            width=15
+        )
         self._model_combo.pack(side="left", padx=(5, 0))
 
-        # Prompt box
+        # Prompt Text Area
         prompt_frame = tk.Frame(right_frame)
         prompt_frame.pack(side="top", fill="both", expand=True)
-        tk.Label(prompt_frame, text="Prompt:").pack(anchor="w")
+
+        tk.Label(prompt_frame, text="Analysis prompt (editable):").pack(anchor="w")
 
         default_prompt = (
-            "You are an expert Spanish teacher analyzing a transcript.\n"
-            "Focus on the student's Spanish.\n"
-            "1. Brief summary.\n"
-            "2. Mistakes (quote, correct, explain).\n"
-            "3. Strengths.\n"
-            "4. Goals.\n"
-            "5. Practice sentences.\n"
-            "Only assume selected speakers are the student."
+            "You are an expert Spanish teacher analyzing a transcript of a 1-on-1 Spanish lesson.\n\n"
+            "Your job is NOT to give a long general summary. Instead, focus mainly on the student's Spanish.\n\n"
+            "Please do the following:\n"
+            "1. VERY brief summary (1–2 sentences max) of what the student talked about.\n"
+            "2. Identify the student's mistakes and weaknesses in Spanish (grammar, verb tenses, agreement, "
+            "prepositions, pronouns, word order, vocabulary, etc.). For each important issue:\n"
+            "   - Quote the original sentence or short fragment.\n"
+            "   - Give a corrected or more natural version.\n"
+            "   - Briefly explain why your version is better.\n"
+            "3. Highlight the student's strengths.\n"
+            "4. Suggest 3–5 very concrete goals for the next lessons.\n"
+            "5. Provide 5–10 example sentences the student could practice.\n\n"
+            "Assume that only the selected speaker IDs correspond to the student. "
+            "Do NOT include the full transcript in your answer."
         )
 
-        prompt_text = tk.Text(prompt_frame, wrap="word", height=10)
+        prompt_text = tk.Text(prompt_frame, wrap="word", height=12)
         prompt_text.pack(side="left", fill="both", expand=True)
+
         scroll2 = tk.Scrollbar(prompt_frame, command=prompt_text.yview)
         scroll2.pack(side="right", fill="y")
         prompt_text.configure(yscrollcommand=scroll2.set)
+
         prompt_text.insert("1.0", default_prompt)
 
+        # --- Bottom: Buttons ---
         btn_frame = tk.Frame(win)
         btn_frame.pack(side="bottom", fill="x", padx=10, pady=10)
 
         def on_ok():
+            # Collect selected speakers
             selected = [spk for spk, var in self._analysis_speaker_vars.items() if var.get()]
             if not selected:
-                messagebox.showerror("Error", "Select at least one speaker.")
+                messagebox.showerror("Error", "Please select at least one speaker that corresponds to the student.")
                 return
 
             prompt = prompt_text.get("1.0", "end").strip()
             if not prompt:
-                messagebox.showerror("Error", "Prompt empty.")
+                messagebox.showerror("Error", "Prompt cannot be empty.")
                 return
 
-            # --- Check Model Availability ---
+            # --- Check Model Availability (NEW) ---
             target_model = self._model_var.get().strip()
-            # Assuming default localhost URL. If customized via ENV, pipeline handles it, 
-            # but we need to check *before* starting the thread to give feedback.
             api_url = os.environ.get("LLM_ANALYSIS_URL", "http://localhost:11434/api/generate")
             
             is_avail = self.pipeline.check_ollama_model_availability(target_model, api_url)
             
             if not is_avail:
-                # Prompt user to download
                 cmd = f"ollama pull {target_model}"
                 msg = (
                     f"The model '{target_model}' was not found in your local Ollama instance.\n\n"
                     f"Please open your Terminal and run:\n\n{cmd}\n\n"
                     "After the download completes, click OK to try again."
                 )
-                # We use askretrycancel so they can go run the command and come back
                 retry = messagebox.askretrycancel("Model Missing", msg)
                 if not retry:
-                    return # Cancel was clicked, stay in setup window
+                    return 
                 else:
-                    # Retry clicked: Check again recursively
-                    on_ok()
+                    on_ok() # recursive check
                     return
 
-            # Append language instruction
             lang = self._analysis_lang_var.get()
+
+            # Append explicit language instruction
             if lang == "EN":
-                prompt += "\n\nIMPORTANT: Write feedback in ENGLISH."
+                prompt += "\n\nIMPORTANT: Write all your feedback in ENGLISH."
             else:
-                prompt += "\n\nIMPORTANTE: Escribe la respuesta en ESPAÑOL."
+                prompt += "\n\nIMPORTANTE: Escribe TODA tu respuesta en ESPAÑOL."
 
             win.destroy()
+            
+            # Start analysis thread
             thread = threading.Thread(
                 target=self._run_analysis_thread,
                 args=(prompt, selected, target_model),
@@ -772,8 +827,10 @@ class DiarizationApp:
         def on_cancel():
             win.destroy()
 
-        tk.Button(btn_frame, text="OK (Analyze)", command=on_ok).pack(side="right", padx=(5, 0))
-        tk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="right")
+        ok_btn = tk.Button(btn_frame, text="OK (Analyze)", command=on_ok)
+        ok_btn.pack(side="right", padx=(5, 0))
+        cancel_btn = tk.Button(btn_frame, text="Cancel", command=on_cancel)
+        cancel_btn.pack(side="right")
 
     def export_txt(self):
         if not self.has_result: return

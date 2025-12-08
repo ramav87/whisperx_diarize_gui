@@ -20,6 +20,7 @@ dependencies = [
   "sounddevice",
   "soundfile",
   "pyannote.audio",
+  "pypaperclip",
 ]
 
 [project.urls]
