@@ -1,5 +1,6 @@
 import os
 import threading
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
@@ -7,6 +8,53 @@ import pyperclip  # You might need to add pyclip or just let user copy manually
 
 from .recorder import AudioRecorder
 from .pipeline import DiarizationPipelineRunner
+import atexit # To kill the server when app closes
+from .pyannote_offline_loader import get_resource_base_path
+
+def start_bundled_ollama():
+    """
+    Locates the bundled Ollama binary and starts it in server mode
+    on a custom port (11435) to avoid conflicts with system Ollama.
+    """
+    # 1. Get absolute path to 'resources' folder
+    resource_path = get_resource_base_path()
+    
+    # 2. Locate the binary
+    ollama_bin = os.path.join(resource_path, "ollama")
+    
+    if not os.path.exists(ollama_bin):
+        print(f"WARNING: Bundled Ollama binary not found at: {ollama_bin}")
+        return None
+
+    # 3. Ensure it is executable (permissions can be lost during packaging)
+    try:
+        os.chmod(ollama_bin, 0o755)
+    except Exception as e:
+        print(f"Warning: Could not chmod ollama binary: {e}")
+
+    # 4. Set up environment for the subprocess
+    # We store models in the user's Application Support folder
+    models_dir = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+    os.makedirs(models_dir, exist_ok=True)
+    
+    env = os.environ.copy()
+    env["OLLAMA_MODELS"] = models_dir
+    env["OLLAMA_HOST"] = "127.0.0.1:11435" # Custom port
+    
+    print(f"Starting bundled Ollama from {ollama_bin} on port 11435...")
+    
+    # 5. Launch in background
+    try:
+        process = subprocess.Popen(
+            [ollama_bin, "serve"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return process
+    except Exception as e:
+        print(f"Failed to start bundled Ollama: {e}")
+        return None
 
 class DiarizationApp:
     def __init__(self, master: tk.Tk):
@@ -188,6 +236,23 @@ class DiarizationApp:
         self.progress_bar.pack(padx=10, pady=(0, 10), fill="x")
 
         self.master.after(0, self._prompt_profile_on_startup)
+
+        #Launch ollama
+        # --- START BUNDLED OLLAMA ---
+        self.ollama_process = start_bundled_ollama()
+        
+        # Ensure we kill the server when the GUI closes
+        atexit.register(self._cleanup_ollama)
+        
+        # Also define a custom environment for client calls (used later in pipeline)
+        # We need to tell the pipeline to talk to our custom port 11435
+        os.environ["LLM_ANALYSIS_URL"] = "http://127.0.0.1:11435/api/generate"
+    
+    def _cleanup_ollama(self):
+        if hasattr(self, 'ollama_process') and self.ollama_process:
+            print("Stopping bundled Ollama server...")
+            self.ollama_process.terminate()
+            self.ollama_process.wait()
 
     def _load_existing_profiles(self):
         base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
@@ -790,20 +855,25 @@ class DiarizationApp:
             target_model = self._model_var.get().strip()
             api_url = os.environ.get("LLM_ANALYSIS_URL", "http://localhost:11434/api/generate")
             
+            # ... inside on_ok ...
             is_avail = self.pipeline.check_ollama_model_availability(target_model, api_url)
             
             if not is_avail:
-                cmd = f"ollama pull {target_model}"
+                # We can't ask them to run terminal commands anymore because
+                # they need to use OUR binary and OUR port/paths.
+                # We should offer to download it for them right here.
+                
                 msg = (
-                    f"The model '{target_model}' was not found in your local Ollama instance.\n\n"
-                    f"Please open your Terminal and run:\n\n{cmd}\n\n"
-                    "After the download completes, click OK to try again."
+                    f"The model '{target_model}' is missing from the app's internal storage.\n\n"
+                    "Would you like to download it now? (This may take a few minutes)"
                 )
-                retry = messagebox.askretrycancel("Model Missing", msg)
-                if not retry:
-                    return 
+                do_download = messagebox.askyesno("Model Missing", msg)
+                
+                if do_download:
+                    # Run the pull command using the bundled binary and environment
+                    self._run_download_thread(target_model)
+                    return # Exit this function, wait for download callback
                 else:
-                    on_ok() # recursive check
                     return
 
             lang = self._analysis_lang_var.get()
@@ -851,6 +921,48 @@ class DiarizationApp:
                 self._show_info("Export", f"Saved to {path}")
             except Exception as e:
                 self._show_error("Error", str(e))
+
+    def _run_download_thread(self, model_name):
+        """
+        Runs 'ollama pull' using the bundled binary in a separate thread,
+        showing a progress window (indeterminite).
+        """
+        resource_path = get_resource_base_path()
+        ollama_bin = os.path.join(resource_path, "ollama")
+        
+        # Reconstruct the environment used by the server
+        models_dir = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+        env = os.environ.copy()
+        env["OLLAMA_MODELS"] = models_dir
+        env["OLLAMA_HOST"] = "127.0.0.1:11435"
+
+        # Create a simple popup window
+        dl_win = tk.Toplevel(self.master)
+        dl_win.title(f"Downloading {model_name}...")
+        dl_win.geometry("300x100")
+        tk.Label(dl_win, text="Downloading model... please wait.").pack(pady=10)
+        pbar = ttk.Progressbar(dl_win, mode='indeterminate')
+        pbar.pack(fill='x', padx=20)
+        pbar.start()
+
+        def run_pull():
+            try:
+                # This blocks until download finishes
+                subprocess.run(
+                    [ollama_bin, "pull", model_name],
+                    env=env,
+                    check=True,
+                    # capture output so it doesn't pop up a terminal
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE 
+                )
+                self.master.after(0, lambda: messagebox.showinfo("Success", f"{model_name} installed!"))
+            except Exception as e:
+                self.master.after(0, lambda: messagebox.showerror("Error", f"Download failed: {e}"))
+            finally:
+                self.master.after(0, dl_win.destroy)
+
+        threading.Thread(target=run_pull, daemon=True).start()
 
     def analyze_transcript(self):
         if not self.has_result: return
