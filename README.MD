@@ -3,6 +3,8 @@
 This application allows you to record or load audio, transcribe it using WhisperX, identify speakers (diarization), and analyze the conversation using local LLMs via Ollama.
 
 ## Prerequisites
+(The following only applies if you are not installing via the pre-built binaries)
+
 1. **Ollama:** Must be installed and running. [Download here](https://ollama.com).
 2. **HuggingFace Token:** Required for the Pyannote diarization model.
    - Go to [HuggingFace Settings](https://huggingface.co/settings/tokens).
