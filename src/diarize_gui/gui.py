@@ -1,49 +1,52 @@
 import os
+import sys
 import threading
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
 import pyperclip  # You might need to add pyclip or just let user copy manually
-
+import atexit # To kill the server when app closes
 from .recorder import AudioRecorder
 from .pipeline import DiarizationPipelineRunner
-import atexit # To kill the server when app closes
 from .pyannote_offline_loader import get_resource_base_path
 
 def start_bundled_ollama():
-    """
-    Locates the bundled Ollama binary and starts it in server mode
-    on a custom port (11435) to avoid conflicts with system Ollama.
-    """
-    # 1. Get absolute path to 'resources' folder
-    resource_path = get_resource_base_path()
+    # 1. Determine search root (Contents/MacOS or src/)
+    if getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base_path = get_resource_base_path()
+
+    # 2. Look specifically in the 'deps' folder defined in the spec
+    # Contents/MacOS/deps/ollama
+    ollama_bin = os.path.join(base_path, "deps", "ollama")
     
-    # 2. Locate the binary
-    ollama_bin = os.path.join(resource_path, "ollama")
-    
+    # 3. Fallback for Dev Mode (where it might still be in resources/ollama)
     if not os.path.exists(ollama_bin):
-        print(f"WARNING: Bundled Ollama binary not found at: {ollama_bin}")
+        dev_path = os.path.join(get_resource_base_path(), "ollama")
+        if os.path.exists(dev_path):
+            ollama_bin = dev_path
+
+    print(f"DEBUG: Looking for ollama at: {ollama_bin}")
+
+    if not os.path.exists(ollama_bin):
+        print(f"CRITICAL ERROR: Bundled Ollama binary not found at: {ollama_bin}")
         return None
 
-    # 3. Ensure it is executable (permissions can be lost during packaging)
     try:
         os.chmod(ollama_bin, 0o755)
-    except Exception as e:
-        print(f"Warning: Could not chmod ollama binary: {e}")
+    except Exception:
+        pass
 
-    # 4. Set up environment for the subprocess
-    # We store models in the user's Application Support folder
+    # 4. Launch
     models_dir = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
     os.makedirs(models_dir, exist_ok=True)
     
     env = os.environ.copy()
     env["OLLAMA_MODELS"] = models_dir
-    env["OLLAMA_HOST"] = "127.0.0.1:11435" # Custom port
+    env["OLLAMA_HOST"] = "127.0.0.1:11435"
     
-    print(f"Starting bundled Ollama from {ollama_bin} on port 11435...")
-    
-    # 5. Launch in background
     try:
         process = subprocess.Popen(
             [ollama_bin, "serve"],
@@ -644,33 +647,27 @@ class DiarizationApp:
             self._show_error("Error", "Select output folder.")
             return
 
-        hf_token = os.environ.get("HUGGINGFACE_TOKEN", "").strip()
-        if not hf_token:
-            self._show_error(
-                "Error",
-                "HUGGINGFACE_TOKEN not set.\n\n"
-                "Please set it: export HUGGINGFACE_TOKEN=\"...\"",
-            )
-            return
+        # --- DELETED: The entire HUGGINGFACE_TOKEN check block --- 
+        # (The block checking os.environ.get and showing the error is gone)
 
         self._set_progress(0.0)
         self._set_status("Starting pipeline...")
 
         thread = threading.Thread(
             target=self._run_pipeline_thread,
-            args=(hf_token,),
+            args=(), # No arguments needed anymore
         )
         thread.daemon = True
         thread.start()
 
-    def _run_pipeline_thread(self, hf_token: str):
+    def _run_pipeline_thread(self): # Removed hf_token arg
         try:
             model_size = self.model_var.get()
             self.pipeline.process_audio(
                 audio_path=self.audio_path,
                 output_dir=self.output_dir,
                 model_size=model_size,
-                hf_token=hf_token,
+                # Removed hf_token=hf_token
             )
             self.has_result = True
             self._enable_export_buttons()
@@ -924,12 +921,17 @@ class DiarizationApp:
 
     def _run_download_thread(self, model_name):
         """
-        Runs 'ollama pull' using the bundled binary in a separate thread,
-        showing a progress window (indeterminite).
+        Runs 'ollama pull' using the bundled binary...
         """
         resource_path = get_resource_base_path()
-        ollama_bin = os.path.join(resource_path, "ollama")
         
+        # NEW CORRECT PATH (Look in 'deps')
+        ollama_bin = os.path.join(resource_path, "deps", "ollama")
+        
+        # Fallback for Dev Mode (if running from source where 'deps' doesn't exist)
+        if not os.path.exists(ollama_bin):
+             ollama_bin = os.path.join(resource_path, "ollama")
+
         # Reconstruct the environment used by the server
         models_dir = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
         env = os.environ.copy()
@@ -958,7 +960,10 @@ class DiarizationApp:
                 )
                 self.master.after(0, lambda: messagebox.showinfo("Success", f"{model_name} installed!"))
             except Exception as e:
-                self.master.after(0, lambda: messagebox.showerror("Error", f"Download failed: {e}"))
+                # --- FIX 2: Capture the error string immediately ---
+                error_msg = str(e)
+                # Pass 'error_msg' to lambda, NOT 'e'
+                self.master.after(0, lambda: messagebox.showerror("Error", f"Download failed: {error_msg}"))
             finally:
                 self.master.after(0, dl_win.destroy)
 

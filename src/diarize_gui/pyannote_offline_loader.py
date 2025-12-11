@@ -3,17 +3,12 @@ import sys
 from pyannote.audio import Pipeline
 
 def get_resource_base_path():
-    """
-    Returns the path to the 'resources' folder.
-    - Frozen (PyInstaller): sys._MEIPASS/resources
-    - Dev (Python): ../../resources (relative to this file)
-    """
-    if hasattr(sys, '_MEIPASS'):
-        # PyInstaller unpacks data to a temp folder stored in _MEIPASS
-        return os.path.join(sys._MEIPASS, "resources")
+    if getattr(sys, 'frozen', False):
+        # Frozen (App Bundle): Return the folder containing the executable
+        # This is usually .../Contents/MacOS
+        return os.path.dirname(os.path.abspath(sys.executable))
     else:
-        # In development, assume 'resources' is in the project root
-        # This file is in src/diarize_gui/, so we go up two levels.
+        # Dev Mode: Return the 'resources' folder in project root
         current_dir = os.path.dirname(os.path.abspath(__file__))
         return os.path.abspath(os.path.join(current_dir, "..", "..", "resources"))
 

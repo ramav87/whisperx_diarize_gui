@@ -119,18 +119,22 @@ class DiarizationPipelineRunner:
         self._set_progress(100)
 
 
+    # Ensure this import is at the top of pipeline.py
+    from .pyannote_offline_loader import load_offline_pipeline
+
     def process_audio(
         self,
         audio_path: str,
         output_dir: str,
         model_size: str = "small",
-        hf_token: Optional[str] = None,
+        # REMOVED: hf_token argument is no longer needed
         ):
-        if hf_token is None or not hf_token.strip():
-            raise ValueError(
-                "HUGGINGFACE_TOKEN is not set. Please export it or pass it explicitly."
-            )
-
+        """
+        Run transcription + alignment + diarization on the given audio file.
+        """
+        
+        # REMOVED: The check for hf_token
+        
         self.last_audio_path = audio_path
         self.last_output_dir = output_dir
         self.last_result = None
@@ -172,15 +176,19 @@ class DiarizationPipelineRunner:
             return_char_alignments=False,
         )
 
-        self._set_status("Running diarization (this may take a while)...")
+        # --- CHANGED: Use Offline Loader ---
+        self._set_status("Running diarization (offline model)...")
         self._set_progress(85)
 
-        diar_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.0",
-            use_auth_token=hf_token,
-        )
+        # Use the helper we wrote to load local files
+        try:
+            diar_pipeline = load_offline_pipeline()
+        except Exception as e:
+            raise RuntimeError(f"Failed to load offline Pyannote model: {e}")
 
+        # Run inference
         annotation = diar_pipeline(audio_path)
+        # -----------------------------------
 
         segments = []
         for segment, _, speaker in annotation.itertracks(yield_label=True):
