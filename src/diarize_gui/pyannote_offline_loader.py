@@ -4,19 +4,35 @@ import yaml
 import tempfile
 from pyannote.audio import Pipeline
 
-def get_model_dir():
+def get_resource_base_path():
     """
-    Locate the folder containing config.yaml and bin files.
+    Returns the base directory where resources (like 'deps' or 'ollama') are located.
+    Used by gui.py to find the Ollama binary.
     """
     if getattr(sys, 'frozen', False):
-        # App Bundle: .../Contents/MacOS/models/pyannote
-        base_path = os.path.dirname(os.path.abspath(sys.executable))
-        return os.path.join(base_path, "models", "pyannote")
+        # Frozen (App Bundle): The folder containing the executable
+        # e.g., .../DiarizeApp.app/Contents/MacOS
+        return os.path.dirname(os.path.abspath(sys.executable))
     else:
-        # Dev Mode: .../resources/pyannote
+        # Dev Mode: The 'resources' folder in the project root
+        # This file is in src/diarize_gui/ -> go up two levels to find 'resources'
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
-        return os.path.join(project_root, "resources", "pyannote")
+        return os.path.join(project_root, "resources")
+
+def get_model_dir():
+    """
+    Locate the folder containing config.yaml and bin files for Pyannote.
+    """
+    base_path = get_resource_base_path()
+    
+    if getattr(sys, 'frozen', False):
+        # In the App Bundle, build_app.sh puts pyannote inside 'models'
+        # .../Contents/MacOS/models/pyannote
+        return os.path.join(base_path, "models", "pyannote")
+    else:
+        # In Dev Mode, it is directly in 'resources/pyannote'
+        return os.path.join(base_path, "pyannote")
 
 def load_offline_pipeline():
     model_dir = get_model_dir()
@@ -25,7 +41,7 @@ def load_offline_pipeline():
     if not os.path.exists(config_path):
         raise FileNotFoundError(
             f"Offline Pyannote config not found at: {config_path}\n"
-            "Ensure 'models/pyannote' was copied correctly."
+            "Ensure you have downloaded the models and placed them in resources/pyannote/"
         )
 
     print(f"Reading config from: {config_path}")
