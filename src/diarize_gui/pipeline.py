@@ -9,6 +9,7 @@ import whisperx
 from pyannote.audio import Pipeline
 import requests
 from .utils import detect_device, format_timestamp
+from .pyannote_offline_loader import load_offline_pipeline  # <--- ADD THIS
 
 StatusCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
@@ -117,10 +118,6 @@ class DiarizationPipelineRunner:
 
         self._set_status("Loaded segments from TXT")
         self._set_progress(100)
-
-
-    # Ensure this import is at the top of pipeline.py
-    from .pyannote_offline_loader import load_offline_pipeline
 
     def process_audio(
         self,
