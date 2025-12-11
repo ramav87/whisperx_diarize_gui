@@ -14,11 +14,20 @@ def get_resource_base_path():
 
 def load_offline_pipeline():
     """
-    Loads the Pyannote pipeline from the local 'resources/pyannote/config.yaml'
-    instead of downloading it from Hugging Face.
+    Loads the Pyannote pipeline from the local config.
     """
-    base_path = get_resource_base_path()
-    pyannote_dir = os.path.join(base_path, "pyannote")
+    # 1. Get the base folder (Contents/MacOS or project root)
+    if getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(os.path.abspath(sys.executable))
+        # In the App Bundle, we put it in 'models/pyannote'
+        pyannote_dir = os.path.join(base_path, "models", "pyannote")
+    else:
+        # In Dev Mode, it is in 'resources/pyannote'
+        # Go up two levels from src/diarize_gui/ to project root
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+        pyannote_dir = os.path.join(project_root, "resources", "pyannote")
+
     config_path = os.path.join(pyannote_dir, "config.yaml")
 
     if not os.path.exists(config_path):
@@ -29,8 +38,7 @@ def load_offline_pipeline():
 
     print(f"Loading offline Pyannote pipeline from: {config_path}")
     
-    # Pipeline.from_pretrained accepts a path to a YAML file.
-    # Paths INSIDE that yaml must be relative to the yaml file itself.
+    # Load pipeline
     pipeline = Pipeline.from_pretrained(config_path)
     
     return pipeline
