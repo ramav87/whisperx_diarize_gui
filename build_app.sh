@@ -4,22 +4,33 @@
 echo "Cleaning..."
 rm -rf build dist
 
-# 2. Run PyInstaller
+# 2. Run PyInstaller (Builds the code only)
 echo "Building App..."
 pyinstaller --clean --noconfirm diarize.spec
 
-# 3. MANUALLY Copy Ollama (The Fix)
-# We create the folder ourselves and copy the file
-echo "Forcing copy of Ollama binary..."
-mkdir -p dist/DiarizeApp.app/Contents/MacOS/deps
-cp resources/ollama dist/DiarizeApp.app/Contents/MacOS/deps/ollama
-chmod +x dist/DiarizeApp.app/Contents/MacOS/deps/ollama
+# 3. MANUALLY Copy Resources (The Fix)
+BASE_DIR="dist/DiarizeApp.app/Contents/MacOS"
+
+# --- A. Copy Ollama Binary ---
+echo "Injecting Ollama binary..."
+mkdir -p "$BASE_DIR/deps"
+cp resources/ollama "$BASE_DIR/deps/ollama"
+chmod +x "$BASE_DIR/deps/ollama"
+
+# --- B. Copy Pyannote Models (New) ---
+echo "Injecting Pyannote models..."
+# Create the parent 'models' folder
+mkdir -p "$BASE_DIR/models"
+# Copy the 'pyannote' folder INTO 'models'
+# This creates .../MacOS/models/pyannote/config.yaml
+cp -r resources/pyannote "$BASE_DIR/models/"
 
 # 4. Verify
-if [ -f "dist/DiarizeApp.app/Contents/MacOS/deps/ollama" ]; then
-    echo "SUCCESS: Ollama binary injected successfully."
+if [ -f "$BASE_DIR/deps/ollama" ] && [ -f "$BASE_DIR/models/pyannote/config.yaml" ]; then
+    echo "SUCCESS: All resources injected successfully."
 else
-    echo "ERROR: Failed to inject Ollama binary."
+    echo "ERROR: Resource injection failed."
+    ls -R "$BASE_DIR"
     exit 1
 fi
 

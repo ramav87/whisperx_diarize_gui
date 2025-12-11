@@ -39,10 +39,8 @@ hiddenimports += [
 # We put Ollama in a folder named 'deps'. 
 # PyInstaller logic: ('source_path', 'dest_folder_name')
 # This creates: Contents/MacOS/deps/ollama
-datas += [
-    (ollama_src, 'deps'),
-    (pyannote_src, 'models/pyannote')
-]
+# We will handle resource copying in build_app.sh manually
+datas += []
 # -----------------------------------------------
 
 block_cipher = None
