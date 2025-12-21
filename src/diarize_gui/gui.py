@@ -171,6 +171,20 @@ class DiarizationApp:
         )
         self.model_menu.pack(padx=10, pady=5, fill="x")
 
+        # --- NEW: Language selection ---
+        self.lang_label = tk.Label(master, text="Audio Language:")
+        self.lang_label.pack(padx=10, pady=(10, 0), anchor="w")
+
+        self.lang_var = tk.StringVar(value="auto")
+        # Common ISO codes. 'auto' will let Whisper detect, 
+        # but 'es' will force Spanish to prevent English translation.
+        self.lang_menu = tk.OptionMenu(
+            master,
+            self.lang_var,
+            "auto", "en", "es", "fr", "de", "it", "pt", "hi", "ta"
+        )
+        self.lang_menu.pack(padx=10, pady=5, fill="x")
+
         # condition_on_previous_text
         self.condition_var = tk.BooleanVar(value=False)
         self.condition_checkbox = tk.Checkbutton(
@@ -647,12 +661,16 @@ class DiarizationApp:
             self._show_error("Error", "Select output folder.")
             return
 
-        # --- DELETED: The entire HUGGINGFACE_TOKEN check block --- 
-        # (The block checking os.environ.get and showing the error is gone)
+        # Get the language and model size from the UI
+        model_size = self.model_var.get()
+        selected_lang = self.lang_var.get()
+        # If 'auto', pass None so WhisperX handles detection
+        self.language_to_pass = None if selected_lang == "auto" else selected_lang
 
         self._set_progress(0.0)
         self._set_status("Starting pipeline...")
 
+       
         thread = threading.Thread(
             target=self._run_pipeline_thread,
             args=(), # No arguments needed anymore
@@ -663,11 +681,13 @@ class DiarizationApp:
     def _run_pipeline_thread(self): # Removed hf_token arg
         try:
             model_size = self.model_var.get()
+            language = self.language_to_pass
             self.pipeline.process_audio(
                 audio_path=self.audio_path,
                 output_dir=self.output_dir,
                 model_size=model_size,
-                # Removed hf_token=hf_token
+                language=language
+       
             )
             self.has_result = True
             self._enable_export_buttons()

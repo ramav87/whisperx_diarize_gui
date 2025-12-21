@@ -124,7 +124,8 @@ class DiarizationPipelineRunner:
         audio_path: str,
         output_dir: str,
         model_size: str = "small",
-        # REMOVED: hf_token argument is no longer needed
+        language: str = None
+       
         ):
         """
         Run transcription + alignment + diarization on the given audio file.
@@ -154,7 +155,7 @@ class DiarizationPipelineRunner:
 
         self._set_status("Transcribing...")
         self._set_progress(50)
-        result = model.transcribe(audio)
+        result = model.transcribe(audio, language=language, task="transcribe")
 
         self._set_status("Loading alignment model...")
         self._set_progress(60)
