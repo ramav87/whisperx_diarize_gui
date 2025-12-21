@@ -202,13 +202,13 @@ class DiarizationApp:
 
         # --- NEW: Language selection ---
         # Language Selection
-        tk.Label(main_frame, text="Language:").grid(row=1, column=0, sticky="w", pady=5)
+        tk.Label(master, text="Language:").grid(row=1, column=0, sticky="w", pady=5)
         
         # Change the variable to hold the Name (e.g., "English") by default
         self.lang_var = tk.StringVar(value="Auto-Detect") 
         
         self.lang_combo = ttk.Combobox(
-            main_frame, 
+            master, 
             textvariable=self.lang_var, 
             # Use the KEYS (Readable Names) for the list
             values=list(LANGUAGE_MAP.keys()), 
