@@ -11,6 +11,35 @@ from .recorder import AudioRecorder
 from .pipeline import DiarizationPipelineRunner
 from .pyannote_offline_loader import get_resource_base_path
 
+LANGUAGE_MAP = {
+    "Auto-Detect": None,
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Italian": "it",
+    "Portuguese": "pt",
+    "Russian": "ru",
+    "Chinese": "zh",
+    "Japanese": "ja",
+    "Korean": "ko",
+    "Dutch": "nl",
+    "Polish": "pl",
+    "Turkish": "tr",
+    "Hindi": "hi",
+    "Arabic": "ar",
+    "Czech": "cs",
+    "Greek": "el",
+    "Hebrew": "he",
+    "Hungarian": "hu",
+    "Indonesian": "id",
+    "Malay": "ms",
+    "Romanian": "ro",
+    "Swedish": "sv",
+    "Ukrainian": "uk",
+    "Vietnamese": "vi"
+}
+
 def start_bundled_ollama():
     # 1. Determine search root (Contents/MacOS or src/)
     if getattr(sys, 'frozen', False):
@@ -172,18 +201,20 @@ class DiarizationApp:
         self.model_menu.pack(padx=10, pady=5, fill="x")
 
         # --- NEW: Language selection ---
-        self.lang_label = tk.Label(master, text="Audio Language:")
-        self.lang_label.pack(padx=10, pady=(10, 0), anchor="w")
-
-        self.lang_var = tk.StringVar(value="auto")
-        # Common ISO codes. 'auto' will let Whisper detect, 
-        # but 'es' will force Spanish to prevent English translation.
-        self.lang_menu = tk.OptionMenu(
-            master,
-            self.lang_var,
-            "auto", "en", "es", "fr", "de", "it", "pt", "hi", "ta"
+        # Language Selection
+        tk.Label(main_frame, text="Language:").grid(row=1, column=0, sticky="w", pady=5)
+        
+        # Change the variable to hold the Name (e.g., "English") by default
+        self.lang_var = tk.StringVar(value="Auto-Detect") 
+        
+        self.lang_combo = ttk.Combobox(
+            main_frame, 
+            textvariable=self.lang_var, 
+            # Use the KEYS (Readable Names) for the list
+            values=list(LANGUAGE_MAP.keys()), 
+            state="readonly"
         )
-        self.lang_menu.pack(padx=10, pady=5, fill="x")
+        self.lang_combo.grid(row=1, column=1, sticky="ew", pady=5)
 
         # condition_on_previous_text
         self.condition_var = tk.BooleanVar(value=False)
@@ -681,12 +712,15 @@ class DiarizationApp:
     def _run_pipeline_thread(self): # Removed hf_token arg
         try:
             model_size = self.model_var.get()
-            language = self.language_to_pass
+            # --- NEW: Get Code from Dictionary ---
+            selected_name = self.lang_var.get()
+            language_code = LANGUAGE_MAP.get(selected_name) # Returns 'en', 'es', or None
+            # -------------------------------------
             self.pipeline.process_audio(
                 audio_path=self.audio_path,
                 output_dir=self.output_dir,
                 model_size=model_size,
-                language=language
+                language=language_code
        
             )
             self.has_result = True
