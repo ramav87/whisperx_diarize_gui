@@ -561,6 +561,29 @@ class DiarizationApp:
         a_box.configure(state="disabled")
 
     # --- ANALYSIS FLOW ---
+    def update_preview():
+        selected = [s for s, v in self.spk_vars.items() if v.get()]
+        if not selected:
+            text = "(Select at least one speaker to preview.)"
+        else:
+            # You can pick a smaller max for preview to keep UI snappy
+            try:
+                text = self.pipeline.get_transcript_text(
+                    include_speaker=True,
+                    speaker_filters=selected,
+                    max_chars=6000,
+                )
+                if not text.strip():
+                    text = "(No transcript text for the selected speaker(s).)"
+            except Exception as e:
+                text = f"(Preview error: {e})"
+
+        preview_box.configure(state="normal")
+        preview_box.delete("1.0", "end")
+        preview_box.insert("1.0", text)
+        preview_box.configure(state="disabled")
+        preview_meta.configure(text=f"Chars: {len(text)}")
+        update_cost_estimate()
 
     def analyze_transcript(self):
         if not self.has_result or not self.pipeline.last_result: return
@@ -572,26 +595,44 @@ class DiarizationApp:
         self._open_analysis_setup_window(speakers)
 
     def _open_analysis_setup_window(self, speakers):
-        win = ctk.CTkToplevel(self.master)
         win.title("Setup Analysis")
-        win.geometry("600x700")
+        win.geometry("780x900")
+        win.minsize(760, 820)
+
+        # NEW: Scroll container for all content
+        container = ctk.CTkScrollableFrame(container)
+        container.pack(fill="both", expand=True, padx=12, pady=12)
+        
+        # --- Cost estimate callback placeholder (defined later) ---
+        def update_cost_estimate(_evt=None):
+            return
 
         # 1. Speaker Selection
-        ctk.CTkLabel(win, text="Select STUDENT Speakers:", font=("Roboto", 14, "bold")).pack(pady=(10,5))
+        ctk.CTkLabel(container, text="Select STUDENT Speakers:", font=("Roboto", 14, "bold")).pack(pady=(10,5))
         
-        spk_frame = ctk.CTkScrollableFrame(win, height=150)
+        spk_frame = ctk.CTkScrollableFrame(container, height=150)
         spk_frame.pack(fill="x", padx=20)
         
+        preview_box = ctk.CTkTextbox(container, height=220)
+        preview_box.pack(fill="both", expand=False, padx=5, pady=(0, 10))
+
+        preview_meta = ctk.CTkLabel(container, text="", text_color="gray")
+        preview_meta.pack(anchor="w", padx=6, pady=(0, 10))
+
         self.spk_vars = {}
         for spk in speakers:
             var = ctk.BooleanVar(value=(spk == "SPEAKER_00"))
-            cb = ctk.CTkCheckBox(spk_frame, text=spk, variable=var, command=update_cost_estimate)
+            cb = ctk.CTkCheckBox(spk_frame, text=spk, variable=var, command=update_preview)
             cb.pack(anchor="w", pady=2)
             self.spk_vars[spk] = var
 
+        # --- Transcript Preview ---
+        ctk.CTkLabel(container, text="Transcript Preview (filtered):", font=("Roboto", 14, "bold")).pack(pady=(10, 5))
+        update_preview()
+
         # 2. Model & Language
         # 2. Provider / Model / Language
-        sett_frame = ctk.CTkFrame(win)
+        sett_frame = ctk.CTkFrame(container)
         sett_frame.pack(fill="x", padx=20, pady=10)
 
         # Provider selector
@@ -648,18 +689,19 @@ class DiarizationApp:
         openai_row = ctk.CTkFrame(sett_frame, fg_color="transparent")
         openai_row.pack(fill="x", padx=10, pady=(5, 5))
 
-        # Load and deobfuscate if present
+        ctk.CTkLabel(openai_row, text="OpenAI API Key:", width=110, anchor="w").pack(side="left", padx=(0, 8))
+
         raw_key = self.profile_config.get("openai_api_key", "")
         self.openai_key_var = ctk.StringVar(value=deobfuscate_secret(raw_key))
 
         self.openai_key_entry = ctk.CTkEntry(
             openai_row,
             textvariable=self.openai_key_var,
-            placeholder_text="OpenAI API Key (sk-...)",
+            placeholder_text="sk-...",
             show="•",
             width=360
         )
-        self.openai_key_entry.pack(side="left", padx=(0, 10))
+        self.openai_key_entry.pack(side="left", padx=(0, 10), fill="x", expand=True)
 
         self.save_key_var = ctk.BooleanVar(value=True)
         self.save_key_cb = ctk.CTkCheckBox(openai_row, text="Save to profile", variable=self.save_key_var)
@@ -693,13 +735,9 @@ class DiarizationApp:
 
         # Apply initial enable/disable state
         update_provider_ui()
-
-        ctk.CTkRadioButton(sett_frame, text="English Feedback", variable=self.analysis_lang_var, value="EN").pack(side="left", padx=10)
-        ctk.CTkRadioButton(sett_frame, text="Spanish Feedback", variable=self.analysis_lang_var, value="ES").pack(side="left", padx=10)
-
         # 3. Prompt
-        ctk.CTkLabel(win, text="Custom Prompt:", font=("Roboto", 14, "bold")).pack(pady=(10,5))
-        prompt_box = ctk.CTkTextbox(win, height=200)
+        ctk.CTkLabel(container, text="Custom Prompt:", font=("Roboto", 14, "bold")).pack(pady=(10,5))
+        prompt_box = ctk.CTkTextbox(container, height=200)
         prompt_box.pack(fill="x", padx=20)
         
         prompt_box.bind("<KeyRelease>", update_cost_estimate)
@@ -712,8 +750,8 @@ class DiarizationApp:
         )
         prompt_box.insert("1.0", default_prompt)
 
-                # --- Cost estimate (OpenAI only) ---
-        est_frame = ctk.CTkFrame(win, fg_color="transparent")
+        # --- Cost estimate (OpenAI only) ---
+        est_frame = ctk.CTkFrame(container, fg_color="transparent")
         est_frame.pack(fill="x", padx=20, pady=(8, 0))
 
         self.cost_label = ctk.CTkLabel(
@@ -881,9 +919,9 @@ class DiarizationApp:
                 daemon=True
             ).start()
 
+        start_btn = ctk.CTkButton(container, text="Start Analysis", command=on_run, fg_color="#2e7d32", height=44)
+        start_btn.pack(pady=(10, 20), fill="x", padx=10)
 
-
-        ctk.CTkButton(win, text="Start Analysis", command=on_run, fg_color="#2e7d32").pack(pady=20)
 
     def _run_download_thread(self, model_name):
         # Popup for download progress
