@@ -2,63 +2,46 @@ import os
 import sys
 import threading
 import subprocess
+import json
+from datetime import datetime
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
-from tkinter import ttk
-import pyperclip  # You might need to add pyclip or just let user copy manually
-import atexit # To kill the server when app closes
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
+from PIL import Image
+import stat
+
+# Import backend logic
+from .utils import obfuscate_secret, deobfuscate_secret, estimate_openai_cost
 from .recorder import AudioRecorder
 from .pipeline import DiarizationPipelineRunner
 from .pyannote_offline_loader import get_resource_base_path
 
+# --- CONFIGURATION ---
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
+
 LANGUAGE_MAP = {
-    "Auto-Detect": None,
-    "English": "en",
-    "Spanish": "es",
-    "French": "fr",
-    "German": "de",
-    "Italian": "it",
-    "Portuguese": "pt",
-    "Russian": "ru",
-    "Chinese": "zh",
-    "Japanese": "ja",
-    "Korean": "ko",
-    "Dutch": "nl",
-    "Polish": "pl",
-    "Turkish": "tr",
-    "Hindi": "hi",
-    "Arabic": "ar",
-    "Czech": "cs",
-    "Greek": "el",
-    "Hebrew": "he",
-    "Hungarian": "hu",
-    "Indonesian": "id",
-    "Malay": "ms",
-    "Romanian": "ro",
-    "Swedish": "sv",
-    "Ukrainian": "uk",
-    "Vietnamese": "vi"
+    "Auto-Detect": None, "English": "en", "Spanish": "es", "French": "fr",
+    "German": "de", "Italian": "it", "Portuguese": "pt", "Russian": "ru",
+    "Chinese": "zh", "Japanese": "ja", "Korean": "ko", "Dutch": "nl",
+    "Polish": "pl", "Turkish": "tr", "Hindi": "hi", "Arabic": "ar",
+    "Czech": "cs", "Greek": "el", "Hebrew": "he", "Hungarian": "hu",
+    "Indonesian": "id", "Malay": "ms", "Romanian": "ro", "Swedish": "sv",
+    "Ukrainian": "uk", "Vietnamese": "vi"
 }
 
 def start_bundled_ollama():
-    # 1. Determine search root (Contents/MacOS or src/)
     if getattr(sys, 'frozen', False):
-        base_path = os.path.dirname(os.path.abspath(sys.executable))
+        base_path = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(os.path.abspath(sys.executable))
     else:
         base_path = get_resource_base_path()
 
-    # 2. Look specifically in the 'deps' folder defined in the spec
-    # Contents/MacOS/deps/ollama
+    # Look in deps (macOS bundle) or dev path
     ollama_bin = os.path.join(base_path, "deps", "ollama")
-    
-    # 3. Fallback for Dev Mode (where it might still be in resources/ollama)
     if not os.path.exists(ollama_bin):
-        dev_path = os.path.join(get_resource_base_path(), "ollama")
-        if os.path.exists(dev_path):
-            ollama_bin = dev_path
-
-    print(f"DEBUG: Looking for ollama at: {ollama_bin}")
-
+        # Dev fallback
+        ollama_bin = os.path.join(get_resource_base_path(), "ollama")
+    
     if not os.path.exists(ollama_bin):
         print(f"CRITICAL ERROR: Bundled Ollama binary not found at: {ollama_bin}")
         return None
@@ -68,7 +51,6 @@ def start_bundled_ollama():
     except Exception:
         pass
 
-    # 4. Launch
     models_dir = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
     os.makedirs(models_dir, exist_ok=True)
     
@@ -89,1050 +71,928 @@ def start_bundled_ollama():
         return None
 
 class DiarizationApp:
-    def __init__(self, master: tk.Tk):
+    def __init__(self, master):
         self.master = master
-        master.title("WhisperX Diarization (with Recording)")
+        self.profile_config = {}
 
-        # Profile selection
-        self.profile_frame = tk.Frame(master)
-        self.profile_frame.pack(padx=10, pady=(5, 5), fill="x")
+        master.title("Lesson Recording and Analysis App")
+        master.geometry("750x900")
 
-        self.profile_label = tk.Label(self.profile_frame, text="Profile: (none)")
-        self.profile_label.pack(side="left")
-
-        self.profile_button = tk.Button(
-            self.profile_frame,
-            text="Set profile...",
-            command=self.set_profile,
-        )
-        self.profile_button.pack(side="right")
-
-        # View history for current profile
-        self.history_button = tk.Button(
-            master,
-            text="View lesson history",
-            command=self.view_history,
-        )
-        self.history_button.pack(padx=10, pady=(0, 5), fill="x")
-
+        # --- LOGIC INIT ---
         self.audio_path = None
         self.output_dir = None
         self.is_recording = False
         self.has_result = False
         self.profile_name = None
-
-        # Status + progress
-        self.progress_var = tk.DoubleVar(value=0.0)
-
+        
         self.recorder = AudioRecorder(on_status=self._set_status)
         self.pipeline = DiarizationPipelineRunner(
             status_callback=self._set_status,
             progress_callback=self._set_progress,
         )
 
-        # Audio file label + button
-        self.audio_label = tk.Label(master, text="Audio file: (none selected)")
-        self.audio_label.pack(padx=10, pady=5, anchor="w")
+        # --- ICONS ---
+        self._load_icons()
 
-        self.audio_button = tk.Button(
-            master, text="Select Existing Audio File", command=self.select_audio
-        )
-        self.audio_button.pack(padx=10, pady=5, fill="x")
+        # --- UI LAYOUT ---
+        self._build_ui()
 
-        # Load existing diarized TXT
-        self.load_txt_button = tk.Button(
-            master,
-            text="Load diarized TXT for analysis",
-            command=self.load_diarized_txt,
+        # --- STARTUP ---
+        # Defer profile prompt slightly so UI renders first
+        self.master.after(200, self._prompt_profile_on_startup)
+        
+        # Start Ollama
+        self.ollama_process = start_bundled_ollama()
+        import atexit
+        atexit.register(self._cleanup_ollama)
+        os.environ["LLM_ANALYSIS_URL"] = "http://127.0.0.1:11435/api/generate"
+
+    def _load_icons(self):
+        def load_icon(name):
+            if getattr(sys, 'frozen', False):
+                base_path = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(os.path.abspath(sys.executable))
+                # Check common bundled locations
+                possible = [
+                    os.path.join(base_path, "resources", "icons", name),
+                    os.path.join(base_path, "icons", name),
+                    os.path.join(base_path, "..", "Resources", "icons", name)
+                ]
+            else:
+                # Source mode: src/diarize_gui/gui_modern.py -> ... -> resources/icons
+                curr = os.path.dirname(os.path.abspath(__file__))
+                root = os.path.abspath(os.path.join(curr, "..", ".."))
+                possible = [os.path.join(root, "resources", "icons", name)]
+
+            for p in possible:
+                if os.path.exists(p):
+                    return ctk.CTkImage(light_image=Image.open(p), dark_image=Image.open(p), size=(20, 20))
+            return None
+
+        self.icon_user = load_icon("user.png")
+        self.icon_mic = load_icon("mic.png")
+        self.icon_folder = load_icon("folder.png")
+
+    def _build_ui(self):
+        # 1. PROFILE HEADER
+        self.profile_frame = ctk.CTkFrame(self.master, corner_radius=10)
+        self.profile_frame.pack(padx=15, pady=(15, 5), fill="x")
+
+        self.profile_label = ctk.CTkLabel(
+            self.profile_frame, 
+            text="Profile: (none)", 
+            font=("Roboto", 16, "bold"),
+            image=self.icon_user,
+            compound="left",
+            padx=10
         )
-        self.load_txt_button.pack(padx=10, pady=5, fill="x")
+        self.profile_label.pack(side="left", padx=10, pady=10)
+
+        self.profile_btn = ctk.CTkButton(self.profile_frame, text="Change", width=80, command=self.set_profile)
+        self.profile_btn.pack(side="right", padx=(5, 10))
+        
+        self.history_btn = ctk.CTkButton(
+            self.profile_frame, 
+            text="History", 
+            width=80, 
+            fg_color="transparent", 
+            border_width=2, 
+            command=self.view_history
+        )
+        self.history_btn.pack(side="right", padx=0)
+
+        # 2. INPUT CARD
+        self.input_card = ctk.CTkFrame(self.master)
+        self.input_card.pack(padx=15, pady=5, fill="x")
+        
+        ctk.CTkLabel(self.input_card, text="Input Source", font=("Roboto", 14, "bold")).pack(anchor="w", padx=15, pady=(10,5))
+
+        # A. File Select
+        self.file_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
+        self.file_row.pack(fill="x", padx=10, pady=5)
+        
+        self.audio_btn = ctk.CTkButton(self.file_row, text="Select Audio", image=self.icon_folder, command=self.select_audio, width=120)
+        self.audio_btn.pack(side="left", padx=5)
+        
+        self.audio_label = ctk.CTkLabel(self.file_row, text="(No file selected)", text_color="gray")
+        self.audio_label.pack(side="left", padx=5)
+
+        ctk.CTkLabel(self.input_card, text="- OR -", text_color="gray", font=("Arial", 10)).pack()
+
+        # B. Recording
+        self.rec_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
+        self.rec_row.pack(fill="x", padx=10, pady=5)
+
+        # Device list
+        self.input_devices = self.recorder.list_input_devices()
+        dev_names = ["(default)"] + [f"{d['index']}: {d['name']}" for d in self.input_devices]
+        
+        self.device_var = ctk.StringVar(value="(default)")
+        self.device_menu = ctk.CTkOptionMenu(self.rec_row, variable=self.device_var, values=dev_names, width=220)
+        self.device_menu.pack(side="left", padx=5)
+
+        self.start_rec_btn = ctk.CTkButton(
+            self.rec_row, text="REC", width=60, 
+            fg_color="#d32f2f", hover_color="#b71c1c", 
+            image=self.icon_mic, command=self.start_recording
+        )
+        self.start_rec_btn.pack(side="left", padx=5)
+        
+        self.stop_rec_btn = ctk.CTkButton(self.rec_row, text="STOP", width=60, state="disabled", command=self.stop_recording)
+        self.stop_rec_btn.pack(side="left", padx=5)
+
+        # 3. SETTINGS CARD
+        self.settings_card = ctk.CTkFrame(self.master)
+        self.settings_card.pack(padx=15, pady=10, fill="x")
+        
+        ctk.CTkLabel(self.settings_card, text="Processing Settings", font=("Roboto", 14, "bold")).pack(anchor="w", padx=15, pady=(10,5))
+        
+        grid = ctk.CTkFrame(self.settings_card, fg_color="transparent")
+        grid.pack(fill="x", padx=10, pady=5)
 
         # Output folder
-        self.output_label = tk.Label(master, text="Output folder: (none selected)")
-        self.output_label.pack(padx=10, pady=5, anchor="w")
+        self.out_btn = ctk.CTkButton(grid, text="Output Folder", width=120, command=self.select_output_dir)
+        self.out_btn.grid(row=0, column=0, padx=5, pady=5)
+        self.output_label = ctk.CTkLabel(grid, text="(None)", text_color="gray")
+        self.output_label.grid(row=0, column=1, padx=5, sticky="w")
 
-        self.output_button = tk.Button(
-            master, text="Select Output Folder", command=self.select_output_dir
-        )
-        self.output_button.pack(padx=10, pady=5, fill="x")
+        # Model Size
+        ctk.CTkLabel(grid, text="Model Size:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.model_var = ctk.StringVar(value="small")
+        self.model_menu = ctk.CTkOptionMenu(grid, variable=self.model_var, values=["tiny", "base", "small", "medium", "large-v2"], width=100)
+        self.model_menu.grid(row=1, column=1, padx=5, sticky="w")
 
-        # Input device selection
-        self.device_label = tk.Label(master, text="Input device (microphone):")
-        self.device_label.pack(padx=10, pady=(10, 0), anchor="w")
-
-        self.device_var = tk.StringVar(value="(default)")
-        self.device_menu = tk.OptionMenu(master, self.device_var, "(default)")
-        self.device_menu.pack(padx=10, pady=5, fill="x")
-
-        self.input_devices = self.recorder.list_input_devices()
-        self._populate_device_menu()
-
-        # Recording controls
-        self.record_frame = tk.Frame(master)
-        self.record_frame.pack(padx=10, pady=5, fill="x")
-
-        self.start_rec_button = tk.Button(
-            self.record_frame, text="Start Recording", command=self.start_recording
-        )
-        self.start_rec_button.pack(side="left", expand=True, fill="x", padx=(0, 5))
-
-        self.stop_rec_button = tk.Button(
-            self.record_frame,
-            text="Stop Recording",
-            command=self.stop_recording,
-            state="disabled",
-        )
-        self.stop_rec_button.pack(side="left", expand=True, fill="x", padx=(5, 0))
-
-        # Model size
-        self.model_size_label = tk.Label(master, text="Whisper model size:")
-        self.model_size_label.pack(padx=10, pady=(10, 0), anchor="w")
-
-        self.model_var = tk.StringVar(value="small")
-        self.model_menu = tk.OptionMenu(
-            master,
-            self.model_var,
-            "tiny",
-            "base",
-            "small",
-            "medium",
-            "large-v2",
-        )
-        self.model_menu.pack(padx=10, pady=5, fill="x")
-
-        # --- NEW: Language selection ---
-        # Language Selection
-        lang_frame = tk.Frame(master)
-        lang_frame.pack(fill="x", pady=5)
+        # Language
+        ctk.CTkLabel(grid, text="Language:").grid(row=1, column=2, padx=5, pady=5, sticky="e")
+        self.lang_var = ctk.StringVar(value="Auto-Detect")
+        self.lang_combo = ctk.CTkOptionMenu(grid, variable=self.lang_var, values=list(LANGUAGE_MAP.keys()), width=120)
+        self.lang_combo.grid(row=1, column=3, padx=5, sticky="w")
         
-        tk.Label(lang_frame, text="Language:").pack(side="left", padx=5)
+        # Checkbox
+        self.condition_checkbox = ctk.CTkCheckBox(self.settings_card, text="Condition on previous text (Context)", onvalue=True, offvalue=False)
+        self.condition_checkbox.pack(padx=20, pady=(5, 15), anchor="w")
+
+        # 4. ACTION
+        self.run_btn = ctk.CTkButton(self.master, text="RUN PROCESSING", height=50, font=("Roboto", 18, "bold"), command=self.run_diarization)
+        self.run_btn.pack(padx=15, pady=5, fill="x")
+
+        # Status & Progress
+        self.progress_bar = ctk.CTkProgressBar(self.master)
+        self.progress_bar.pack(padx=15, pady=(5,5), fill="x")
+        self.progress_bar.set(0)
         
-        self.lang_var = tk.StringVar(value="Auto-Detect") 
-        self.lang_combo = ttk.Combobox(
-            lang_frame,   # <--- CHANGE 1: Attach this to 'lang_frame', not 'master'
-            textvariable=self.lang_var, 
-            values=list(LANGUAGE_MAP.keys()), 
-            state="readonly"
-        )
-        # CHANGE 2: Use .pack() instead of .grid()
-        self.lang_combo.pack(side="left", padx=5)
+        self.status_label = ctk.CTkLabel(self.master, text="Status: Idle", text_color="gray")
+        self.status_label.pack(padx=15, pady=(0,10), anchor="w")
 
-        # condition_on_previous_text
-        self.condition_var = tk.BooleanVar(value=False)
-        self.condition_checkbox = tk.Checkbutton(
-            master,
-            text="Condition on previous text (Whisper)",
-            variable=self.condition_var,
-        )
-        self.condition_checkbox.pack(padx=10, pady=5, anchor="w")
+        # 5. POST-PROCESSING CARD
+        self.post_card = ctk.CTkFrame(self.master)
+        self.post_card.pack(padx=15, pady=5, fill="x")
 
-        # Run button
-        self.run_button = tk.Button(
-            master,
-            text="Run Transcription + Diarization",
-            command=self.run_diarization,
+        self.analyze_btn = ctk.CTkButton(
+            self.post_card, 
+            text="Analyze with AI Assistant", 
+            state="disabled", 
+            fg_color="#2e7d32", 
+            hover_color="#1b5e20",
+            height=40,
+            command=self.analyze_transcript
         )
-        self.run_button.pack(padx=10, pady=10, fill="x")
+        self.analyze_btn.pack(padx=10, pady=10, fill="x")
 
-        # Export buttons
-        self.export_frame = tk.Frame(master)
-        self.export_frame.pack(padx=10, pady=(0, 5), fill="x")
-
-        self.analyze_button = tk.Button(
-            master,
-            text="Analyze transcript with LLM",
-            command=self.analyze_transcript,
-            state="disabled",
-        )
-        self.analyze_button.pack(padx=10, pady=(0, 10), fill="x")
-
-        self.export_srt_button = tk.Button(
-            self.export_frame,
-            text="Export SRT",
-            command=self.export_srt,
-            state="disabled",
-        )
-        self.export_srt_button.pack(side="left", expand=True, fill="x", padx=(0, 5))
+        exp_row = ctk.CTkFrame(self.post_card, fg_color="transparent")
+        exp_row.pack(fill="x", padx=10, pady=(0,10))
         
-        self.export_txt_button = tk.Button(
-            self.export_frame,
-            text="Export TXT",
-            command=self.export_txt,
-            state="disabled",
-        )
-        self.export_txt_button.pack(side="left", expand=True, fill="x", padx=(5, 5))
-
-        self.export_speaker_button = tk.Button(
-            self.export_frame,
-            text="Export speaker WAVs",
-            command=self.export_speaker_audio,
-            state="disabled",
-        )
-        self.export_speaker_button.pack(side="left", expand=True, fill="x", padx=(5, 0))
-
-        # Status label
-        self.status_label = tk.Label(master, text="Status: idle")
-        self.status_label.pack(padx=10, pady=(5, 2), anchor="w")
-
-        # Progress bar
-        self.progress_bar = ttk.Progressbar(
-            master,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100.0,
-            variable=self.progress_var,
-        )
-        self.progress_bar.pack(padx=10, pady=(0, 10), fill="x")
-
-        self.master.after(0, self._prompt_profile_on_startup)
-
-        #Launch ollama
-        # --- START BUNDLED OLLAMA ---
-        self.ollama_process = start_bundled_ollama()
+        self.export_srt_btn = ctk.CTkButton(exp_row, text="Export SRT", state="disabled", width=80, command=self.export_srt)
+        self.export_srt_btn.pack(side="left", padx=5, expand=True, fill="x")
         
-        # Ensure we kill the server when the GUI closes
-        atexit.register(self._cleanup_ollama)
+        self.export_txt_btn = ctk.CTkButton(exp_row, text="Export TXT", state="disabled", width=80, command=self.export_txt)
+        self.export_txt_btn.pack(side="left", padx=5, expand=True, fill="x")
         
-        # Also define a custom environment for client calls (used later in pipeline)
-        # We need to tell the pipeline to talk to our custom port 11435
-        os.environ["LLM_ANALYSIS_URL"] = "http://127.0.0.1:11435/api/generate"
-    
+        self.export_wav_btn = ctk.CTkButton(exp_row, text="Export Speakers", state="disabled", width=80, command=self.export_speaker_audio)
+        self.export_wav_btn.pack(side="left", padx=5, expand=True, fill="x")
+        
+        # Load TXT Button (at bottom)
+        self.load_txt_btn = ctk.CTkButton(self.master, text="Load Existing TXT", fg_color="transparent", border_width=1, text_color=("gray10", "gray90"), command=self.load_diarized_txt)
+        self.load_txt_btn.pack(pady=10)
+
+    # --- LOGIC METHODS ---
+    # --- PROFILE CONFIG (OpenAI key, provider prefs) ---
+
+    def _profile_base_dir(self):
+        return os.path.expanduser("~/.whisperx_diarize_gui")
+
+    def _profile_dir(self):
+        if not self.profile_name:
+            return None
+        return os.path.join(self._profile_base_dir(), "profiles", self.profile_name)
+
+    def _profile_config_path(self):
+        d = self._profile_dir()
+        if not d:
+            return None
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "config.json")
+
+    def _load_profile_config(self):
+        path = self._profile_config_path()
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r") as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _save_profile_config(self, cfg: dict):
+        path = self._profile_config_path()
+        if not path:
+            return
+        # Keep permissions user-only if possible
+        try:
+            with open(path, "w") as f:
+                json.dump(cfg, f, indent=2)
+            try:
+                os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+            except Exception:
+                pass
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save profile config: {e}")
+
     def _cleanup_ollama(self):
         if hasattr(self, 'ollama_process') and self.ollama_process:
-            print("Stopping bundled Ollama server...")
             self.ollama_process.terminate()
             self.ollama_process.wait()
+
+    def _set_status(self, text):
+        self.status_label.configure(text=f"Status: {text}")
+
+    def _set_progress(self, value):
+        # CTk progress bar is 0.0 to 1.0
+        self.progress_bar.set(float(value) / 100.0)
+
+    def _enable_export_buttons(self):
+        self.analyze_btn.configure(state="normal")
+        self.export_srt_btn.configure(state="normal")
+        self.export_txt_btn.configure(state="normal")
+        self.export_wav_btn.configure(state="normal")
+
+    def _disable_export_buttons(self):
+        self.analyze_btn.configure(state="disabled")
+        self.export_srt_btn.configure(state="disabled")
+        self.export_txt_btn.configure(state="disabled")
+        self.export_wav_btn.configure(state="disabled")
+
+    # --- PROFILE MANAGEMENT ---
 
     def _load_existing_profiles(self):
         base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
         profiles_dir = os.path.join(base_dir, "profiles")
         if not os.path.isdir(profiles_dir):
             return []
-        names = []
-        for name in os.listdir(profiles_dir):
-            full = os.path.join(profiles_dir, name)
-            if os.path.isdir(full):
-                names.append(name)
-        names.sort()
-        return names
+        return sorted([n for n in os.listdir(profiles_dir) if os.path.isdir(os.path.join(profiles_dir, n))])
 
     def _prompt_profile_on_startup(self):
         existing = self._load_existing_profiles()
+        
+        win = ctk.CTkToplevel(self.master)
+        win.title("Who is learning?")
+        win.geometry("400x400")
+        win.attributes("-topmost", True)
+        
+        ctk.CTkLabel(win, text="Select Profile", font=("Roboto", 20)).pack(pady=10)
 
-        win = tk.Toplevel(self.master)
-        win.title("Select profile")
-        win.geometry("400x300")
-        win.transient(self.master)
-        win.grab_set()
+        scroll = ctk.CTkScrollableFrame(win, height=200)
+        scroll.pack(fill="both", expand=True, padx=20, pady=10)
 
-        tk.Label(
-            win,
-            text="Select your profile or create a new one:",
-        ).pack(padx=10, pady=(10, 5), anchor="w")
+        # Helper to set and close
+        def select_and_close(name):
+            self.profile_name = name
+            self.profile_label.configure(text=f"Profile: {name}")
+             # Load profile config (OpenAI key, prefs)
+            self.profile_config = self._load_profile_config()
 
-        list_frame = tk.Frame(win)
-        list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
-
-        self._profile_listbox = tk.Listbox(list_frame, height=8)
-        self._profile_listbox.pack(side="left", fill="both", expand=True)
-
-        scroll = tk.Scrollbar(list_frame, command=self._profile_listbox.yview)
-        scroll.pack(side="right", fill="y")
-        self._profile_listbox.configure(yscrollcommand=scroll.set)
+            win.destroy()
 
         for name in existing:
-            self._profile_listbox.insert("end", name)
+            btn = ctk.CTkButton(scroll, text=name, fg_color="transparent", border_width=1, 
+                                command=lambda n=name: select_and_close(n))
+            btn.pack(fill="x", pady=2)
 
-        new_frame = tk.Frame(win)
-        new_frame.pack(fill="x", padx=10, pady=(5, 5))
+        ctk.CTkLabel(win, text="Or create new:").pack(pady=(10,0))
+        entry = ctk.CTkEntry(win, placeholder_text="New Name")
+        entry.pack(fill="x", padx=20, pady=5)
 
-        tk.Label(new_frame, text="New profile name (optional):").pack(anchor="w")
-        new_entry = tk.Entry(new_frame)
-        new_entry.pack(fill="x")
+        def create_new():
+            name = entry.get().strip()
+            if name:
+                select_and_close(name)
 
-        btn_frame = tk.Frame(win)
-        btn_frame.pack(fill="x", padx=10, pady=(10, 10))
-
-        chosen = {"name": None}
-
-        def on_ok():
-            new_name = new_entry.get().strip()
-            if new_name:
-                chosen["name"] = new_name
-            else:
-                sel = self._profile_listbox.curselection()
-                if sel:
-                    chosen["name"] = self._profile_listbox.get(sel[0])
-                else:
-                    messagebox.showerror(
-                        "Profile required",
-                        "Please select an existing profile or enter a new profile name.",
-                        parent=win,
-                    )
-                    return
-            win.destroy()
-
-        def on_cancel():
-            win.destroy()
-
-        ok_btn = tk.Button(btn_frame, text="OK", command=on_ok)
-        ok_btn.pack(side="right", padx=(5, 0))
-        cancel_btn = tk.Button(btn_frame, text="Cancel", command=on_cancel)
-        cancel_btn.pack(side="right")
-
-        def on_double_click(event):
-            sel = self._profile_listbox.curselection()
-            if not sel:
-                return
-            chosen["name"] = self._profile_listbox.get(sel[0])
-            win.destroy()
-
-        self._profile_listbox.bind("<Double-Button-1>", on_double_click)
-
-        self.master.update_idletasks()
-        x = self.master.winfo_rootx()
-        y = self.master.winfo_rooty()
-        w = self.master.winfo_width()
-        h = self.master.winfo_height()
-        win.update_idletasks()
-        ww = win.winfo_width()
-        wh = win.winfo_height()
-        win.geometry(f"+{x + (w - ww) // 2}+{y + (h - wh) // 2}")
-        self.master.wait_window(win)
-
-        if chosen["name"]:
-            self.profile_name = chosen["name"]
-            self.profile_label.config(text=f"Profile: {self.profile_name}")
-
-    def _populate_device_menu(self):
-        menu = self.device_menu["menu"]
-        menu.delete(0, "end")
-
-        menu.add_command(
-            label="(default)",
-            command=lambda v="(default)": self.device_var.set(v),
-        )
-        self.device_var.set("(default)")
-
-        for dev in self.input_devices:
-            label = f"{dev['index']}: {dev['name']}"
-            menu.add_command(
-                label=label,
-                command=lambda v=label: self.device_var.set(v),
-            )
-
-    def _get_selected_device_index(self):
-        value = self.device_var.get()
-        if value == "(default)":
-            return None
-        try:
-            idx_str = value.split(":", 1)[0].strip()
-            return int(idx_str)
-        except Exception:
-            return None
+        ctk.CTkButton(win, text="Create & Start", command=create_new).pack(pady=10)
+        win.wait_window() # Block until done
 
     def set_profile(self):
-        name = simpledialog.askstring(
-            "Set profile",
-            "Enter profile name:",
-            parent=self.master,
-        )
+        dialog = ctk.CTkInputDialog(text="Enter new profile name:", title="New Profile")
+        name = dialog.get_input()
         if name and name.strip():
             self.profile_name = name.strip()
-            self.profile_label.config(text=f"Profile: {name}")
+            self.profile_label.configure(text=f"Profile: {self.profile_name}")
+            self.profile_config = self._load_profile_config()
+
+
+    # --- MAIN FUNCTIONS ---
 
     def select_audio(self):
-        path = filedialog.askopenfilename(
-            title="Select audio file",
-            filetypes=[
-                ("Audio files", "*.mp3 *.wav *.m4a *.flac *.ogg"),
-                ("All files", "*.*"),
-            ],
-        )
+        path = filedialog.askopenfilename(filetypes=[("Audio", "*.mp3 *.wav *.m4a *.flac *.ogg"), ("All", "*.*")])
         if path:
             self.audio_path = path
-            self.audio_label.config(text=f"Audio file: {os.path.basename(path)}")
+            self.audio_label.configure(text=os.path.basename(path), text_color="white")
 
     def select_output_dir(self):
-        path = filedialog.askdirectory(title="Select output folder")
+        path = filedialog.askdirectory()
         if path:
             self.output_dir = path
-            self.output_label.config(text=f"Output folder: {path}")
+            self.output_label.configure(text=os.path.basename(path), text_color="white")
 
     def start_recording(self):
-        if self.is_recording:
-            return
-
+        if self.is_recording: return
         if not self.output_dir:
-            path = filedialog.askdirectory(title="Select output folder for recording")
-            if not path:
-                self._show_error("Error", "Please select an output folder.")
-                return
-            self.output_dir = path
-            self.output_label.config(text=f"Output folder: {path}")
+            self.select_output_dir()
+            if not self.output_dir: return
 
-        device_index = self._get_selected_device_index()
-        self.recorder.start_recording(self.output_dir, device_index=device_index)
+        # Parse device
+        dev_str = self.device_var.get()
+        idx = int(dev_str.split(":")[0]) if ":" in dev_str else None
+        
+        self.recorder.start_recording(self.output_dir, device_index=idx)
         if self.recorder.is_recording:
             self.is_recording = True
-            self.start_rec_button.config(state="disabled")
-            self.stop_rec_button.config(state="normal")
+            self.start_rec_btn.configure(state="disabled", fg_color="gray")
+            self.stop_rec_btn.configure(state="normal", fg_color="#d32f2f")
 
     def stop_recording(self):
-        if not self.is_recording:
-            return
-
-        recorded_file = self.recorder.stop_recording()
+        if not self.is_recording: return
+        f = self.recorder.stop_recording()
         self.is_recording = False
-        self.start_rec_button.config(state="normal")
-        self.stop_rec_button.config(state="disabled")
-
-        if recorded_file:
-            self.audio_path = recorded_file
-            self.audio_label.config(
-                text=f"Audio file (recorded): {os.path.basename(recorded_file)}"
-            )
-
-    def view_history(self):
-        if not self.profile_name:
-            self._show_error("No profile", "No profile is set.")
-            return
-
-        base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
-        profile_dir = os.path.join(base_dir, "profiles", self.profile_name)
-        lesson_dir = os.path.join(profile_dir, "lessons")
-
-        if not os.path.isdir(lesson_dir):
-            self._show_error("No lessons", f"No lessons found for profile '{self.profile_name}'.")
-            return
-
-        import json
-        from datetime import datetime
-
-        lessons = []
-        for fname in os.listdir(lesson_dir):
-            if not fname.endswith(".json"):
-                continue
-            path = os.path.join(lesson_dir, fname)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-
-            ts = data.get("timestamp", "")
-            audio_path = data.get("audio_path", "")
-            llm_model = data.get("llm_model", "")
-
-            try:
-                dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
-                ts_human = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                ts_human = ts
-
-            audio_name = os.path.basename(audio_path) if audio_path else "(no audio)"
-            label = f"{ts_human}  |  {audio_name}  |  {llm_model}"
-
-            lessons.append(
-                {
-                    "path": path,
-                    "label": label,
-                    "timestamp": ts,
-                    "audio_name": audio_name,
-                    "llm_model": llm_model,
-                    "data": data,
-                }
-            )
-
-        if not lessons:
-            self._show_error("No lessons", f"No valid lesson records found for profile '{self.profile_name}'.")
-            return
-
-        lessons.sort(key=lambda x: x["timestamp"], reverse=True)
-        self._history_lessons = lessons
-
-        win = tk.Toplevel(self.master)
-        win.title(f"Lesson history – {self.profile_name}")
-        win.geometry("700x400")
-
-        tk.Label(win, text=f"Lessons for profile '{self.profile_name}':").pack(anchor="w", padx=10, pady=(10, 5))
-
-        list_frame = tk.Frame(win)
-        list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
-
-        self._history_listbox = tk.Listbox(list_frame, height=15)
-        self._history_listbox.pack(side="left", fill="both", expand=True)
-
-        scroll = tk.Scrollbar(list_frame, command=self._history_listbox.yview)
-        scroll.pack(side="right", fill="y")
-        self._history_listbox.configure(yscrollcommand=scroll.set)
-
-        for lesson in lessons:
-            self._history_listbox.insert("end", lesson["label"])
-
-        btn_frame = tk.Frame(win)
-        btn_frame.pack(fill="x", padx=10, pady=(5, 10))
-
-        def on_open():
-            sel = self._history_listbox.curselection()
-            if not sel:
-                return
-            idx = sel[0]
-            lesson = self._history_lessons[idx]
-            self._open_lesson_detail(lesson)
-
-        def on_close():
-            win.destroy()
-
-        open_btn = tk.Button(btn_frame, text="Open lesson", command=on_open)
-        open_btn.pack(side="right", padx=(5, 0))
-        close_btn = tk.Button(btn_frame, text="Close", command=on_close)
-        close_btn.pack(side="right")
-
-        def on_double_click(event):
-            sel = self._history_listbox.curselection()
-            if not sel:
-                return
-            idx = sel[0]
-            lesson = self._history_lessons[idx]
-            self._open_lesson_detail(lesson)
-
-        self._history_listbox.bind("<Double-Button-1>", on_double_click)
-
-    def _open_lesson_detail(self, lesson_record: dict):
-        data = lesson_record.get("data", {})
-        transcript_text = data.get("transcript_text", "")
-        llm_response = data.get("llm_response", "")
-        llm_prompt = data.get("llm_prompt", "")
-        ts = data.get("timestamp", "")
-        audio_path = data.get("audio_path", "")
-        llm_model = data.get("llm_model", "")
-
-        win = tk.Toplevel(self.master)
-        title = f"Lesson detail – {ts}"
-        if audio_path:
-            title += f" – {os.path.basename(audio_path)}"
-        win.title(title)
-        win.geometry("1000x700")
-
-        meta_frame = tk.Frame(win)
-        meta_frame.pack(fill="x", padx=10, pady=(10, 5))
-
-        meta_lines = []
-        meta_lines.append(f"Profile: {self.profile_name}")
-        if ts: meta_lines.append(f"Timestamp: {ts}")
-        if audio_path: meta_lines.append(f"Audio: {audio_path}")
-        if llm_model: meta_lines.append(f"LLM model: {llm_model}")
-
-        tk.Label(meta_frame, text=" | ".join(meta_lines), wraplength=900, justify="left").pack(anchor="w")
-
-        main_frame = tk.Frame(win)
-        main_frame.pack(fill="both", expand=True, padx=10, pady=(5, 10))
-
-        left_frame = tk.Frame(main_frame)
-        left_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        tk.Label(left_frame, text="Transcript:").pack(anchor="w")
-        transcript_box = tk.Text(left_frame, wrap="word")
-        transcript_box.pack(side="left", fill="both", expand=True)
-        t_scroll = tk.Scrollbar(left_frame, command=transcript_box.yview)
-        t_scroll.pack(side="right", fill="y")
-        transcript_box.configure(yscrollcommand=t_scroll.set)
-        transcript_box.insert("1.0", transcript_text)
-        transcript_box.config(state="disabled")
-
-        right_frame = tk.Frame(main_frame)
-        right_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
-        tk.Label(right_frame, text="LLM feedback:").pack(anchor="w")
-        feedback_box = tk.Text(right_frame, wrap="word")
-        feedback_box.pack(side="left", fill="both", expand=True)
-        f_scroll = tk.Scrollbar(right_frame, command=feedback_box.yview)
-        f_scroll.pack(side="right", fill="y")
-        feedback_box.configure(yscrollcommand=f_scroll.set)
-        feedback_box.insert("1.0", llm_response)
-        feedback_box.config(state="disabled")
-
-        if llm_prompt:
-            prompt_frame = tk.Frame(win)
-            prompt_frame.pack(fill="x", padx=10, pady=(0, 10))
-            tk.Label(prompt_frame, text="Prompt used:").pack(anchor="w")
-            prompt_box = tk.Text(prompt_frame, wrap="word", height=5)
-            prompt_box.pack(fill="x")
-            prompt_box.insert("1.0", llm_prompt)
-            prompt_box.config(state="disabled")
-
-    def load_diarized_txt(self):
-        path = filedialog.askopenfilename(
-            title="Select diarized TXT file",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-
-        try:
-            self.pipeline.load_segments_from_txt(path)
-            self.audio_path = None
-            self.output_dir = os.path.dirname(path)
-
-            self.audio_label.config(text=f"Loaded TXT: {os.path.basename(path)}")
-            self.output_label.config(text=f"Output folder: {self.output_dir}")
-            self.has_result = True
-            self._enable_export_buttons()
-            self._set_status("Diarized TXT loaded; ready for analysis.")
-        except Exception as e:
-            self._show_error("Error loading TXT", str(e))
+        self.start_rec_btn.configure(state="normal", fg_color="#d32f2f")
+        self.stop_rec_btn.configure(state="disabled", fg_color="gray")
+        if f:
+            self.audio_path = f
+            self.audio_label.configure(text=os.path.basename(f), text_color="white")
 
     def run_diarization(self):
-        if self.is_recording:
-            self._show_error("Error", "Recording in progress.")
+        if not self.audio_path or not self.output_dir:
+            messagebox.showerror("Missing Info", "Please select audio and output folder.")
             return
 
-        if not self.audio_path:
-            self._show_error("Error", "Select/record audio first.")
-            return
-        if not self.output_dir:
-            self._show_error("Error", "Select output folder.")
-            return
-
-        # Get the language and model size from the UI
-        model_size = self.model_var.get()
-        selected_lang = self.lang_var.get()
-        # If 'auto', pass None so WhisperX handles detection
-        self.language_to_pass = None if selected_lang == "auto" else selected_lang
-
-        self._set_progress(0.0)
+        self.run_btn.configure(state="disabled")
+        self._set_progress(0)
         self._set_status("Starting pipeline...")
-
-       
-        thread = threading.Thread(
-            target=self._run_pipeline_thread,
-            args=(), # No arguments needed anymore
-        )
+        
+        thread = threading.Thread(target=self._run_pipeline_thread)
         thread.daemon = True
         thread.start()
 
-    def _run_pipeline_thread(self): # Removed hf_token arg
+    def _run_pipeline_thread(self):
         try:
-            model_size = self.model_var.get()
-            # --- NEW: Get Code from Dictionary ---
-            selected_name = self.lang_var.get()
-            language_code = LANGUAGE_MAP.get(selected_name) # Returns 'en', 'es', or None
-            # -------------------------------------
+            lang = self.lang_var.get()
+            lang_code = LANGUAGE_MAP.get(lang)
+            
             self.pipeline.process_audio(
                 audio_path=self.audio_path,
                 output_dir=self.output_dir,
-                model_size=model_size,
-                language=language_code
-       
+                model_size=self.model_var.get(),
+                language=lang_code
             )
             self.has_result = True
-            self._enable_export_buttons()
-            self._show_info("Success", "Processing complete.")
+            self.master.after(0, self._enable_export_buttons)
+            self.master.after(0, lambda: messagebox.showinfo("Done", "Processing Complete!"))
+            self._set_status("Complete")
         except Exception as e:
             self._set_status("Error")
-            self._set_progress(0.0)
-            self.has_result = False
-            self._disable_export_buttons()
-            self._show_error("Error", str(e))
+            self.master.after(0, lambda: messagebox.showerror("Error", str(e)))
+        finally:
+            self.master.after(0, lambda: self.run_btn.configure(state="normal"))
+
+    def load_diarized_txt(self):
+        path = filedialog.askopenfilename(filetypes=[("TXT", "*.txt")])
+        if path:
+            try:
+                self.pipeline.load_segments_from_txt(path)
+                self.output_dir = os.path.dirname(path)
+                self.output_label.configure(text=os.path.basename(self.output_dir))
+                self.has_result = True
+                self._enable_export_buttons()
+                self._set_status("TXT Loaded")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    # --- HISTORY VIEW ---
+
+    def view_history(self):
+        if not self.profile_name:
+            messagebox.showerror("Error", "No profile selected.")
+            return
+
+        base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
+        lesson_dir = os.path.join(base_dir, "profiles", self.profile_name, "lessons")
+        
+        if not os.path.isdir(lesson_dir):
+            messagebox.showinfo("History", "No history found for this profile.")
+            return
+
+        # Load JSONs
+        lessons = []
+        for fname in os.listdir(lesson_dir):
+            if fname.endswith(".json"):
+                try:
+                    with open(os.path.join(lesson_dir, fname), "r") as f:
+                        data = json.load(f)
+                        lessons.append(data)
+                except: pass
+        
+        # Sort by timestamp
+        lessons.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+
+        # UI
+        win = ctk.CTkToplevel(self.master)
+        win.title(f"History - {self.profile_name}")
+        win.geometry("600x500")
+
+        ctk.CTkLabel(win, text="Past Lessons", font=("Roboto", 20)).pack(pady=10)
+
+        scroll = ctk.CTkScrollableFrame(win)
+        scroll.pack(fill="both", expand=True, padx=10, pady=10)
+
+        for l in lessons:
+            ts = l.get("timestamp", "???")
+            provider = l.get("llm_provider", "ollama")
+            model = l.get("llm_model", "unknown")
+            # Create a card for each lesson
+            card = ctk.CTkFrame(scroll, fg_color="gray25")
+            card.pack(fill="x", pady=5)
+            
+            lbl = ctk.CTkLabel(card, text=f"Date: {ts}\nProvider: {provider}\nModel: {model}", justify="left")
+            lbl.pack(side="left", padx=10, pady=5)
+            
+            btn = ctk.CTkButton(card, text="Open", width=60, command=lambda d=l: self._open_lesson_detail(d))
+            btn.pack(side="right", padx=10)
+
+    def _open_lesson_detail(self, data):
+        win = ctk.CTkToplevel(self.master)
+        win.title("Lesson Detail")
+        win.geometry("800x600")
+
+        # Tabs for Transcript vs Analysis
+        tabview = ctk.CTkTabview(win)
+        tabview.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        t_tab = tabview.add("Transcript")
+        a_tab = tabview.add("Analysis")
+        
+        # Transcript Tab
+        t_box = ctk.CTkTextbox(t_tab)
+        t_box.pack(fill="both", expand=True)
+        t_box.insert("1.0", data.get("transcript_text", ""))
+        t_box.configure(state="disabled")
+        
+        # Analysis Tab
+        a_box = ctk.CTkTextbox(a_tab)
+        a_box.pack(fill="both", expand=True)
+        a_box.insert("1.0", data.get("llm_response", ""))
+        a_box.configure(state="disabled")
+
+    # --- ANALYSIS FLOW ---
+
+    def analyze_transcript(self):
+        if not self.has_result or not self.pipeline.last_result: return
+        
+        # Get speakers
+        segs = self.pipeline.last_result["segments"]
+        speakers = sorted(list(set(s.get("speaker", "") for s in segs if s.get("speaker"))))
+        
+        self._open_analysis_setup_window(speakers)
 
     def _open_analysis_setup_window(self, speakers):
-        win = tk.Toplevel(self.master)
-        win.title("Review transcript & select student speakers")
-        win.geometry("900x750")  # Slightly taller to fit everything
+        win = ctk.CTkToplevel(self.master)
+        win.title("Setup Analysis")
+        win.geometry("600x700")
 
-        # --- Top: Transcript View ---
-        top_frame = tk.Frame(win)
-        top_frame.pack(side="top", fill="both", expand=True, padx=10, pady=5)
+        # 1. Speaker Selection
+        ctk.CTkLabel(win, text="Select STUDENT Speakers:", font=("Roboto", 14, "bold")).pack(pady=(10,5))
         
-        tk.Label(top_frame, text="Full transcript (all speakers):").pack(anchor="w")
+        spk_frame = ctk.CTkScrollableFrame(win, height=150)
+        spk_frame.pack(fill="x", padx=20)
         
-        transcript_text = tk.Text(top_frame, wrap="word")
-        transcript_text.pack(side="left", fill="both", expand=True)
-        
-        scroll1 = tk.Scrollbar(top_frame, command=transcript_text.yview)
-        scroll1.pack(side="right", fill="y")
-        transcript_text.configure(yscrollcommand=scroll1.set)
-
-        try:
-            full_transcript = self.pipeline.get_transcript_text(
-                include_speaker=True, speaker_filters=None, max_chars=None
-            )
-        except Exception as e:
-            full_transcript = f"<<Error building transcript: {e}>>"
-
-        transcript_text.insert("1.0", full_transcript)
-        transcript_text.config(state="disabled")
-
-        # --- Middle: Speaker Selection & Settings ---
-        mid_frame = tk.Frame(win)
-        mid_frame.pack(side="top", fill="both", expand=False, padx=10, pady=5)
-
-        # 1. Left Column: Speakers
-        spk_frame = tk.Frame(mid_frame)
-        spk_frame.pack(side="left", fill="y", padx=(0, 10))
-
-        tk.Label(spk_frame, text="Select student speakers:").pack(anchor="w")
-        
-        # Character count label (RESTORED WARNING LOGIC)
-        self._char_count_label = tk.Label(spk_frame, text="Selected student text: 0 chars", fg="black")
-        self._char_count_label.pack(anchor="w", pady=(2, 5))
-
-        self._analysis_speaker_vars = {}
-
-        # Define update function with warning logic
-        def update_char_count():
-            selected = [spk for spk, var in self._analysis_speaker_vars.items() if var.get()]
-            try:
-                text = self.pipeline.get_transcript_text(
-                    include_speaker=True,
-                    speaker_filters=selected if selected else None,
-                    max_chars=None,  # Get full length to check against limit
-                )
-            except Exception:
-                text = ""
-            
-            length = len(text)
-            max_chars = 20000  # Sync with pipeline.DEFAULT_MAX_CHARS
-
-            if length <= max_chars:
-                msg = f"Selected: {length} chars (max {max_chars}; OK)"
-                self._char_count_label.config(text=msg, fg="black")
-            else:
-                msg = f"Selected: {length} chars (max {max_chars}; WILL BE TRUNCATED)"
-                self._char_count_label.config(text=msg, fg="red")
-
-        # Create checkboxes
+        self.spk_vars = {}
         for spk in speakers:
-            # Default to checking SPEAKER_00 as a guess, or unchecked
-            var = tk.BooleanVar(value=(spk == "SPEAKER_00"))
-            cb = tk.Checkbutton(
-                spk_frame,
-                text=spk,
-                variable=var,
-                command=update_char_count,  # update count when toggled
-            )
-            cb.pack(anchor="w")
-            self._analysis_speaker_vars[spk] = var
+            var = ctk.BooleanVar(value=(spk == "SPEAKER_00"))
+            cb = ctk.CTkCheckBox(spk_frame, text=spk, variable=var, command=update_cost_estimate)
+            cb.pack(anchor="w", pady=2)
+            self.spk_vars[spk] = var
 
-        # Initialize count
-        update_char_count()
+        # 2. Model & Language
+        # 2. Provider / Model / Language
+        sett_frame = ctk.CTkFrame(win)
+        sett_frame.pack(fill="x", padx=20, pady=10)
 
-        # 2. Right Column: LLM Settings & Prompt
-        right_frame = tk.Frame(mid_frame)
-        right_frame.pack(side="left", fill="both", expand=True)
-
-        # LLM Settings Row (Lang + Model)
-        llm_settings_frame = tk.Frame(right_frame)
-        llm_settings_frame.pack(fill="x", pady=(0, 5))
-
-        # Language Selection
-        tk.Label(llm_settings_frame, text="Lang:").pack(side="left")
-        self._analysis_lang_var = tk.StringVar(value="EN")  # EN or ES
-
-        tk.Radiobutton(
-            llm_settings_frame,
-            text="English",
-            variable=self._analysis_lang_var,
-            value="EN",
-        ).pack(side="left", padx=(5, 0))
-
-        tk.Radiobutton(
-            llm_settings_frame,
-            text="Spanish",
-            variable=self._analysis_lang_var,
-            value="ES",
-        ).pack(side="left", padx=(5, 15))
-
-        # Model Selector (NEW FEATURE)
-        tk.Label(llm_settings_frame, text="Ollama Model:").pack(side="left")
-        self._model_var = tk.StringVar(value="mistral")
-        
-        suggested_models = ["mistral", "mixtral", "gemma:2b", "gemma:7b", "gemma2", "phi", "llama2", "llama3"]
-        self._model_combo = ttk.Combobox(
-            llm_settings_frame, 
-            textvariable=self._model_var, 
-            values=suggested_models,
-            width=15
+        # Provider selector
+        self.analysis_provider_var = ctk.StringVar(
+            value=self.profile_config.get("llm_provider", "ollama")
         )
-        self._model_combo.pack(side="left", padx=(5, 0))
 
-        # Prompt Text Area
-        prompt_frame = tk.Frame(right_frame)
-        prompt_frame.pack(side="top", fill="both", expand=True)
+        prov_row = ctk.CTkFrame(sett_frame, fg_color="transparent")
+        prov_row.pack(fill="x", padx=10, pady=(10, 5))
 
-        tk.Label(prompt_frame, text="Analysis prompt (editable):").pack(anchor="w")
+        ctk.CTkLabel(prov_row, text="LLM Provider:", font=("Roboto", 13, "bold")).pack(side="left", padx=(0, 10))
+
+        ctk.CTkRadioButton(
+            prov_row, text="Local (Ollama)",
+            variable=self.analysis_provider_var, value="ollama",
+            command=lambda: update_provider_ui()
+        ).pack(side="left", padx=10)
+
+        ctk.CTkRadioButton(
+            prov_row, text="OpenAI",
+            variable=self.analysis_provider_var, value="openai",
+            command=lambda: update_provider_ui()
+        ).pack(side="left", padx=10)
+
+        # Model row
+        model_row = ctk.CTkFrame(sett_frame, fg_color="transparent")
+        model_row.pack(fill="x", padx=10, pady=(0, 5))
+
+        ctk.CTkLabel(model_row, text="Model:", width=60).pack(side="left")
+
+        self.ollama_models = ["mistral", "mixtral", "gemma:2b", "llama3"]
+        self.openai_models = ["gpt-4o", "gpt-4o-mini", "gpt-5.1", "gpt-5.2"]
+        
+        # Pick model default from profile depending on provider
+        provider0 = self.analysis_provider_var.get()
+        if provider0 == "openai":
+            default_model = self.profile_config.get("openai_model", "gpt-5.1")
+        else:
+            default_model = self.profile_config.get("ollama_model", "mistral")
+
+        self.analysis_model_var = ctk.StringVar(value=default_model)
+
+        self.model_menu = ctk.CTkOptionMenu(
+            model_row,
+            variable=self.analysis_model_var,
+            values=self.openai_models if provider0 == "openai" else self.ollama_models,
+            width=180,
+            command=lambda _val=None: update_cost_estimate(),
+        )
+
+        self.model_menu.pack(side="left", padx=5)
+
+        # OpenAI API key row (disabled unless OpenAI selected)
+        openai_row = ctk.CTkFrame(sett_frame, fg_color="transparent")
+        openai_row.pack(fill="x", padx=10, pady=(5, 5))
+
+        # Load and deobfuscate if present
+        raw_key = self.profile_config.get("openai_api_key", "")
+        self.openai_key_var = ctk.StringVar(value=deobfuscate_secret(raw_key))
+
+        self.openai_key_entry = ctk.CTkEntry(
+            openai_row,
+            textvariable=self.openai_key_var,
+            placeholder_text="OpenAI API Key (sk-...)",
+            show="•",
+            width=360
+        )
+        self.openai_key_entry.pack(side="left", padx=(0, 10))
+
+        self.save_key_var = ctk.BooleanVar(value=True)
+        self.save_key_cb = ctk.CTkCheckBox(openai_row, text="Save to profile", variable=self.save_key_var)
+        self.save_key_cb.pack(side="left")
+
+        # Language row
+        lang_row = ctk.CTkFrame(sett_frame, fg_color="transparent")
+        lang_row.pack(fill="x", padx=10, pady=(5, 10))
+
+        self.analysis_lang_var = ctk.StringVar(value=self.profile_config.get("analysis_lang", "EN"))
+        ctk.CTkLabel(lang_row, text="Feedback:", width=60).pack(side="left")
+        ctk.CTkRadioButton(lang_row, text="English", variable=self.analysis_lang_var, value="EN", command=update_cost_estimate).pack(side="left", padx=10)
+        ctk.CTkRadioButton(lang_row, text="Spanish", variable=self.analysis_lang_var, value="ES", command=update_cost_estimate).pack(side="left", padx=10)
+
+        def update_provider_ui():
+            provider = self.analysis_provider_var.get()
+            if provider == "openai":
+                self.model_menu.configure(values=self.openai_models)
+                if self.analysis_model_var.get() not in self.openai_models:
+                    self.analysis_model_var.set(self.profile_config.get("openai_model", "gpt-4o"))
+                self.openai_key_entry.configure(state="normal")
+                self.save_key_cb.configure(state="normal")
+            else:
+                self.model_menu.configure(values=self.ollama_models)
+                if self.analysis_model_var.get() not in self.ollama_models:
+                    self.analysis_model_var.set(self.profile_config.get("ollama_model", "mistral"))
+                self.openai_key_entry.configure(state="disabled")
+                self.save_key_cb.configure(state="disabled")
+            update_cost_estimate()
+
+
+        # Apply initial enable/disable state
+        update_provider_ui()
+
+        ctk.CTkRadioButton(sett_frame, text="English Feedback", variable=self.analysis_lang_var, value="EN").pack(side="left", padx=10)
+        ctk.CTkRadioButton(sett_frame, text="Spanish Feedback", variable=self.analysis_lang_var, value="ES").pack(side="left", padx=10)
+
+        # 3. Prompt
+        ctk.CTkLabel(win, text="Custom Prompt:", font=("Roboto", 14, "bold")).pack(pady=(10,5))
+        prompt_box = ctk.CTkTextbox(win, height=200)
+        prompt_box.pack(fill="x", padx=20)
+        
+        prompt_box.bind("<KeyRelease>", update_cost_estimate)
+        prompt_box.bind("<FocusOut>", update_cost_estimate)
+
 
         default_prompt = (
-            "You are an expert Spanish teacher analyzing a transcript of a 1-on-1 Spanish lesson.\n\n"
-            "Your job is NOT to give a long general summary. Instead, focus mainly on the student's Spanish.\n\n"
-            "Please do the following:\n"
-            "1. VERY brief summary (1–2 sentences max) of what the student talked about.\n"
-            "2. Identify the student's mistakes and weaknesses in Spanish (grammar, verb tenses, agreement, "
-            "prepositions, pronouns, word order, vocabulary, etc.). For each important issue:\n"
-            "   - Quote the original sentence or short fragment.\n"
-            "   - Give a corrected or more natural version.\n"
-            "   - Briefly explain why your version is better.\n"
-            "3. Highlight the student's strengths.\n"
-            "4. Suggest 3–5 very concrete goals for the next lessons.\n"
-            "5. Provide 5–10 example sentences the student could practice.\n\n"
-            "Assume that only the selected speaker IDs correspond to the student. "
-            "Do NOT include the full transcript in your answer."
+            "You are an expert Spanish teacher. Identify the student's mistakes "
+            "and provide corrections and practice goals."
         )
+        prompt_box.insert("1.0", default_prompt)
 
-        prompt_text = tk.Text(prompt_frame, wrap="word", height=12)
-        prompt_text.pack(side="left", fill="both", expand=True)
+                # --- Cost estimate (OpenAI only) ---
+        est_frame = ctk.CTkFrame(win, fg_color="transparent")
+        est_frame.pack(fill="x", padx=20, pady=(8, 0))
 
-        scroll2 = tk.Scrollbar(prompt_frame, command=prompt_text.yview)
-        scroll2.pack(side="right", fill="y")
-        prompt_text.configure(yscrollcommand=scroll2.set)
+        self.cost_label = ctk.CTkLabel(
+            est_frame,
+            text="Estimated cost: (select OpenAI to estimate)",
+            text_color="gray",
+            justify="left",
+        )
+        self.cost_label.pack(anchor="w")
 
-        prompt_text.insert("1.0", default_prompt)
+        # Try to use pipeline's default max chars if available, else fall back
+        try:
+            from .pipeline import DEFAULT_MAX_CHARS as _MAX_CHARS_DEFAULT
+        except Exception:
+            _MAX_CHARS_DEFAULT = 8000
 
-        # --- Bottom: Buttons ---
-        btn_frame = tk.Frame(win)
-        btn_frame.pack(side="bottom", fill="x", padx=10, pady=10)
+        def _build_estimated_combined_prompt() -> str:
+            # Speakers currently selected
+            selected_spks = [s for s, v in self.spk_vars.items() if v.get()]
+            speaker_filters = selected_spks if selected_spks else None
 
-        def on_ok():
-            # Collect selected speakers
-            selected = [spk for spk, var in self._analysis_speaker_vars.items() if var.get()]
-            if not selected:
-                messagebox.showerror("Error", "Please select at least one speaker that corresponds to the student.")
-                return
+            # Prompt text + language instruction (matches what you'll send)
+            base_prompt = prompt_box.get("1.0", "end").strip()
+            lang = self.analysis_lang_var.get()
+            if lang == "EN":
+                base_prompt += "\n\nWrite response in ENGLISH."
+            else:
+                base_prompt += "\n\nEscribe la respuesta en ESPAÑOL."
 
-            prompt = prompt_text.get("1.0", "end").strip()
-            if not prompt:
-                messagebox.showerror("Error", "Prompt cannot be empty.")
-                return
+            transcript = self.pipeline.get_transcript_text(
+                include_speaker=True,
+                speaker_filters=speaker_filters,
+                max_chars=_MAX_CHARS_DEFAULT,
+            )
 
-            # --- Check Model Availability (NEW) ---
-            target_model = self._model_var.get().strip()
-            api_url = os.environ.get("LLM_ANALYSIS_URL", "http://localhost:11434/api/generate")
-            
-            # ... inside on_ok ...
-            is_avail = self.pipeline.check_ollama_model_availability(target_model, api_url)
-            
-            if not is_avail:
-                # We can't ask them to run terminal commands anymore because
-                # they need to use OUR binary and OUR port/paths.
-                # We should offer to download it for them right here.
-                
-                msg = (
-                    f"The model '{target_model}' is missing from the app's internal storage.\n\n"
-                    "Would you like to download it now? (This may take a few minutes)"
+            speakers_str = ", ".join(selected_spks) if selected_spks else "ALL"
+            combined = (
+                base_prompt
+                + f"\n\n--- FILTERED TRANSCRIPT (speakers: {speakers_str}) ---\n"
+                + transcript
+            )
+            return combined
+
+        def update_cost_estimate(_evt=None):
+            try:
+                provider = self.analysis_provider_var.get()
+            except Exception:
+                provider = "ollama"
+
+            if provider != "openai":
+                self.cost_label.configure(
+                    text="Estimated cost: (local analysis — no OpenAI cost)",
+                    text_color="gray",
                 )
-                do_download = messagebox.askyesno("Model Missing", msg)
-                
-                if do_download:
-                    # Run the pull command using the bundled binary and environment
-                    self._run_download_thread(target_model)
-                    return # Exit this function, wait for download callback
-                else:
+                return
+
+            model = self.analysis_model_var.get()
+            combined_prompt = _build_estimated_combined_prompt()
+
+            est = estimate_openai_cost(text=combined_prompt, model=model)
+            if not est:
+                self.cost_label.configure(
+                    text=f"Estimated cost: (no pricing data for model: {model})",
+                    text_color="gray",
+                )
+                return
+
+            total = est["total_cost_usd"]
+            inp = est["input_tokens"]
+            out = est["output_tokens"]
+
+            # Show a small range by varying output ratio (typical variance)
+            est_low = estimate_openai_cost(text=combined_prompt, model=model, output_ratio=0.25)
+            est_high = estimate_openai_cost(text=combined_prompt, model=model, output_ratio=0.50)
+            if est_low and est_high:
+                lo = est_low["total_cost_usd"]
+                hi = est_high["total_cost_usd"]
+                text = (
+                    f"Estimated OpenAI cost: ~${lo:.4f} – ${hi:.4f} per run  "
+                    f"(in ~{inp:,} tok, out ~{out:,} tok)"
+                )
+            else:
+                text = (
+                    f"Estimated OpenAI cost: ~${total:.4f} per run  "
+                    f"(in ~{inp:,} tok, out ~{out:,} tok)"
+                )
+
+            # If it's getting expensive, use a warmer color
+            color = "gray"
+            if total >= 0.50:
+                color = "orange"
+            if total >= 2.00:
+                color = "red"
+
+            self.cost_label.configure(text=text, text_color=color)
+
+        # Initialize estimate once the widgets exist
+        update_cost_estimate()
+
+
+        def on_run():
+            selected_spks = [s for s, v in self.spk_vars.items() if v.get()]
+            if not selected_spks:
+                messagebox.showerror("Error", "Select at least one speaker.")
+                return
+
+            provider = self.analysis_provider_var.get()
+            model = self.analysis_model_var.get()
+
+            # Build prompt
+            final_prompt = prompt_box.get("1.0", "end").strip()
+            lang = self.analysis_lang_var.get()
+            if lang == "EN":
+                final_prompt += "\n\nWrite response in ENGLISH."
+            else:
+                final_prompt += "\n\nEscribe la respuesta en ESPAÑOL."
+
+            # Load existing config and update preferences
+            cfg = self._load_profile_config()
+            cfg["llm_provider"] = provider
+            cfg["analysis_lang"] = lang
+
+            if provider == "openai":
+                cfg["openai_model"] = model
+            else:
+                cfg["ollama_model"] = model
+
+            # Handle provider-specific validation
+            openai_key_to_use = None
+
+            if provider == "openai":
+                openai_key_to_use = (self.openai_key_var.get() or "").strip()
+                if not openai_key_to_use:
+                    messagebox.showerror("Error", "Please enter your OpenAI API key.")
                     return
 
-            lang = self._analysis_lang_var.get()
+                if self.save_key_var.get():
+                    cfg["openai_api_key"] = obfuscate_secret(openai_key_to_use)
 
-            # Append explicit language instruction
-            if lang == "EN":
-                prompt += "\n\nIMPORTANT: Write all your feedback in ENGLISH."
-            else:
-                prompt += "\n\nIMPORTANTE: Escribe TODA tu respuesta en ESPAÑOL."
+                self._save_profile_config(cfg)
+                self.profile_config = cfg
+
+                win.destroy()
+                threading.Thread(
+                    target=self._run_analysis_thread,
+                    args=(final_prompt, selected_spks, provider, model, openai_key_to_use),
+                    daemon=True
+                ).start()
+                return
+
+            # provider == ollama (existing model availability check)
+            api_url = os.environ.get("LLM_ANALYSIS_URL", "http://localhost:11434/api/generate")
+            if not self.pipeline.check_ollama_model_availability(model, api_url):
+                if messagebox.askyesno("Model Missing", f"Download {model}?"):
+                    self._run_download_thread(model)
+                return
+
+            self._save_profile_config(cfg)
+            self.profile_config = cfg
 
             win.destroy()
-            
-            # Start analysis thread
-            thread = threading.Thread(
+            threading.Thread(
                 target=self._run_analysis_thread,
-                args=(prompt, selected, target_model),
-            )
-            thread.daemon = True
-            thread.start()
+                args=(final_prompt, selected_spks, provider, model, None),
+                daemon=True
+            ).start()
 
-        def on_cancel():
-            win.destroy()
 
-        ok_btn = tk.Button(btn_frame, text="OK (Analyze)", command=on_ok)
-        ok_btn.pack(side="right", padx=(5, 0))
-        cancel_btn = tk.Button(btn_frame, text="Cancel", command=on_cancel)
-        cancel_btn.pack(side="right")
 
-    def export_txt(self):
-        if not self.has_result: return
-        path = filedialog.asksaveasfilename(defaultextension=".txt")
-        if path:
-            try:
-                self.pipeline.export_txt(path)
-                self._show_info("Export", f"Saved to {path}")
-            except Exception as e:
-                self._show_error("Error", str(e))
-
-    def export_srt(self):
-        if not self.has_result: return
-        path = filedialog.asksaveasfilename(defaultextension=".srt")
-        if path:
-            try:
-                self.pipeline.export_srt(path)
-                self._show_info("Export", f"Saved to {path}")
-            except Exception as e:
-                self._show_error("Error", str(e))
+        ctk.CTkButton(win, text="Start Analysis", command=on_run, fg_color="#2e7d32").pack(pady=20)
 
     def _run_download_thread(self, model_name):
-        """
-        Runs 'ollama pull' using the bundled binary...
-        """
-        resource_path = get_resource_base_path()
-        
-        # NEW CORRECT PATH (Look in 'deps')
-        ollama_bin = os.path.join(resource_path, "deps", "ollama")
-        
-        # Fallback for Dev Mode (if running from source where 'deps' doesn't exist)
-        if not os.path.exists(ollama_bin):
-             ollama_bin = os.path.join(resource_path, "ollama")
-
-        # Reconstruct the environment used by the server
-        models_dir = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
-        env = os.environ.copy()
-        env["OLLAMA_MODELS"] = models_dir
-        env["OLLAMA_HOST"] = "127.0.0.1:11435"
-
-        # Create a simple popup window
-        dl_win = tk.Toplevel(self.master)
+        # Popup for download progress
+        dl_win = ctk.CTkToplevel(self.master)
         dl_win.title(f"Downloading {model_name}...")
-        dl_win.geometry("300x100")
-        tk.Label(dl_win, text="Downloading model... please wait.").pack(pady=10)
-        pbar = ttk.Progressbar(dl_win, mode='indeterminate')
-        pbar.pack(fill='x', padx=20)
-        pbar.start()
+        dl_win.geometry("300x150")
+        
+        lbl = ctk.CTkLabel(dl_win, text="Downloading... please wait.")
+        lbl.pack(pady=20)
+        prog = ctk.CTkProgressBar(dl_win, mode="indeterminate")
+        prog.pack(padx=20, fill="x")
+        prog.start()
 
-        def run_pull():
+        def worker():
+            if getattr(sys, 'frozen', False):
+                base_path = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                base_path = get_resource_base_path()
+            
+            ollama_bin = os.path.join(base_path, "deps", "ollama")
+            if not os.path.exists(ollama_bin):
+                ollama_bin = os.path.join(get_resource_base_path(), "ollama")
+
+            env = os.environ.copy()
+            env["OLLAMA_MODELS"] = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+            env["OLLAMA_HOST"] = "127.0.0.1:11435"
+
             try:
-                # This blocks until download finishes
-                subprocess.run(
-                    [ollama_bin, "pull", model_name],
-                    env=env,
-                    check=True,
-                    # capture output so it doesn't pop up a terminal
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE 
-                )
-                self.master.after(0, lambda: messagebox.showinfo("Success", f"{model_name} installed!"))
+                subprocess.run([ollama_bin, "pull", model_name], env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.master.after(0, lambda: messagebox.showinfo("Success", "Model Installed!"))
             except Exception as e:
-                # --- FIX 2: Capture the error string immediately ---
-                error_msg = str(e)
-                # Pass 'error_msg' to lambda, NOT 'e'
-                self.master.after(0, lambda: messagebox.showerror("Error", f"Download failed: {error_msg}"))
+                self.master.after(0, lambda: messagebox.showerror("Error", str(e)))
             finally:
                 self.master.after(0, dl_win.destroy)
 
-        threading.Thread(target=run_pull, daemon=True).start()
+        threading.Thread(target=worker, daemon=True).start()
 
-    def analyze_transcript(self):
-        if not self.has_result: return
-        if not self.pipeline.last_result: return
-        speakers = sorted(list(set(s.get("speaker","") for s in self.pipeline.last_result["segments"] if s.get("speaker"))))
-        if not speakers:
-            self._show_error("Error", "No speakers found.")
-            return
-        self._open_analysis_setup_window(speakers)
-
-    def _run_analysis_thread(self, prompt: str, speakers, model: str):
+    def _run_analysis_thread(self, prompt, speakers, provider, model, openai_api_key=None):
+        self._set_status("Analyzing...")
+        self._set_progress(20) # fake progress
         try:
-            self._set_status("Running analysis...")
-            self._set_progress(10)
-            
-            # Pass the model to the pipeline
-            analysis_text = self.pipeline.analyze_with_llm(
-                prompt,
+            res = self.pipeline.analyze_with_llm(
+                user_prompt=prompt,
+                provider=provider,
+                model=model,
+                api_key=openai_api_key if provider == "openai" else None,
                 speakers=speakers,
-                model=model
             )
-            self._save_lesson_record(prompt, analysis_text, model)
-            self._show_analysis_window(analysis_text)
+
+
+            self._save_lesson_record(prompt, res, model, provider=provider)
+            self.master.after(0, lambda: self._show_analysis_window(res))
+            self._set_status("Analysis Done")
+            self._set_progress(100)
         except Exception as e:
-            self._set_status("Analysis error")
-            self._set_progress(0.0)
-            self._show_error("Error", str(e))
+            self.master.after(0, lambda: messagebox.showerror("Analysis Failed", str(e)))
+            self._set_status("Error")
 
-    def _show_analysis_window(self, text: str):
-        def create_window():
-            win = tk.Toplevel(self.master)
-            win.title("Analysis Result")
-            txt = tk.Text(win, wrap="word")
-            txt.pack(fill="both", expand=True)
-            txt.insert("1.0", text)
-        self.master.after(0, create_window)
+    def _show_analysis_window(self, text):
+        win = ctk.CTkToplevel(self.master)
+        win.title("Analysis Result")
+        win.geometry("700x600")
+        
+        box = ctk.CTkTextbox(win)
+        box.pack(fill="both", expand=True, padx=10, pady=10)
+        box.insert("1.0", text)
 
-    def export_speaker_audio(self):
-        if not self.has_result: return
-        path = filedialog.askdirectory()
-        if path:
-            try:
-                self.pipeline.export_speaker_audios(path)
-                self._show_info("Export", f"Saved to {path}")
-            except Exception as e:
-                self._show_error("Error", str(e))
-
-    def _set_status(self, text: str):
-        self.master.after(0, lambda: self.status_label.config(text=f"Status: {text}"))
-
-    def _set_progress(self, value: float):
-        self.master.after(0, lambda: self.progress_var.set(float(value)))
-
-    def _show_error(self, title: str, message: str):
-        self.master.after(0, lambda: messagebox.showerror(title, message))
-
-    def _show_info(self, title: str, message: str):
-        self.master.after(0, lambda: messagebox.showinfo(title, message))
-
-    def _enable_export_buttons(self):
-        def enable():
-            self.export_srt_button.config(state="normal")
-            self.export_txt_button.config(state="normal")
-            self.analyze_button.config(state="normal")
-            if self.pipeline.last_diar_df is not None:
-                self.export_speaker_button.config(state="normal")
-        self.master.after(0, enable)
-
-    def _disable_export_buttons(self):
-        def disable():
-            self.export_srt_button.config(state="disabled")
-            self.export_txt_button.config(state="disabled")
-            self.export_speaker_button.config(state="disabled")
-            self.analyze_button.config(state="disabled")
-        self.master.after(0, disable)
-
-    def _save_lesson_record(self, prompt: str, analysis_text: str, model_used: str = "mistral"):
-        import os, json
-        from datetime import datetime
+    def _save_lesson_record(self, prompt, response, model, provider=None):
         if not self.profile_name: return
-
         base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
-        profile_dir = os.path.join(base_dir, "profiles", self.profile_name)
-        lesson_dir = os.path.join(profile_dir, "lessons")
-        os.makedirs(lesson_dir, exist_ok=True)
-
+        d = os.path.join(base_dir, "profiles", self.profile_name, "lessons")
+        os.makedirs(d, exist_ok=True)
+        
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"lesson_{ts}.json"
-        path = os.path.join(lesson_dir, filename)
-
-        try:
-            transcript_text = self.pipeline.get_transcript_text(include_speaker=True)
-        except Exception:
-            transcript_text = ""
-
         record = {
             "timestamp": ts,
-            "profile": self.profile_name,
-            "audio_path": self.audio_path,
-            "output_dir": self.output_dir,
-            "llm_model": model_used,
+            "llm_model": model,
             "llm_prompt": prompt,
-            "llm_response": analysis_text,
-            "transcript_text": transcript_text,
+            "llm_response": response,
+            "llm_provider": provider or "ollama",
+            "transcript_text": self.pipeline.get_transcript_text(include_speaker=True)
         }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(record, f, ensure_ascii=False, indent=2)
-        self._show_info("Saved", f"Lesson saved to {path}")
+        with open(os.path.join(d, f"lesson_{ts}.json"), "w") as f:
+            json.dump(record, f, indent=2)
+
+    # --- EXPORTS ---
+
+    def export_srt(self):
+        path = filedialog.asksaveasfilename(defaultextension=".srt")
+        if path:
+            self.pipeline.export_srt(path)
+            messagebox.showinfo("Export", "Saved SRT")
+
+    def export_txt(self):
+        path = filedialog.asksaveasfilename(defaultextension=".txt")
+        if path:
+            self.pipeline.export_txt(path)
+            messagebox.showinfo("Export", "Saved TXT")
+
+    def export_speaker_audio(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.pipeline.export_speaker_audios(path)
+            messagebox.showinfo("Export", "Saved Speaker Audios")
 
 def main():
-    root = tk.Tk()
+    root = ctk.CTk()
     app = DiarizationApp(root)
     root.mainloop()
+
+if __name__ == "__main__":
+    main()

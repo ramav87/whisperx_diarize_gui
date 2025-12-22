@@ -296,9 +296,10 @@ class DiarizationPipelineRunner:
     def analyze_with_llm(
         self,
         user_prompt: str,
-        model: Optional[str] = "mistral",
+        model: Optional[str] = None,
         api_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        provider: str = "ollama",
         speakers: Optional[List[str]] = None,
         max_chars: int = DEFAULT_MAX_CHARS,
     ) -> str:
@@ -314,55 +315,68 @@ class DiarizationPipelineRunner:
         speakers_str = ", ".join(speakers) if speakers else "TODOS"
         combined_prompt = (
             user_prompt.strip()
-            + "\n\n--- TRANSCRIPCIÓN FILTRADA (speakers: "
+            + "\n\n--- FILTERED TRANSCRIPT (speakers: "
             + speakers_str
             + ") ---\n"
             + transcript
         )
 
-        api_url = api_url or os.environ.get(
-            "LLM_ANALYSIS_URL", "http://localhost:11434/api/generate"
-        )
-        
-        # Override env var if model is passed
-        model = model or os.environ.get("LLM_ANALYSIS_MODEL", "mistral")
+        if provider == "openai":
 
-        headers = {}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+            from .openai_provider import OpenAIProvider
+            client = OpenAIProvider(api_key=api_key, model=model or "gpt-5.1")
+            
+            self._set_status(f"Calling OpenAI ({client.model})...")
+            self._set_progress(50)
+            text = client.analyze(combined_prompt)
+            self._set_status("Analysis done")
+            self._set_progress(100)
 
-        payload = {
-            "model": model,
-            "prompt": combined_prompt,
-            "stream": False,
-        }
+            return text
+        elif provider == "ollama":
+            api_url = api_url or os.environ.get(
+                "LLM_ANALYSIS_URL", "http://localhost:11434/api/generate"
+            )
+            
+            # Override env var if model is passed
+            model = model or os.environ.get("LLM_ANALYSIS_MODEL", "mistral")
 
-        self._set_status(f"Calling analysis model ({model})...")
-        self._set_progress(50)
+            headers = {}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
 
-        import requests
-        resp = requests.post(api_url, json=payload, headers=headers, timeout=600)
-        resp.raise_for_status()
-        data = resp.json()
+            payload = {
+                "model": model,
+                "prompt": combined_prompt,
+                "stream": False,
+            }
 
-        text = None
-        if isinstance(data, dict) and "response" in data:
-            text = data["response"]
-        if text is None and "choices" in data:
-            try:
-                text = data["choices"][0]["message"]["content"]
-            except Exception:
+            self._set_status(f"Calling analysis model ({model})...")
+            self._set_progress(50)
+
+            import requests
+            resp = requests.post(api_url, json=payload, headers=headers, timeout=600)
+            resp.raise_for_status()
+            data = resp.json()
+
+            text = None
+            if isinstance(data, dict) and "response" in data:
+                text = data["response"]
+            if text is None and "choices" in data:
                 try:
-                    text = data["choices"][0]["text"]
+                    text = data["choices"][0]["message"]["content"]
                 except Exception:
-                    pass
+                    try:
+                        text = data["choices"][0]["text"]
+                    except Exception:
+                        pass
 
-        if not text:
-            raise RuntimeError(f"Could not parse LLM response: {data}")
+            if not text:
+                raise RuntimeError(f"Could not parse LLM response: {data}")
 
-        self._set_status("Analysis done")
-        self._set_progress(100)
-        return text
+            self._set_status("Analysis done")
+            self._set_progress(100)
+            return text
 
     # ---------- Export helpers (unchanged) ----------
     def export_txt(self, txt_path: str):
