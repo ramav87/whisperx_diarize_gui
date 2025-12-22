@@ -561,29 +561,6 @@ class DiarizationApp:
         a_box.configure(state="disabled")
 
     # --- ANALYSIS FLOW ---
-    def update_preview():
-        selected = [s for s, v in self.spk_vars.items() if v.get()]
-        if not selected:
-            text = "(Select at least one speaker to preview.)"
-        else:
-            # You can pick a smaller max for preview to keep UI snappy
-            try:
-                text = self.pipeline.get_transcript_text(
-                    include_speaker=True,
-                    speaker_filters=selected,
-                    max_chars=6000,
-                )
-                if not text.strip():
-                    text = "(No transcript text for the selected speaker(s).)"
-            except Exception as e:
-                text = f"(Preview error: {e})"
-
-        preview_box.configure(state="normal")
-        preview_box.delete("1.0", "end")
-        preview_box.insert("1.0", text)
-        preview_box.configure(state="disabled")
-        preview_meta.configure(text=f"Chars: {len(text)}")
-        update_cost_estimate()
 
     def analyze_transcript(self):
         if not self.has_result or not self.pipeline.last_result: return
@@ -595,45 +572,89 @@ class DiarizationApp:
         self._open_analysis_setup_window(speakers)
 
     def _open_analysis_setup_window(self, speakers):
+        win = ctk.CTkToplevel(self.master)
         win.title("Setup Analysis")
-        win.geometry("780x900")
-        win.minsize(760, 820)
+        win.geometry("900x720")
+        win.minsize(860, 680)
 
-        # NEW: Scroll container for all content
-        container = ctk.CTkScrollableFrame(container)
-        container.pack(fill="both", expand=True, padx=12, pady=12)
+        # Container for all content (no window scrolling)
+        container = ctk.CTkFrame(win, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=12, pady=5)
         
         # --- Cost estimate callback placeholder (defined later) ---
         def update_cost_estimate(_evt=None):
             return
 
-        # 1. Speaker Selection
-        ctk.CTkLabel(container, text="Select STUDENT Speakers:", font=("Roboto", 14, "bold")).pack(pady=(10,5))
-        
-        spk_frame = ctk.CTkScrollableFrame(container, height=150)
-        spk_frame.pack(fill="x", padx=20)
-        
-        preview_box = ctk.CTkTextbox(container, height=220)
-        preview_box.pack(fill="both", expand=False, padx=5, pady=(0, 10))
+        # --- Speakers + Preview side-by-side ---
+        top_row = ctk.CTkFrame(container, fg_color="transparent")
+        top_row.pack(fill="x", padx=10, pady=(5, 5))
 
-        preview_meta = ctk.CTkLabel(container, text="", text_color="gray")
-        preview_meta.pack(anchor="w", padx=6, pady=(0, 10))
+        # Left column: Speakers
+        left = ctk.CTkFrame(top_row)
+        left.pack(side="left", fill="y", padx=(5, 5))
+
+        ctk.CTkLabel(left, text="Speakers", font=("Roboto", 14, "bold")).pack(anchor="w", padx=12, pady=(5, 5))
+
+        spk_frame = ctk.CTkScrollableFrame(left, width=220, height=220)
+        spk_frame.pack(fill="y", padx=10, pady=(5, 5))
+
+        # Right column: Transcript Preview
+        right = ctk.CTkFrame(top_row)
+        right.pack(side="left", fill="both", expand=True)
+
+        ctk.CTkLabel(right, text="Transcript Preview (filtered)", font=("Roboto", 14, "bold")).pack(anchor="w", padx=12, pady=(10, 6))
+
+        preview_box = ctk.CTkTextbox(right, height=220)
+        preview_box.pack(fill="both", expand=False, padx=10, pady=(0, 5))
+
+        preview_meta = ctk.CTkLabel(right, text="", text_color="gray")
+        preview_meta.pack(anchor="w", padx=12, pady=(0, 5))
 
         self.spk_vars = {}
+
+        def update_preview():
+            selected = [s for s, v in self.spk_vars.items() if v.get()]
+            if not selected:
+                text = "(Select at least one speaker to preview.)"
+            else:
+                try:
+                    text = self.pipeline.get_transcript_text(
+                        include_speaker=True,
+                        speaker_filters=selected,
+                        max_chars=6000,  # preview cap for responsiveness
+                    )
+                    if not text.strip():
+                        text = "(No transcript text for the selected speaker(s).)"
+                except Exception as e:
+                    text = f"(Preview error: {e})"
+
+            preview_box.configure(state="normal")
+            preview_box.delete("1.0", "end")
+            preview_box.insert("1.0", text)
+            preview_box.configure(state="disabled")
+
+            preview_meta.configure(text=f"Chars: {len(text)}")
+
+            # If you have cost estimate logic, this is a good place to refresh it:
+            try:
+                update_cost_estimate()
+            except Exception:
+                pass
+
+        # Now that update_preview exists, create checkboxes safely
         for spk in speakers:
             var = ctk.BooleanVar(value=(spk == "SPEAKER_00"))
             cb = ctk.CTkCheckBox(spk_frame, text=spk, variable=var, command=update_preview)
-            cb.pack(anchor="w", pady=2)
+            cb.pack(anchor="w", pady=2, padx=5)
             self.spk_vars[spk] = var
-
-        # --- Transcript Preview ---
-        ctk.CTkLabel(container, text="Transcript Preview (filtered):", font=("Roboto", 14, "bold")).pack(pady=(10, 5))
+        
+        # Initialize preview
         update_preview()
 
         # 2. Model & Language
         # 2. Provider / Model / Language
         sett_frame = ctk.CTkFrame(container)
-        sett_frame.pack(fill="x", padx=20, pady=10)
+        sett_frame.pack(fill="x", padx=20, pady=5)
 
         # Provider selector
         self.analysis_provider_var = ctk.StringVar(
@@ -641,9 +662,9 @@ class DiarizationApp:
         )
 
         prov_row = ctk.CTkFrame(sett_frame, fg_color="transparent")
-        prov_row.pack(fill="x", padx=10, pady=(10, 5))
+        prov_row.pack(fill="x", padx=10, pady=(0, 5))
 
-        ctk.CTkLabel(prov_row, text="LLM Provider:", font=("Roboto", 13, "bold")).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(prov_row, text="LLM Provider:", font=("Roboto", 13, "bold")).pack(side="left", padx=(0, 5))
 
         ctk.CTkRadioButton(
             prov_row, text="Local (Ollama)",
@@ -687,7 +708,7 @@ class DiarizationApp:
 
         # OpenAI API key row (disabled unless OpenAI selected)
         openai_row = ctk.CTkFrame(sett_frame, fg_color="transparent")
-        openai_row.pack(fill="x", padx=10, pady=(5, 5))
+        openai_row.pack(fill="x", padx=10, pady=(0, 5))
 
         ctk.CTkLabel(openai_row, text="OpenAI API Key:", width=110, anchor="w").pack(side="left", padx=(0, 8))
 
@@ -736,13 +757,12 @@ class DiarizationApp:
         # Apply initial enable/disable state
         update_provider_ui()
         # 3. Prompt
-        ctk.CTkLabel(container, text="Custom Prompt:", font=("Roboto", 14, "bold")).pack(pady=(10,5))
-        prompt_box = ctk.CTkTextbox(container, height=200)
-        prompt_box.pack(fill="x", padx=20)
+        ctk.CTkLabel(container, text="Custom Prompt:", font=("Roboto", 14, "bold")).pack(pady=(0,5))
+        prompt_box = ctk.CTkTextbox(container, height=100)
+        prompt_box.pack(fill="x", padx=20, expand=False)
         
         prompt_box.bind("<KeyRelease>", update_cost_estimate)
         prompt_box.bind("<FocusOut>", update_cost_estimate)
-
 
         default_prompt = (
             "You are an expert Spanish teacher. Identify the student's mistakes "
