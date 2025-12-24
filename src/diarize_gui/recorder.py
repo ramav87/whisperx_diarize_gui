@@ -1,11 +1,11 @@
 import os
 from datetime import datetime
 from typing import Optional, Callable
-
 import sounddevice as sd
 import soundfile as sf
 from tkinter import messagebox
-
+import numpy as np
+import threading
 
 class AudioRecorder:
     """
@@ -27,6 +27,10 @@ class AudioRecorder:
         self.record_file: Optional[sf.SoundFile] = None
         self.record_stream: Optional[sd.InputStream] = None
         self.recorded_file_path: Optional[str] = None
+        self._level_lock = threading.Lock()
+        self._rms = 0.0
+        self._peak = 0.0
+
 
     def _set_status(self, text: str):
         if self.on_status is not None:
@@ -42,6 +46,12 @@ class AudioRecorder:
         except Exception as e:
             messagebox.showerror("Error querying audio devices", str(e))
         return devices
+    
+    def get_level(self):
+        """Returns (rms, peak) in 0..1 range."""
+        with self._level_lock:
+            return self._rms, self._peak
+
 
     def start_recording(self, output_dir: str, device_index: Optional[int] = None):
         if self.is_recording:
@@ -66,6 +76,23 @@ class AudioRecorder:
                 if status:
                     print(status)
                 self.record_file.write(indata)
+                
+                # Compute RMS/peak for meter (mono or multi-channel)
+                try:
+                    x = indata
+                    if hasattr(x, "shape") and len(x.shape) == 2:
+                        x = x[:, 0]  # first channel
+                    x = np.asarray(x, dtype=np.float32)
+
+                    peak = float(np.max(np.abs(x))) if x.size else 0.0
+                    rms = float(np.sqrt(np.mean(x * x))) if x.size else 0.0
+
+                    with self._level_lock:
+                        # smooth a bit so it doesn't jitter
+                        self._peak = max(peak, self._peak * 0.85)
+                        self._rms = (rms * 0.25) + (self._rms * 0.75)
+                except Exception:
+                    pass
 
             self.record_stream = sd.InputStream(
                 samplerate=self.samplerate,

@@ -2,6 +2,7 @@ import os
 import json
 import re
 from typing import Callable, Optional, List
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -325,7 +326,7 @@ class DiarizationPipelineRunner:
 
             from .openai_provider import OpenAIProvider
             client = OpenAIProvider(api_key=api_key, model=model or "gpt-5.1")
-            
+
             self._set_status(f"Calling OpenAI ({client.model})...")
             self._set_progress(50)
             text = client.analyze(combined_prompt)
@@ -378,7 +379,185 @@ class DiarizationPipelineRunner:
             self._set_progress(100)
             return text
 
+    def load_lesson_artifacts(self, lesson_dir: str):
+        # segments
+        seg_path = os.path.join(lesson_dir, "segments.json")
+        with open(seg_path, "r", encoding="utf-8") as f:
+            self.last_result = json.load(f)
+
+        # diarization (if separate)
+        diar_path = os.path.join(lesson_dir, "diarization.json")
+        if os.path.isfile(diar_path):
+            with open(diar_path, "r", encoding="utf-8") as f:
+                diar = json.load(f)
+            self.last_diar = diar  # or build a dataframe your exporter expects
+
+        # meta
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        meta = {}
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f) or {}
+
+        # audio path resolution (prefer embedded audio)
+        embedded_audio = os.path.join(lesson_dir, meta.get("saved_audio_filename", "audio.wav"))
+        if os.path.isfile(embedded_audio):
+            self.last_audio_path = embedded_audio
+        else:
+            p = meta.get("source_audio_path")
+            self.last_audio_path = p if p and os.path.isfile(p) else None
+
+        return meta
+
     # ---------- Export helpers (unchanged) ----------
+    def _lesson_duration_sec(self) -> float:
+        """Best-effort duration from segments/diarization."""
+        ends = []
+        if self.last_result and "segments" in self.last_result:
+            ends.extend([float(s.get("end") or 0.0) for s in self.last_result["segments"]])
+        if self.last_diar_df is not None and not self.last_diar_df.empty:
+            ends.extend([float(x) for x in self.last_diar_df["end"].tolist()])
+        return float(max(ends)) if ends else 0.0
+
+
+    def save_lesson_artifacts(
+        self,
+        lesson_dir: str,
+        *,
+        profile_name: Optional[str] = None,
+        whisper_model_size: Optional[str] = None,
+        language: Optional[str] = None,
+        contextual: Optional[bool] = None,
+        llm_provider: Optional[str] = None,
+        llm_model: Optional[str] = None,
+        extra_meta: Optional[dict] = None,
+        ) -> dict:
+        """
+        Persist everything needed to re-open a lesson and (optionally) re-export speaker WAVs
+        without re-running transcription/diarization.
+
+        Writes:
+        - transcript.txt
+        - segments.json  (start/end/speaker/text)
+        - diarization.json (start/end/speaker) if available
+        - meta.json
+
+        Returns meta dict.
+        """
+        if not self.last_result or "segments" not in self.last_result:
+            raise ValueError("No transcription segments available to save.")
+
+        os.makedirs(lesson_dir, exist_ok=True)
+
+        # 1) transcript.txt (human-readable)
+        transcript_path = os.path.join(lesson_dir, "transcript.txt")
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(self.get_transcript_text(include_speaker=True))
+
+        # 2) segments.json (canonical for future features)
+        segments_clean = []
+        for seg in self.last_result["segments"]:
+            segments_clean.append(
+                {
+                    "start": float(seg.get("start") or 0.0),
+                    "end": float(seg.get("end") or 0.0),
+                    "speaker": seg.get("speaker") or "UNKNOWN",
+                    "text": (seg.get("text") or "").strip(),
+                }
+            )
+
+        segments_path = os.path.join(lesson_dir, "segments.json")
+        with open(segments_path, "w", encoding="utf-8") as f:
+            json.dump(segments_clean, f, ensure_ascii=False, indent=2)
+
+        # 3) diarization-only segments (optional but important for speaker WAV export)
+        diar_path = None
+        if self.last_diar_df is not None and not self.last_diar_df.empty:
+            diar_clean = []
+            for _, row in self.last_diar_df.iterrows():
+                diar_clean.append(
+                    {
+                        "start": float(row["start"]),
+                        "end": float(row["end"]),
+                        "speaker": str(row["speaker"]),
+                    }
+                )
+            diar_path = os.path.join(lesson_dir, "diarization.json")
+            with open(diar_path, "w", encoding="utf-8") as f:
+                json.dump(diar_clean, f, ensure_ascii=False, indent=2)
+        
+        import shutil
+
+        if self.last_audio_path and os.path.isfile(self.last_audio_path):
+            dst = os.path.join(lesson_dir, "audio.wav")
+            if not os.path.isfile(dst):
+                shutil.copy2(self.last_audio_path, dst)
+
+        # 4) meta.json
+        meta = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "profile": profile_name,
+            "source_audio_path": self.last_audio_path,   # critical for future speaker WAV export
+            "saved_audio_filename": "audio.wav",  # if you copy it
+            "output_dir": self.last_output_dir,
+            "duration_sec": self._lesson_duration_sec(),
+            "num_segments": len(segments_clean),
+            "num_speakers": len({s["speaker"] for s in segments_clean}),
+            "whisper_model_size": whisper_model_size,
+            "language": language,
+            "contextual": contextual,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "files": {
+                "transcript": "transcript.txt",
+                "segments": "segments.json",
+                "diarization": "diarization.json" if diar_path else None,
+            },
+        }
+        if extra_meta:
+            meta.update(extra_meta)
+
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        return meta
+
+    def load_lesson_artifacts(self, lesson_dir: str):
+        """
+        Restore last_result/last_diar_df/last_audio_path from a lesson folder.
+        Enables export_srt/export_txt and export_speaker_audios (if audio path exists).
+        """
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        seg_path = os.path.join(lesson_dir, "segments.json")
+        diar_path = os.path.join(lesson_dir, "diarization.json")
+
+        if not os.path.isfile(seg_path):
+            raise FileNotFoundError(f"Missing segments.json in {lesson_dir}")
+
+        with open(seg_path, "r", encoding="utf-8") as f:
+            segments = json.load(f)
+
+        self.last_result = {"segments": segments}
+        self.last_output_dir = lesson_dir
+
+        # optional meta
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            self.last_audio_path = meta.get("source_audio")
+        else:
+            self.last_audio_path = None
+
+        # diarization df optional
+        if os.path.isfile(diar_path):
+            with open(diar_path, "r", encoding="utf-8") as f:
+                diar = json.load(f)
+            self.last_diar_df = pd.DataFrame(diar)
+        else:
+            self.last_diar_df = None
+
+
     def export_txt(self, txt_path: str):
         if not self.last_result or "segments" not in self.last_result:
             raise ValueError("No transcription result available for TXT export.")

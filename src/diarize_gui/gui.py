@@ -9,6 +9,8 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
 import stat
+import math
+from .dashboard import DashboardFrame
 
 # Import backend logic
 from .utils import obfuscate_secret, deobfuscate_secret, estimate_openai_cost
@@ -74,6 +76,7 @@ class DiarizationApp:
     def __init__(self, master):
         self.master = master
         self.profile_config = {}
+        self.current_lesson_dir = None
 
         master.title("Lesson Recording and Analysis App")
         master.geometry("750x900")
@@ -176,6 +179,10 @@ class DiarizationApp:
         self.audio_label = ctk.CTkLabel(self.file_row, text="(No file selected)", text_color="gray")
         self.audio_label.pack(side="left", padx=5)
 
+        # Load TXT Button (at bottom)
+        self.load_txt_btn = ctk.CTkButton(self.file_row, text="Load Existing TXT", fg_color="transparent", border_width=1, text_color=("gray10", "gray90"), command=self.load_diarized_txt)
+        self.load_txt_btn.pack(padx=5)
+
         ctk.CTkLabel(self.input_card, text="- OR -", text_color="gray", font=("Arial", 10)).pack()
 
         # B. Recording
@@ -187,18 +194,29 @@ class DiarizationApp:
         dev_names = ["(default)"] + [f"{d['index']}: {d['name']}" for d in self.input_devices]
         
         self.device_var = ctk.StringVar(value="(default)")
-        self.device_menu = ctk.CTkOptionMenu(self.rec_row, variable=self.device_var, values=dev_names, width=220)
+        self.device_menu = ctk.CTkOptionMenu(self.rec_row, variable=self.device_var, values=dev_names, width=220, height = 40)
         self.device_menu.pack(side="left", padx=5)
 
         self.start_rec_btn = ctk.CTkButton(
-            self.rec_row, text="REC", width=60, 
-            fg_color="#d32f2f", hover_color="#b71c1c", 
+            self.rec_row, text="REC", width=120, height = 40,font=("Roboto", 14, "bold"), 
+            fg_color="#c0392b", hover_color="#b71c1c", 
             image=self.icon_mic, command=self.start_recording
         )
         self.start_rec_btn.pack(side="left", padx=5)
         
-        self.stop_rec_btn = ctk.CTkButton(self.rec_row, text="STOP", width=60, state="disabled", command=self.stop_recording)
+        self.stop_rec_btn = ctk.CTkButton(self.rec_row, text="STOP", width=120,height = 40,
+        font=("Roboto", 14, "bold"), state="disabled", command=self.stop_recording)
         self.stop_rec_btn.pack(side="left", padx=5)
+
+        # Mic level meter (initially hidden/disabled)
+        self.mic_level_label = ctk.CTkLabel(self.rec_row, text="Mic:", text_color="gray")
+        self.mic_level_bar = ctk.CTkProgressBar(self.rec_row, width=120)
+        self.mic_level_bar.set(0.0)
+        self.mic_level_db = ctk.CTkLabel(self.rec_row, text="", text_color="gray")
+
+        self.mic_level_label.pack(side="left", padx=(12, 6))
+        self.mic_level_bar.pack(side="left", padx=(0, 6))
+        self.mic_level_db.pack(side="left", padx=(0, 0))
 
         # 3. SETTINGS CARD
         self.settings_card = ctk.CTkFrame(self.master)
@@ -210,53 +228,94 @@ class DiarizationApp:
         grid.pack(fill="x", padx=10, pady=5)
 
         # Output folder
-        self.out_btn = ctk.CTkButton(grid, text="Output Folder", width=120, command=self.select_output_dir)
+        self.out_btn = ctk.CTkButton(grid, text="Output Folder",font=("Roboto", 18, "bold"), width=120, height = 40, command=self.select_output_dir)
         self.out_btn.grid(row=0, column=0, padx=5, pady=5)
         self.output_label = ctk.CTkLabel(grid, text="(None)", text_color="gray")
         self.output_label.grid(row=0, column=1, padx=5, sticky="w")
 
         # Model Size
-        ctk.CTkLabel(grid, text="Model Size:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        ctk.CTkLabel(grid, text="Transcription Model Size:").grid(row=1, column=0, padx=(0, 8), pady=5, sticky="w")
         self.model_var = ctk.StringVar(value="small")
-        self.model_menu = ctk.CTkOptionMenu(grid, variable=self.model_var, values=["tiny", "base", "small", "medium", "large-v2"], width=100)
-        self.model_menu.grid(row=1, column=1, padx=5, sticky="w")
+        self.model_menu = ctk.CTkOptionMenu(
+            grid, variable=self.model_var,
+            values=["tiny", "base", "small", "medium", "large-v2"],
+            width=110
+        )
+        self.model_menu.grid(row=1, column=1, padx=(0, 20), pady=5, sticky="w")
 
         # Language
-        ctk.CTkLabel(grid, text="Language:").grid(row=1, column=2, padx=5, pady=5, sticky="e")
+        ctk.CTkLabel(grid, text="Language:").grid(row=1, column=2, padx=(0, 8), pady=5, sticky="w")
         self.lang_var = ctk.StringVar(value="Auto-Detect")
-        self.lang_combo = ctk.CTkOptionMenu(grid, variable=self.lang_var, values=list(LANGUAGE_MAP.keys()), width=120)
-        self.lang_combo.grid(row=1, column=3, padx=5, sticky="w")
+        self.lang_combo = ctk.CTkOptionMenu(
+            grid, variable=self.lang_var,
+            values=list(LANGUAGE_MAP.keys()),
+            width=140
+        )
+        self.lang_combo.grid(row=1, column=3, padx=(0, 0), pady=5, sticky="w")
         
         # Checkbox
-        self.condition_checkbox = ctk.CTkCheckBox(self.settings_card, text="Condition on previous text (Context)", onvalue=True, offvalue=False)
-        self.condition_checkbox.pack(padx=20, pady=(5, 15), anchor="w")
+        self.context_var = ctk.BooleanVar(value=False)
+        self.context_cb = ctk.CTkCheckBox(grid, text="Contextual Transcribing", variable=self.context_var)
+        self.context_cb.grid(row=1, column=4, padx=(15, 0), sticky="w")
 
-        # 4. ACTION
-        self.run_btn = ctk.CTkButton(self.master, text="RUN PROCESSING", height=50, font=("Roboto", 18, "bold"), command=self.run_diarization)
-        self.run_btn.pack(padx=15, pady=5, fill="x")
+        # 4. ACTION CARD (Run + Progress + Status)
+        self.action_card = ctk.CTkFrame(self.master)
+        self.action_card.pack(padx=15, pady=8, fill="x")
 
-        # Status & Progress
-        self.progress_bar = ctk.CTkProgressBar(self.master)
-        self.progress_bar.pack(padx=15, pady=(5,5), fill="x")
+        # Run button (hero)
+        self.run_btn = ctk.CTkButton(
+            self.action_card,
+            text="RUN PROCESSING",
+            height=50,
+            font=("Roboto", 18, "bold"),
+            command=self.run_diarization
+        )
+        self.run_btn.pack(padx=12, pady=(12, 8), fill="x")
+
+        # Progress bar
+        self.progress_bar = ctk.CTkProgressBar(self.action_card)
+        self.progress_bar.pack(padx=12, pady=(0, 6), fill="x")
         self.progress_bar.set(0)
-        
-        self.status_label = ctk.CTkLabel(self.master, text="Status: Idle", text_color="gray")
-        self.status_label.pack(padx=15, pady=(0,10), anchor="w")
+
+        # Status label (more visible)
+        self.status_label = ctk.CTkLabel(
+            self.action_card,
+            text="Status: Idle",
+            text_color="gray",
+            font=("Roboto", 12)
+        )
+        self.status_label.pack(padx=12, pady=(0, 12), anchor="w")
+
 
         # 5. POST-PROCESSING CARD
         self.post_card = ctk.CTkFrame(self.master)
         self.post_card.pack(padx=15, pady=5, fill="x")
 
+        # Analyze card
+        self.analyze_card = ctk.CTkFrame(self.master)
+        self.analyze_card.pack(padx=15, pady=(6, 10), fill="x")
+
         self.analyze_btn = ctk.CTkButton(
-            self.post_card, 
-            text="Analyze with AI Assistant", 
-            state="disabled", 
-            fg_color="#2e7d32", 
-            hover_color="#1b5e20",
-            height=40,
+            self.analyze_card,
+            text="Analyze with AI Assistant",
+            height=46,
+            fg_color="#2e7d32",        # green
+            hover_color="#256628",     # darker green on hover
+            text_color="white",
+            font=("Roboto", 16, "bold"),
             command=self.analyze_transcript
         )
-        self.analyze_btn.pack(padx=10, pady=10, fill="x")
+        self.analyze_btn.pack(padx=12, pady=(10, 4), fill="x")
+
+        self.analyze_help = ctk.CTkLabel(
+            self.analyze_card,
+            text="",
+            text_color="gray",
+            font=("Roboto", 12),
+            anchor="w",
+            justify="left"
+        )
+        self.analyze_help.pack(padx=12, pady=(0, 8), anchor="w")
 
         exp_row = ctk.CTkFrame(self.post_card, fg_color="transparent")
         exp_row.pack(fill="x", padx=10, pady=(0,10))
@@ -269,13 +328,71 @@ class DiarizationApp:
         
         self.export_wav_btn = ctk.CTkButton(exp_row, text="Export Speakers", state="disabled", width=80, command=self.export_speaker_audio)
         self.export_wav_btn.pack(side="left", padx=5, expand=True, fill="x")
-        
-        # Load TXT Button (at bottom)
-        self.load_txt_btn = ctk.CTkButton(self.master, text="Load Existing TXT", fg_color="transparent", border_width=1, text_color=("gray10", "gray90"), command=self.load_diarized_txt)
-        self.load_txt_btn.pack(pady=10)
+
+        self._update_analyze_ui_state()
+
 
     # --- LOGIC METHODS ---
+    def _update_analyze_ui_state(self):
+        """
+        Updates Analyze button + helper text based on whether a transcript exists and whether we're busy.
+        """
+        # Busy: if you're processing or analyzing, keep things disabled
+        busy = getattr(self, "_is_processing", False) or getattr(self, "_is_analyzing", False)
+
+        has_transcript = False
+        try:
+            # Prefer whatever your app uses as the source of truth
+            # e.g., self.pipeline.transcript_segments, self.pipeline.last_result, self.current_transcript_text, etc.
+            txt = self.pipeline.get_transcript_text(include_speaker=True, max_chars=100)
+            has_transcript = bool(txt and txt.strip())
+        except Exception:
+            has_transcript = False
+
+        if busy:
+            self.analyze_btn.configure(state="disabled")
+            self.analyze_help.configure(text="Working… please wait.")
+            return
+
+        if not has_transcript:
+            self.analyze_btn.configure(state="disabled")
+            self.analyze_help.configure(text="To enable analysis: run processing or load an existing TXT transcript.")
+            return
+
+        # Ready
+        self.analyze_btn.configure(state="normal")
+
+        # Optional: mention selected provider in the hint
+        provider = getattr(self, "analysis_provider", None)
+        if hasattr(self, "analysis_provider_var"):
+            provider = self.analysis_provider_var.get()
+
+        
+        self.analyze_help.configure(text="Ready for transcription view and analysis.")
+
     # --- PROFILE CONFIG (OpenAI key, provider prefs) ---
+
+    def _profile_lessons_dir(self):
+        d = self._profile_dir()
+        if not d:
+            return None
+        path = os.path.join(d, "lessons")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+
+    def _new_lesson_dir(self):
+        """
+        Create a new lesson folder using timestamp.
+        Example: 20251221_215700
+        """
+        base = self._profile_lessons_dir()
+        if not base:
+            return None
+        lesson_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(base, lesson_id)
+        os.makedirs(path, exist_ok=True)
+        return path
 
     def _profile_base_dir(self):
         return os.path.expanduser("~/.whisperx_diarize_gui")
@@ -301,6 +418,63 @@ class DiarizationApp:
                 return json.load(f) or {}
         except Exception:
             return {}
+
+    def _list_profile_lessons(self):
+        base = self._profile_lessons_dir()
+        if not base or not os.path.isdir(base):
+            return []
+
+        lessons = []
+        for name in sorted(os.listdir(base), reverse=True):
+            path = os.path.join(base, name)
+            meta_path = os.path.join(path, "meta.json")
+            if os.path.isdir(path) and os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    lessons.append((name, path, meta))
+                except Exception:
+                    continue
+        return lessons
+
+    def _start_mic_meter(self):
+        self._mic_meter_running = True
+        self._update_mic_meter()
+
+    def _stop_mic_meter(self):
+        self._mic_meter_running = False
+        try:
+            self.mic_level_bar.set(0.0)
+            self.mic_level_db.configure(text="")
+        except Exception:
+            pass
+
+    def _update_mic_meter(self):
+        if not getattr(self, "_mic_meter_running", False):
+            return
+
+        # recorder may not exist or may not be recording
+        try:
+            rms, peak = self.recorder.get_level()  # <-- adapt name if different
+        except Exception:
+            rms, peak = 0.0, 0.0
+
+        # Map RMS (0..1) to progress bar (0..1)
+        level = max(0.0, min(1.0, rms * 4.0))  # scale so normal speech shows up
+        self.mic_level_bar.set(level)
+
+        # Optional dB estimate (avoid log(0))
+        if rms > 1e-6:
+            db = 20.0 * math.log10(rms)
+            self.mic_level_db.configure(text=f"{db:0.0f} dB")
+        else:
+            self.mic_level_db.configure(text="")
+
+        # Optional clip indicator (peak near 1.0)
+        # if peak > 0.98: you could change label color or show "CLIP"
+        # keep it simple initially
+
+        self.master.after(60, self._update_mic_meter)  # ~16 fps
 
     def _save_profile_config(self, cfg: dict):
         path = self._profile_config_path()
@@ -334,6 +508,7 @@ class DiarizationApp:
         self.export_srt_btn.configure(state="normal")
         self.export_txt_btn.configure(state="normal")
         self.export_wav_btn.configure(state="normal")
+        self._update_analyze_ui_state()
 
     def _disable_export_buttons(self):
         self.analyze_btn.configure(state="disabled")
@@ -413,6 +588,7 @@ class DiarizationApp:
             self.output_label.configure(text=os.path.basename(path), text_color="white")
 
     def start_recording(self):
+        
         if self.is_recording: return
         if not self.output_dir:
             self.select_output_dir()
@@ -425,12 +601,14 @@ class DiarizationApp:
         self.recorder.start_recording(self.output_dir, device_index=idx)
         if self.recorder.is_recording:
             self.is_recording = True
+            self._start_mic_meter()
             self.start_rec_btn.configure(state="disabled", fg_color="gray")
             self.stop_rec_btn.configure(state="normal", fg_color="#d32f2f")
 
     def stop_recording(self):
         if not self.is_recording: return
         f = self.recorder.stop_recording()
+        self._stop_mic_meter()
         self.is_recording = False
         self.start_rec_btn.configure(state="normal", fg_color="#d32f2f")
         self.stop_rec_btn.configure(state="disabled", fg_color="gray")
@@ -446,7 +624,8 @@ class DiarizationApp:
         self.run_btn.configure(state="disabled")
         self._set_progress(0)
         self._set_status("Starting pipeline...")
-        
+
+        self.run_btn.configure(text="PROCESSING…", state="disabled")
         thread = threading.Thread(target=self._run_pipeline_thread)
         thread.daemon = True
         thread.start()
@@ -466,11 +645,26 @@ class DiarizationApp:
             self.master.after(0, self._enable_export_buttons)
             self.master.after(0, lambda: messagebox.showinfo("Done", "Processing Complete!"))
             self._set_status("Complete")
+
+            try:
+                self.current_lesson_dir = self._new_lesson_dir()
+                if self.current_lesson_dir:
+                    self.pipeline.save_lesson_artifacts(
+                        self.current_lesson_dir,
+                        profile_name=self.profile_name,
+                        whisper_model_size=self.model_var.get(),
+                        language=self.lang_var.get(),
+                        contextual=self.context_var.get(),
+                    )
+            except Exception as e:
+                print(f"[WARN] Failed to save lesson artifacts: {e}")
+
         except Exception as e:
             self._set_status("Error")
             self.master.after(0, lambda: messagebox.showerror("Error", str(e)))
         finally:
-            self.master.after(0, lambda: self.run_btn.configure(state="normal"))
+            self.master.after(0, lambda: self.run_btn.configure(state="normal", text="RUN PROCESSING"))
+            
 
     def load_diarized_txt(self):
         path = filedialog.askopenfilename(filetypes=[("TXT", "*.txt")])
@@ -482,6 +676,20 @@ class DiarizationApp:
                 self.has_result = True
                 self._enable_export_buttons()
                 self._set_status("TXT Loaded")
+                self._update_analyze_ui_state()
+                try:
+                    self.current_lesson_dir = self._new_lesson_dir()
+                    if self.current_lesson_dir:
+                        self.pipeline.save_lesson_artifacts(
+                            self.current_lesson_dir,
+                            profile_name=self.profile_name,
+                            whisper_model_size=None,
+                            language=None,
+                            contextual=None,
+                        )
+                except Exception as e:
+                    print(f"[WARN] Failed to save lesson artifacts from TXT: {e}")
+
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 
@@ -499,18 +707,25 @@ class DiarizationApp:
             messagebox.showinfo("History", "No history found for this profile.")
             return
 
-        # Load JSONs
+        # Load lessons from artifact folders: lessons/<lesson_id>/meta.json
         lessons = []
-        for fname in os.listdir(lesson_dir):
-            if fname.endswith(".json"):
+        for entry in os.listdir(lesson_dir):
+            path = os.path.join(lesson_dir, entry)
+            meta_path = os.path.join(path, "meta.json")
+            if os.path.isdir(path) and os.path.isfile(meta_path):
                 try:
-                    with open(os.path.join(lesson_dir, fname), "r") as f:
-                        data = json.load(f)
-                        lessons.append(data)
-                except: pass
-        
-        # Sort by timestamp
-        lessons.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f) or {}
+                    lessons.append({"lesson_id": entry, "lesson_dir": path, "meta": meta})
+                except Exception:
+                    pass
+
+        # Sort newest first (prefer created_at; fallback to folder name)
+        def _sort_key(x):
+            meta = x.get("meta", {}) or {}
+            return meta.get("created_at") or x.get("lesson_id") or ""
+
+        lessons.sort(key=_sort_key, reverse=True)
 
         # UI
         win = ctk.CTkToplevel(self.master)
@@ -522,46 +737,137 @@ class DiarizationApp:
         scroll = ctk.CTkScrollableFrame(win)
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
 
-        for l in lessons:
-            ts = l.get("timestamp", "???")
-            provider = l.get("llm_provider", "ollama")
-            model = l.get("llm_model", "unknown")
-            # Create a card for each lesson
+        for item in lessons:
+            meta = item.get("meta", {}) or {}
+            lesson_id = item.get("lesson_id", "???")
+            ldir = item.get("lesson_dir")
+
+            ts = meta.get("created_at", lesson_id)
+            provider = meta.get("llm_provider", meta.get("provider", "—"))
+            model = meta.get("llm_model", "—")
+            dur = meta.get("duration_sec", 0.0)
+            nspk = meta.get("num_speakers", "—")
+            nseg = meta.get("num_segments", "—")
+
             card = ctk.CTkFrame(scroll, fg_color="gray25")
             card.pack(fill="x", pady=5)
-            
-            lbl = ctk.CTkLabel(card, text=f"Date: {ts}\nProvider: {provider}\nModel: {model}", justify="left")
-            lbl.pack(side="left", padx=10, pady=5)
-            
-            btn = ctk.CTkButton(card, text="Open", width=60, command=lambda d=l: self._open_lesson_detail(d))
-            btn.pack(side="right", padx=10)
 
-    def _open_lesson_detail(self, data):
+            lbl = ctk.CTkLabel(
+                card,
+                text=f"Date: {ts}\nSpeakers: {nspk} | Segments: {nseg} | Duration: {dur/60:.1f} min\nLLM: {provider} / {model}",
+                justify="left",
+            )
+            lbl.pack(side="left", padx=10, pady=8)
+
+            btn = ctk.CTkButton(
+            card,
+            text="Load",
+            width=60,
+            command=lambda d=ldir: self._load_lesson_into_app(d)
+            )
+
+            btn.pack(side="right", padx=10, pady=10)
+
+    def _open_lesson_from_history(self, lesson_dir: str):
+        print("OPEN LESSON DIR:", lesson_dir)
+        print("FILES IN DIR:", os.listdir(lesson_dir))
+        try:
+            transcript_path = os.path.join(lesson_dir, "transcript.txt")
+            analysis_path = os.path.join(lesson_dir, "analysis.txt")
+            print("TRANSCRIPT PATH:", transcript_path, "exists?", os.path.isfile(transcript_path))
+            print("ANALYSIS PATH:", analysis_path, "exists?", os.path.isfile(analysis_path))
+
+            self.pipeline.load_lesson_artifacts(lesson_dir)
+            self._set_status(f"Loaded lesson: {os.path.basename(lesson_dir)}")
+            self._set_progress(0)
+
+            # If you have these helpers, call them:
+            try:
+                self._update_analyze_ui_state()
+            except Exception:
+                pass
+
+            # If your export buttons are enabled elsewhere, ensure they're enabled now:
+            try:
+                self.export_srt_btn.configure(state="normal")
+                self.export_txt_btn.configure(state="normal")
+                self.export_speakers_btn.configure(state="normal")
+            except Exception:
+                pass
+
+
+        except Exception as e:
+            msg = str(e)
+            self.master.after(0, lambda err=msg: messagebox.showerror("Error", err))
+    def _load_lesson_into_app(self, lesson_dir: str):
+        try:
+            meta = self.pipeline.load_lesson_artifacts(lesson_dir)
+
+            self.current_lesson_dir = lesson_dir
+            self.output_dir = lesson_dir
+            self.output_label.configure(text=os.path.basename(lesson_dir))
+
+            self.has_result = True
+            self._enable_export_buttons()
+            self._update_analyze_ui_state()
+
+            if getattr(self.pipeline, "last_audio_path", None):
+                # optional: show audio filename in UI
+                self.selected_audio_path = self.pipeline.last_audio_path
+
+            self._set_status(f"Loaded lesson {os.path.basename(lesson_dir)}")
+            self._set_progress(0)
+
+            # if audio missing, warn user (export speakers will fail)
+            if not getattr(self.pipeline, "last_audio_path", None):
+                messagebox.showwarning(
+                    "Audio missing",
+                    "This lesson does not have an audio file saved, and the original audio path is not available.\n\n"
+                    "Speaker WAV export will not work unless you re-associate the audio file."
+                )
+
+        except Exception as e:
+            msg = str(e)
+            self.master.after(0, lambda err=msg: messagebox.showerror("Load Failed", err))
+
+    def _open_lesson_detail(self, lesson_dir: str):
         win = ctk.CTkToplevel(self.master)
         win.title("Lesson Detail")
         win.geometry("800x600")
 
-        # Tabs for Transcript vs Analysis
         tabview = ctk.CTkTabview(win)
         tabview.pack(fill="both", expand=True, padx=10, pady=10)
-        
+
         t_tab = tabview.add("Transcript")
         a_tab = tabview.add("Analysis")
-        
-        # Transcript Tab
+
+        # --- Transcript ---
         t_box = ctk.CTkTextbox(t_tab)
         t_box.pack(fill="both", expand=True)
-        t_box.insert("1.0", data.get("transcript_text", ""))
+
+        transcript_path = os.path.join(lesson_dir, "transcript.txt")
+        if os.path.isfile(transcript_path):
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                t_box.insert("1.0", f.read())
+        else:
+            t_box.insert("1.0", "[Transcript not found]")
+
         t_box.configure(state="disabled")
-        
-        # Analysis Tab
+
+        # --- Analysis ---
         a_box = ctk.CTkTextbox(a_tab)
         a_box.pack(fill="both", expand=True)
-        a_box.insert("1.0", data.get("llm_response", ""))
+
+        analysis_path = os.path.join(lesson_dir, "analysis.txt")
+        if os.path.isfile(analysis_path):
+            with open(analysis_path, "r", encoding="utf-8") as f:
+                a_box.insert("1.0", f.read())
+        else:
+            a_box.insert("1.0", "No analysis available for this lesson.")
+
         a_box.configure(state="disabled")
 
     # --- ANALYSIS FLOW ---
-
     def analyze_transcript(self):
         if not self.has_result or not self.pipeline.last_result: return
         
@@ -973,7 +1279,8 @@ class DiarizationApp:
                 subprocess.run([ollama_bin, "pull", model_name], env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 self.master.after(0, lambda: messagebox.showinfo("Success", "Model Installed!"))
             except Exception as e:
-                self.master.after(0, lambda: messagebox.showerror("Error", str(e)))
+                msg = str(e)
+                self.master.after(0, lambda: messagebox.showerror("Error", msg))
             finally:
                 self.master.after(0, dl_win.destroy)
 
@@ -981,7 +1288,7 @@ class DiarizationApp:
 
     def _run_analysis_thread(self, prompt, speakers, provider, model, openai_api_key=None):
         self._set_status("Analyzing...")
-        self._set_progress(20) # fake progress
+        self._set_progress(20)
         try:
             res = self.pipeline.analyze_with_llm(
                 user_prompt=prompt,
@@ -991,14 +1298,49 @@ class DiarizationApp:
                 speakers=speakers,
             )
 
+            # Ensure we have a lesson folder to attach analysis to
+            if not getattr(self, "current_lesson_dir", None):
+                self.current_lesson_dir = self._new_lesson_dir()
+                if self.current_lesson_dir:
+                    # If analysis happens without a saved transcript yet, save it now
+                    self.pipeline.save_lesson_artifacts(
+                        self.current_lesson_dir,
+                        profile_name=self.profile_name,
+                        whisper_model_size=self.model_var.get() if hasattr(self, "model_var") else None,
+                        language=self.lang_var.get() if hasattr(self, "lang_var") else None,
+                        contextual=self.context_var.get() if hasattr(self, "context_var") else None,
+                    )
 
-            self._save_lesson_record(prompt, res, model, provider=provider)
-            self.master.after(0, lambda: self._show_analysis_window(res))
+            # Write analysis.txt + patch meta.json
+            if self.current_lesson_dir:
+                analysis_path = os.path.join(self.current_lesson_dir, "analysis.txt")
+                with open(analysis_path, "w", encoding="utf-8") as f:
+                    f.write(res)
+
+                meta_path = os.path.join(self.current_lesson_dir, "meta.json")
+                meta = {}
+                if os.path.isfile(meta_path):
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f) or {}
+
+                meta["llm_provider"] = provider
+                meta["llm_model"] = model
+                meta["analysis_updated_at"] = datetime.now().isoformat(timespec="seconds")
+                meta["has_analysis"] = True
+
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+
+            # Show result
+            self.master.after(0, lambda text=res: self._show_analysis_window(text))
             self._set_status("Analysis Done")
             self._set_progress(100)
+
         except Exception as e:
-            self.master.after(0, lambda: messagebox.showerror("Analysis Failed", str(e)))
+            msg = str(e)
+            self.master.after(0, lambda err=msg: messagebox.showerror("Analysis Failed", err))
             self._set_status("Error")
+
 
     def _show_analysis_window(self, text):
         win = ctk.CTkToplevel(self.master)
@@ -1008,24 +1350,6 @@ class DiarizationApp:
         box = ctk.CTkTextbox(win)
         box.pack(fill="both", expand=True, padx=10, pady=10)
         box.insert("1.0", text)
-
-    def _save_lesson_record(self, prompt, response, model, provider=None):
-        if not self.profile_name: return
-        base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
-        d = os.path.join(base_dir, "profiles", self.profile_name, "lessons")
-        os.makedirs(d, exist_ok=True)
-        
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        record = {
-            "timestamp": ts,
-            "llm_model": model,
-            "llm_prompt": prompt,
-            "llm_response": response,
-            "llm_provider": provider or "ollama",
-            "transcript_text": self.pipeline.get_transcript_text(include_speaker=True)
-        }
-        with open(os.path.join(d, f"lesson_{ts}.json"), "w") as f:
-            json.dump(record, f, indent=2)
 
     # --- EXPORTS ---
 
