@@ -98,7 +98,18 @@ class DiarizationApp:
         self._load_icons()
 
         # --- UI LAYOUT ---
-        self._build_ui()
+        self.tab_view = ctk.CTkTabview(self.master)
+        self.tab_view.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.tab_dash = self.tab_view.add("Dashboard")
+        self.tab_studio = self.tab_view.add("Studio")
+        
+        # Set "Studio" as the parent for all existing UI elements
+        # We will pass self.tab_studio to _build_ui instead of self.master
+        self._build_ui(parent=self.tab_studio)
+        
+        # Initialize Dashboard (empty until profile loads)
+        self.dashboard = None
 
         # --- STARTUP ---
         # Defer profile prompt slightly so UI renders first
@@ -135,9 +146,9 @@ class DiarizationApp:
         self.icon_mic = load_icon("mic.png")
         self.icon_folder = load_icon("folder.png")
 
-    def _build_ui(self):
+    def _build_ui(self, parent):
         # 1. PROFILE HEADER
-        self.profile_frame = ctk.CTkFrame(self.master, corner_radius=10)
+        self.profile_frame = ctk.CTkFrame(parent, corner_radius=10)
         self.profile_frame.pack(padx=15, pady=(15, 5), fill="x")
 
         self.profile_label = ctk.CTkLabel(
@@ -164,7 +175,7 @@ class DiarizationApp:
         self.history_btn.pack(side="right", padx=0)
 
         # 2. INPUT CARD
-        self.input_card = ctk.CTkFrame(self.master)
+        self.input_card = ctk.CTkFrame(parent)
         self.input_card.pack(padx=15, pady=5, fill="x")
         
         ctk.CTkLabel(self.input_card, text="Input Source", font=("Roboto", 14, "bold")).pack(anchor="w", padx=15, pady=(10,5))
@@ -219,7 +230,7 @@ class DiarizationApp:
         self.mic_level_db.pack(side="left", padx=(0, 0))
 
         # 3. SETTINGS CARD
-        self.settings_card = ctk.CTkFrame(self.master)
+        self.settings_card = ctk.CTkFrame(parent)
         self.settings_card.pack(padx=15, pady=10, fill="x")
         
         ctk.CTkLabel(self.settings_card, text="Processing Settings", font=("Roboto", 14, "bold")).pack(anchor="w", padx=15, pady=(10,5))
@@ -259,7 +270,7 @@ class DiarizationApp:
         self.context_cb.grid(row=1, column=4, padx=(15, 0), sticky="w")
 
         # 4. ACTION CARD (Run + Progress + Status)
-        self.action_card = ctk.CTkFrame(self.master)
+        self.action_card = ctk.CTkFrame(parent)
         self.action_card.pack(padx=15, pady=8, fill="x")
 
         # Run button (hero)
@@ -288,11 +299,11 @@ class DiarizationApp:
 
 
         # 5. POST-PROCESSING CARD
-        self.post_card = ctk.CTkFrame(self.master)
+        self.post_card = ctk.CTkFrame(parent)
         self.post_card.pack(padx=15, pady=5, fill="x")
 
         # Analyze card
-        self.analyze_card = ctk.CTkFrame(self.master)
+        self.analyze_card = ctk.CTkFrame(parent)
         self.analyze_card.pack(padx=15, pady=(6, 10), fill="x")
 
         self.analyze_btn = ctk.CTkButton(
@@ -542,8 +553,20 @@ class DiarizationApp:
         def select_and_close(name):
             self.profile_name = name
             self.profile_label.configure(text=f"Profile: {name}")
-             # Load profile config (OpenAI key, prefs)
             self.profile_config = self._load_profile_config()
+            
+            # --- ADD THIS BLOCK ---
+            # Reload Dashboard
+            if self.dashboard:
+                self.dashboard.destroy()
+            
+            self.dashboard = DashboardFrame(
+                self.tab_dash, 
+                profile_name=self.profile_name, 
+                profile_dir=self._profile_dir()
+            )
+            self.dashboard.pack(fill="both", expand=True)
+            # ----------------------
 
             win.destroy()
 
@@ -759,6 +782,9 @@ class DiarizationApp:
             )
             lbl.pack(side="left", padx=10, pady=8)
 
+            btn_view = ctk.CTkButton(card,text="View", width=70, command=lambda d=ldir: self._open_lesson_detail(d))
+            btn_view.pack(side="right", padx=(6, 10), pady=10)
+
             btn = ctk.CTkButton(
             card,
             text="Load",
@@ -799,6 +825,7 @@ class DiarizationApp:
         except Exception as e:
             msg = str(e)
             self.master.after(0, lambda err=msg: messagebox.showerror("Error", err))
+
     def _load_lesson_into_app(self, lesson_dir: str):
         try:
             meta = self.pipeline.load_lesson_artifacts(lesson_dir)
@@ -810,25 +837,20 @@ class DiarizationApp:
             self.has_result = True
             self._enable_export_buttons()
             self._update_analyze_ui_state()
-
-            if getattr(self.pipeline, "last_audio_path", None):
-                # optional: show audio filename in UI
-                self.selected_audio_path = self.pipeline.last_audio_path
-
             self._set_status(f"Loaded lesson {os.path.basename(lesson_dir)}")
             self._set_progress(0)
 
-            # if audio missing, warn user (export speakers will fail)
+            # With option (2), audio might not exist anymore
             if not getattr(self.pipeline, "last_audio_path", None):
                 messagebox.showwarning(
-                    "Audio missing",
-                    "This lesson does not have an audio file saved, and the original audio path is not available.\n\n"
-                    "Speaker WAV export will not work unless you re-associate the audio file."
+                    "Audio not found",
+                    "This lesson was loaded, but the original audio file path is not available.\n\n"
+                    "Speaker WAV export requires the original audio file. If you moved/deleted it, re-associate it."
                 )
-
         except Exception as e:
             msg = str(e)
             self.master.after(0, lambda err=msg: messagebox.showerror("Load Failed", err))
+
 
     def _open_lesson_detail(self, lesson_dir: str):
         win = ctk.CTkToplevel(self.master)

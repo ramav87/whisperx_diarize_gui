@@ -380,34 +380,54 @@ class DiarizationPipelineRunner:
             return text
 
     def load_lesson_artifacts(self, lesson_dir: str):
-        # segments
-        seg_path = os.path.join(lesson_dir, "segments.json")
-        with open(seg_path, "r", encoding="utf-8") as f:
-            self.last_result = json.load(f)
-
-        # diarization (if separate)
-        diar_path = os.path.join(lesson_dir, "diarization.json")
-        if os.path.isfile(diar_path):
-            with open(diar_path, "r", encoding="utf-8") as f:
-                diar = json.load(f)
-            self.last_diar = diar  # or build a dataframe your exporter expects
-
-        # meta
+        """
+        Restore last_result/last_diar_df/last_audio_path from a lesson folder.
+        Enables export_srt/export_txt and export_speaker_audios (if audio path exists).
+        Returns meta dict (may be empty).
+        """
         meta_path = os.path.join(lesson_dir, "meta.json")
+        seg_path = os.path.join(lesson_dir, "segments.json")
+        diar_path = os.path.join(lesson_dir, "diarization.json")
+
+        if not os.path.isfile(seg_path):
+            raise FileNotFoundError(f"Missing segments.json in {lesson_dir}")
+
+        with open(seg_path, "r", encoding="utf-8") as f:
+            segments = json.load(f)
+
+        # segments.json is a list of segments; pipeline expects {"segments": [...]}
+        self.last_result = {"segments": segments}
+        self.last_output_dir = lesson_dir
+
+        # Load meta (optional)
         meta = {}
         if os.path.isfile(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f) or {}
 
-        # audio path resolution (prefer embedded audio)
-        embedded_audio = os.path.join(lesson_dir, meta.get("saved_audio_filename", "audio.wav"))
-        if os.path.isfile(embedded_audio):
-            self.last_audio_path = embedded_audio
+        # Option (2): use original audio path from meta, but only if it still exists
+        # Support multiple historical key names to be robust:
+        audio_path = (
+            meta.get("source_audio_path")
+            or meta.get("source_audio")
+            or meta.get("last_audio_path")
+            or meta.get("audio_path")
+        )
+        if audio_path and os.path.isfile(audio_path):
+            self.last_audio_path = audio_path
         else:
-            p = meta.get("source_audio_path")
-            self.last_audio_path = p if p and os.path.isfile(p) else None
+            self.last_audio_path = None
+
+        # diarization df optional (needed for speaker WAV export)
+        if os.path.isfile(diar_path):
+            with open(diar_path, "r", encoding="utf-8") as f:
+                diar = json.load(f)
+            self.last_diar_df = pd.DataFrame(diar)
+        else:
+            self.last_diar_df = None
 
         return meta
+
 
     # ---------- Export helpers (unchanged) ----------
     def _lesson_duration_sec(self) -> float:
@@ -545,7 +565,7 @@ class DiarizationPipelineRunner:
         if os.path.isfile(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            self.last_audio_path = meta.get("source_audio")
+            self.last_audio_path = meta.get("source_audio_path")
         else:
             self.last_audio_path = None
 
