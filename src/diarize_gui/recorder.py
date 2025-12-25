@@ -22,6 +22,7 @@ class AudioRecorder:
         self.samplerate = samplerate
         self.channels = channels
         self.on_status = on_status
+        self.recorded_at_time = None
 
         self.is_recording: bool = False
         self.record_file: Optional[sf.SoundFile] = None
@@ -60,8 +61,10 @@ class AudioRecorder:
         os.makedirs(output_dir, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        recording_started_at = datetime.now().isoformat(timespec="seconds")
         filename = f"recording_{timestamp}.wav"
         self.recorded_file_path = os.path.join(output_dir, filename)
+        self.recorded_at_time = recording_started_at
 
         try:
             self.record_file = sf.SoundFile(

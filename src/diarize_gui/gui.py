@@ -72,11 +72,60 @@ def start_bundled_ollama():
         print(f"Failed to start bundled Ollama: {e}")
         return None
 
+class ToolTip:
+    def __init__(self, widget, text, delay=500):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.tipwindow = None
+        self.after_id = None
+
+        widget.bind("<Enter>", self._schedule)
+        widget.bind("<Leave>", self._hide)
+
+    def _schedule(self, _=None):
+        self.after_id = self.widget.after(self.delay, self._show)
+
+    def _show(self):
+        if self.tipwindow:
+            return
+
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() - 10
+
+        self.tipwindow = tw = ctk.CTkToplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.attributes("-topmost", True)
+
+        label = ctk.CTkLabel(
+            tw,
+            text=self.text,
+            fg_color="#2B2B2B",
+            text_color="#E6E6E6",
+            corner_radius=6,
+            padx=8,
+            pady=4,
+            justify="left",
+        )
+        label.pack()
+
+    def _hide(self, _=None):
+        if self.after_id:
+            self.widget.after_cancel(self.after_id)
+            self.after_id = None
+        if self.tipwindow:
+            self.tipwindow.destroy()
+            self.tipwindow = None
+
+
+
 class DiarizationApp:
     def __init__(self, master):
         self.master = master
         self.profile_config = {}
         self.current_lesson_dir = None
+        self._assign_window_open = False
 
         master.title("Lesson Recording and Analysis App")
         master.geometry("750x900")
@@ -99,10 +148,16 @@ class DiarizationApp:
 
         # --- UI LAYOUT ---
         self.tab_view = ctk.CTkTabview(self.master)
+        self.master.configure(fg_color="#1E1E1E")
+
+        self.tab_view = ctk.CTkTabview(self.master, fg_color="#1E1E1E")
         self.tab_view.pack(fill="both", expand=True, padx=10, pady=10)
 
         self.tab_dash = self.tab_view.add("Dashboard")
+        self.tab_dash.configure(fg_color="#1E1E1E")
+
         self.tab_studio = self.tab_view.add("Studio")
+        self.tab_studio.configure(fg_color="#1E1E1E")
         
         # Set "Studio" as the parent for all existing UI elements
         # We will pass self.tab_studio to _build_ui instead of self.master
@@ -148,7 +203,7 @@ class DiarizationApp:
 
     def _build_ui(self, parent):
         # 1. PROFILE HEADER
-        self.profile_frame = ctk.CTkFrame(parent, corner_radius=10)
+        self.profile_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color = "#262626")
         self.profile_frame.pack(padx=15, pady=(15, 5), fill="x")
 
         self.profile_label = ctk.CTkLabel(
@@ -175,7 +230,7 @@ class DiarizationApp:
         self.history_btn.pack(side="right", padx=0)
 
         # 2. INPUT CARD
-        self.input_card = ctk.CTkFrame(parent)
+        self.input_card = ctk.CTkFrame(parent, fg_color = "#262626")
         self.input_card.pack(padx=15, pady=5, fill="x")
         
         ctk.CTkLabel(self.input_card, text="Input Source", font=("Roboto", 14, "bold")).pack(anchor="w", padx=15, pady=(10,5))
@@ -230,7 +285,7 @@ class DiarizationApp:
         self.mic_level_db.pack(side="left", padx=(0, 0))
 
         # 3. SETTINGS CARD
-        self.settings_card = ctk.CTkFrame(parent)
+        self.settings_card = ctk.CTkFrame(parent, fg_color = "#262626")
         self.settings_card.pack(padx=15, pady=10, fill="x")
         
         ctk.CTkLabel(self.settings_card, text="Processing Settings", font=("Roboto", 14, "bold")).pack(anchor="w", padx=15, pady=(10,5))
@@ -243,6 +298,31 @@ class DiarizationApp:
         self.out_btn.grid(row=0, column=0, padx=5, pady=5)
         self.output_label = ctk.CTkLabel(grid, text="(None)", text_color="gray")
         self.output_label.grid(row=0, column=1, padx=5, sticky="w")
+
+        lbl = ctk.CTkLabel(grid, text="Expected speakers:")
+        lbl.grid(row=0, column=1, padx=5, sticky="e")
+        ToolTip(
+        lbl,
+        "Set the expected number of speakers for diarization.\n"
+        "• Auto: WhisperX decides (may over-split).\n"
+        "• 2 is recommended for tutor/student lessons."
+        )
+        lbl.configure(cursor="question_arrow")
+
+        self.exp_spk_var = ctk.StringVar(value="2")
+        self.exp_spk_menu = ctk.CTkOptionMenu(
+            grid,
+            variable=self.exp_spk_var,
+            values=["Auto", "1", "2", "3", "4", "5", "6"],
+            width=100
+        )
+        self.exp_spk_menu.grid(row=0, column=2, padx=5, sticky="w")
+
+        ToolTip(
+            self.exp_spk_menu,
+            "For group sessions, use Auto.\n"
+            "For lessons, 2 is usually best."
+        )
 
         # Model Size
         ctk.CTkLabel(grid, text="Transcription Model Size:").grid(row=1, column=0, padx=(0, 8), pady=5, sticky="w")
@@ -266,11 +346,11 @@ class DiarizationApp:
         
         # Checkbox
         self.context_var = ctk.BooleanVar(value=False)
-        self.context_cb = ctk.CTkCheckBox(grid, text="Contextual Transcribing", variable=self.context_var)
+        self.context_cb = ctk.CTkCheckBox(grid, text="Context", variable=self.context_var)
         self.context_cb.grid(row=1, column=4, padx=(15, 0), sticky="w")
 
         # 4. ACTION CARD (Run + Progress + Status)
-        self.action_card = ctk.CTkFrame(parent)
+        self.action_card = ctk.CTkFrame(parent, fg_color = "#262626")
         self.action_card.pack(padx=15, pady=8, fill="x")
 
         # Run button (hero)
@@ -282,6 +362,10 @@ class DiarizationApp:
             command=self.run_diarization
         )
         self.run_btn.pack(padx=12, pady=(12, 8), fill="x")
+
+        self.assign_btn = ctk.CTkButton(self.action_card, text="Assign Speakers…",width=160,
+        command=self.open_assign_speakers,state = "disabled")
+        self.assign_btn.pack(side="left", padx=8, pady=8)
 
         # Progress bar
         self.progress_bar = ctk.CTkProgressBar(self.action_card)
@@ -296,7 +380,6 @@ class DiarizationApp:
             font=("Roboto", 12)
         )
         self.status_label.pack(padx=12, pady=(0, 12), anchor="w")
-
 
         # 5. POST-PROCESSING CARD
         self.post_card = ctk.CTkFrame(parent)
@@ -339,50 +422,113 @@ class DiarizationApp:
         
         self.export_wav_btn = ctk.CTkButton(exp_row, text="Export Speakers", state="disabled", width=80, command=self.export_speaker_audio)
         self.export_wav_btn.pack(side="left", padx=5, expand=True, fill="x")
-
+        self.export_help = ctk.CTkLabel(
+            exp_row,
+            text="",
+            text_color="gray",
+            font=("Roboto", 12),
+            anchor="w",
+            justify="left"
+        )
         self._update_analyze_ui_state()
 
+    def open_assign_speakers(self):
+        if not getattr(self, "current_lesson_dir", None):
+            messagebox.showerror("Error", "No lesson loaded. Run processing or load a transcript first.")
+            return
+
+        seg_path = os.path.join(self.current_lesson_dir, "segments.json")
+        if not os.path.isfile(seg_path):
+            messagebox.showerror("Error", "This lesson has no segments.json (nothing to assign).")
+            return
+
+        try:
+            with open(seg_path, "r", encoding="utf-8") as f:
+                segs = json.load(f) or []
+            speakers = sorted({s.get("speaker") for s in segs if s.get("speaker")})
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read segments.json:\n{e}")
+            return
+
+        if not speakers:
+            messagebox.showinfo("Assign Speakers", "No speaker labels found in segments.")
+            return
+
+        self._open_assign_speakers_window(speakers)
 
     # --- LOGIC METHODS ---
     def _update_analyze_ui_state(self):
         """
         Updates Analyze button + helper text based on whether a transcript exists and whether we're busy.
         """
-        # Busy: if you're processing or analyzing, keep things disabled
         busy = getattr(self, "_is_processing", False) or getattr(self, "_is_analyzing", False)
 
         has_transcript = False
         try:
-            # Prefer whatever your app uses as the source of truth
-            # e.g., self.pipeline.transcript_segments, self.pipeline.last_result, self.current_transcript_text, etc.
             txt = self.pipeline.get_transcript_text(include_speaker=True, max_chars=100)
             has_transcript = bool(txt and txt.strip())
         except Exception:
             has_transcript = False
 
+        # --- defaults: prevent stale UI ---
+        self.analyze_btn.configure(state="disabled")
+        self.analyze_help.configure(text="")
+        try:
+            self.export_wav_btn.configure(state="disabled")
+            self.export_help.configure(text="")
+        except Exception:
+            pass
+
+        # Assign button availability
+        can_assign = False
+        lesson_dir = getattr(self, "current_lesson_dir", None)
+        if lesson_dir:
+            seg_path = os.path.join(lesson_dir, "segments.json")
+            can_assign = os.path.isfile(seg_path)
+        try:
+            self.assign_btn.configure(state="normal" if can_assign else "disabled")
+        except Exception:
+            pass
+
         if busy:
-            self.analyze_btn.configure(state="disabled")
             self.analyze_help.configure(text="Working… please wait.")
+            try:
+                self.export_help.configure(text="Working… please wait.")
+            except Exception:
+                pass
             return
 
         if not has_transcript:
-            self.analyze_btn.configure(state="disabled")
             self.analyze_help.configure(text="To enable analysis: run processing or load an existing TXT transcript.")
+            try:
+                self.export_help.configure(text="To enable export: run processing or load an existing TXT transcript.")
+            except Exception:
+                pass
             return
 
-        # Ready
+        # If we have transcript, we're at least eligible for analysis once assignment is done
+        # Now enforce speaker assignment if segments exist
+        if lesson_dir and os.path.isfile(os.path.join(lesson_dir, "segments.json")):
+            if not self._has_speaker_assignment(lesson_dir):
+                self.analyze_help.configure(text="Action required: Assign Student Speaker(s) before analysis.")
+                try:
+                    self.export_help.configure(text="Action required: Assign Student Speaker(s) before Speaker WAV export.")
+                except Exception:
+                    pass
+                return
+
         self.analyze_btn.configure(state="normal")
+        self.analyze_help.configure(text="Ready for analysis.")
 
-        # Optional: mention selected provider in the hint
-        provider = getattr(self, "analysis_provider", None)
-        if hasattr(self, "analysis_provider_var"):
-            provider = self.analysis_provider_var.get()
+        try:
+            self.export_wav_btn.configure(state="normal")
+            self.export_help.configure(text="Ready: Speaker WAV export available.")
+            self._set_status("Ready for Export and Analysis")
+        except Exception:
+            pass
 
-        
-        self.analyze_help.configure(text="Ready for transcription view and analysis.")
 
     # --- PROFILE CONFIG (OpenAI key, provider prefs) ---
-
     def _profile_lessons_dir(self):
         d = self._profile_dir()
         if not d:
@@ -519,6 +665,7 @@ class DiarizationApp:
         self.export_srt_btn.configure(state="normal")
         self.export_txt_btn.configure(state="normal")
         self.export_wav_btn.configure(state="normal")
+        self.assign_btn.configure(state = "normal")
         self._update_analyze_ui_state()
 
     def _disable_export_buttons(self):
@@ -526,6 +673,59 @@ class DiarizationApp:
         self.export_srt_btn.configure(state="disabled")
         self.export_txt_btn.configure(state="disabled")
         self.export_wav_btn.configure(state="disabled")
+        self._update_analyze_ui_state()
+
+
+    def _read_json_file(self, path: str) -> dict:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _write_json_file(self, path: str, data: dict) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _reassociate_audio_for_lesson(self, lesson_dir: str, status_label=None):
+        # Let user pick an audio file
+        audio_path = filedialog.askopenfilename(
+            title="Select the original audio file for this lesson",
+            filetypes=[
+                ("Audio", "*.wav *.mp3 *.m4a *.flac *.ogg *.aac *.aiff *.aif"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not audio_path:
+            return
+
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        meta = self._read_json_file(meta_path)
+
+        meta["source_audio_path"] = audio_path
+
+        # Optional: keep a timestamp
+        meta["audio_reassociated_at"] = datetime.now().isoformat(timespec="seconds")
+
+        self._write_json_file(meta_path, meta)
+
+        # If this lesson is currently loaded, update pipeline immediately
+        if getattr(self, "current_lesson_dir", None) == lesson_dir:
+            try:
+                if os.path.isfile(audio_path):
+                    self.pipeline.last_audio_path = audio_path
+            except Exception:
+                pass
+
+        # Update UI feedback
+        if status_label is not None:
+            try:
+                status_label.configure(text=f"Audio: {os.path.basename(audio_path)}", text_color="lightgreen")
+            except Exception:
+                pass
+
+        messagebox.showinfo("Updated", "Audio path saved. You can now Load this lesson and export speaker WAVs.")
+
 
     # --- PROFILE MANAGEMENT ---
 
@@ -657,12 +857,15 @@ class DiarizationApp:
         try:
             lang = self.lang_var.get()
             lang_code = LANGUAGE_MAP.get(lang)
+            exp = self.exp_spk_var.get() if hasattr(self, "exp_spk_var") else "Auto"
+            num_speakers = None if exp == "Auto" else int(exp)
             
             self.pipeline.process_audio(
                 audio_path=self.audio_path,
                 output_dir=self.output_dir,
                 model_size=self.model_var.get(),
-                language=lang_code
+                language=lang_code,
+                num_speakers=num_speakers,
             )
             self.has_result = True
             self.master.after(0, self._enable_export_buttons)
@@ -678,13 +881,16 @@ class DiarizationApp:
                         whisper_model_size=self.model_var.get(),
                         language=self.lang_var.get(),
                         contextual=self.context_var.get(),
+                        extra_meta={"recorded_at": self.recorder.recorded_at_time}
                     )
+                    self.master.after(0, self._enforce_speaker_assignment_after_save)
             except Exception as e:
                 print(f"[WARN] Failed to save lesson artifacts: {e}")
 
         except Exception as e:
             self._set_status("Error")
-            self.master.after(0, lambda: messagebox.showerror("Error", str(e)))
+            info = str(e)
+            self.master.after(0, lambda: messagebox.showerror("Error", info))
         finally:
             self.master.after(0, lambda: self.run_btn.configure(state="normal", text="RUN PROCESSING"))
             
@@ -710,6 +916,7 @@ class DiarizationApp:
                             language=None,
                             contextual=None,
                         )
+                        self.master.after(0, self._enforce_speaker_assignment_after_save)
                 except Exception as e:
                     print(f"[WARN] Failed to save lesson artifacts from TXT: {e}")
 
@@ -757,7 +964,7 @@ class DiarizationApp:
 
         ctk.CTkLabel(win, text="Past Lessons", font=("Roboto", 20)).pack(pady=10)
 
-        scroll = ctk.CTkScrollableFrame(win)
+        scroll = ctk.CTkScrollableFrame(win, fg_color="#2B2B2B")
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
 
         for item in lessons:
@@ -765,14 +972,14 @@ class DiarizationApp:
             lesson_id = item.get("lesson_id", "???")
             ldir = item.get("lesson_dir")
 
-            ts = meta.get("created_at", lesson_id)
+            ts = meta.get("recorded_at") or meta.get("processed_at") or meta.get("created_at") or lesson_id
             provider = meta.get("llm_provider", meta.get("provider", "—"))
             model = meta.get("llm_model", "—")
             dur = meta.get("duration_sec", 0.0)
             nspk = meta.get("num_speakers", "—")
             nseg = meta.get("num_segments", "—")
 
-            card = ctk.CTkFrame(scroll, fg_color="gray25")
+            card = ctk.CTkFrame(scroll, fg_color="#2B2B2B")
             card.pack(fill="x", pady=5)
 
             lbl = ctk.CTkLabel(
@@ -817,7 +1024,7 @@ class DiarizationApp:
             try:
                 self.export_srt_btn.configure(state="normal")
                 self.export_txt_btn.configure(state="normal")
-                self.export_speakers_btn.configure(state="normal")
+                self.export_wav_btn.configure(state="normal")
             except Exception:
                 pass
 
@@ -840,6 +1047,18 @@ class DiarizationApp:
             self._set_status(f"Loaded lesson {os.path.basename(lesson_dir)}")
             self._set_progress(0)
 
+            # Make "Process" and other actions see an audio file as selected
+            audio_path = getattr(self.pipeline, "last_audio_path", None)
+            if audio_path:
+                # use whichever attribute your app uses as the selected audio
+                self.audio_path = audio_path  # <-- if you use self.audio_path
+                self.selected_audio_path = audio_path  # <-- if you use this one
+                # if you have a label showing selected file, update it:
+                try:
+                    self.audio_label.configure(text=os.path.basename(audio_path))
+                except Exception:
+                    pass
+
             # With option (2), audio might not exist anymore
             if not getattr(self.pipeline, "last_audio_path", None):
                 messagebox.showwarning(
@@ -856,6 +1075,34 @@ class DiarizationApp:
         win = ctk.CTkToplevel(self.master)
         win.title("Lesson Detail")
         win.geometry("800x600")
+        # --- Header row (buttons + audio status) ---
+        header = ctk.CTkFrame(win)
+        header.pack(fill="x", padx=10, pady=(10, 6))
+
+        btn_relink = ctk.CTkButton(
+            header,
+            text="Re-associate audio…",
+            width=160,
+            command=lambda d=lesson_dir: self._reassociate_audio_for_lesson(d, status_label=audio_status),
+        )
+        # We reference audio_status below, so create it first (see next lines)
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        meta = self._read_json_file(meta_path)
+        ap = meta.get("source_audio_path")
+        ap_ok = bool(ap and os.path.isfile(ap))
+        audio_text = f"Audio: {os.path.basename(ap)}" if ap else "Audio: (not set)"
+        audio_color = "lightgreen" if ap_ok else "gray"
+
+        audio_status = ctk.CTkLabel(header, text=audio_text, text_color=audio_color)
+        audio_status.pack(side="left", padx=(10, 8), pady=8)
+
+        btn_relink = ctk.CTkButton(
+            header,
+            text="Re-associate audio…",
+            width=160,
+            command=lambda d=lesson_dir, lbl=audio_status: self._reassociate_audio_for_lesson(d, status_label=lbl),
+        )
+        btn_relink.pack(side="right", padx=10, pady=8)
 
         tabview = ctk.CTkTabview(win)
         tabview.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1093,9 +1340,58 @@ class DiarizationApp:
         prompt_box.bind("<FocusOut>", update_cost_estimate)
 
         default_prompt = (
-            "You are an expert Spanish teacher. Identify the student's mistakes "
-            "and provide corrections and practice goals."
-        )
+            "You are an expert Spanish language teacher and pronunciation coach. \
+            You will analyze ONLY the student’s speech from a lesson transcript. \
+            Do not analyze or comment on the tutor’s speech. \
+ \
+            Your analysis must be objective, supportive, and pedagogically precise. \
+            Base your feedback strictly on evidence in the transcript. \
+\
+            Produce your response in the following structured sections: \
+ \
+            1. Overall Assessment (2–3 sentences) \
+            - Summarize the student’s current performance in terms of communicative effectiveness. \
+            - State whether communication was generally smooth or effortful. \
+ \
+            2. Accuracy \
+            - Identify recurring grammatical, morphological, or lexical errors. \
+            - Focus on error patterns, not isolated slips. \
+            - Provide 2–4 representative examples with corrections. \
+            - Briefly explain why the correction is needed (no long grammar lessons). \
+ \
+            3. Fluency \
+            - Evaluate flow, hesitation patterns, false starts, and sentence completion. \
+            - Comment on whether pauses interfere with meaning or are natural at this level. \
+\
+            4. Pronunciation & Prosody \
+            - Assess rhythm, syllable timing, stress, and intonation. \
+            - Note any features that sound non-native (e.g., English stress patterns, vowel reduction). \
+            - Also identify any aspects that already sound natural. \
+\
+            5. Positive Observations \
+            - Highlight specific strengths demonstrated in this lesson \
+            (e.g., verb tense control, use of connectors, conversational strategies). \
+\
+            6. CEFR Profile (Estimated) \
+            Provide an estimated CEFR level for each dimension: \
+            - Grammar accuracy \
+            - Fluency \
+            - Pronunciation & prosody \
+            - Vocabulary range \
+            Use labels such as: A2 / B1 / B2 / C1. \
+            Briefly justify each estimate (1 sentence each). \
+\
+            7. Priority Practice Goals (Next 2–3 Weeks) \
+            - List 3–5 concrete, actionable goals. \
+            - Focus on the highest-impact improvements for the student. \
+            - Phrase goals in practical terms (e.g., “practice linking clauses with…”, not “improve grammar”). \
+\
+            Guidelines: \
+            - Do not rewrite the entire transcript. \
+            - Do not invent errors not present in the text. \
+            - Avoid vague advice (“practice more”, “be more fluent”). \
+            - Assume the student is motivated and aiming for advanced proficiency.")
+        
         prompt_box.insert("1.0", default_prompt)
 
         # --- Cost estimate (OpenAI only) ---
@@ -1270,6 +1566,11 @@ class DiarizationApp:
         start_btn = ctk.CTkButton(container, text="Start Analysis", command=on_run, fg_color="#2e7d32", height=44)
         start_btn.pack(pady=(10, 20), fill="x", padx=10)
 
+    def _speaker_map_path(self, lesson_dir: str) -> str:
+        return os.path.join(lesson_dir, "speaker_map.json")
+
+    def _has_speaker_assignment(self, lesson_dir: str) -> bool:
+        return os.path.isfile(self._speaker_map_path(lesson_dir))
 
     def _run_download_thread(self, model_name):
         # Popup for download progress
@@ -1307,6 +1608,46 @@ class DiarizationApp:
                 self.master.after(0, dl_win.destroy)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _enforce_speaker_assignment_after_save(self):
+        """
+        Call this after save_lesson_artifacts() for any workflow that creates/loads speaker-labeled segments.
+        """
+        if not getattr(self, "current_lesson_dir", None):
+            return
+
+        # Only enforce if there are speakers to assign
+        seg_path = os.path.join(self.current_lesson_dir, "segments.json")
+        if not os.path.isfile(seg_path):
+            return
+
+        try:
+            with open(seg_path, "r", encoding="utf-8") as f:
+                segs = json.load(f) or []
+            speakers = sorted({s.get("speaker") for s in segs if s.get("speaker")})
+        except Exception:
+            speakers = []
+
+        if not speakers:
+            return
+
+        diar_path = os.path.join(self.current_lesson_dir, "diarization.json")
+        has_diar = os.path.isfile(diar_path)
+
+        # Enforce if diarization exists OR multiple speakers exist
+        if (has_diar or len(speakers) > 1) and not self._has_speaker_assignment(self.current_lesson_dir):
+            if getattr(self, "_assign_window_open", False):
+                return
+            self._assign_window_open = True
+
+            def _open():
+                try:
+                    self._set_status("Action required: Assign Student speaker(s).")
+                    self._open_assign_speakers_window(speakers)
+                finally:
+                    self._assign_window_open = False
+
+            self.master.after(0, _open)
 
     def _run_analysis_thread(self, prompt, speakers, provider, model, openai_api_key=None):
         self._set_status("Analyzing...")
@@ -1373,6 +1714,254 @@ class DiarizationApp:
         box.pack(fill="both", expand=True, padx=10, pady=10)
         box.insert("1.0", text)
 
+    def _open_assign_speakers_window(self, speakers: list[str]):
+        """
+        Modal: user selects which diarized speakers correspond to the Student.
+        Writes speaker_map.json into current_lesson_dir and patches meta.json.
+        """
+        if not getattr(self, "current_lesson_dir", None):
+            messagebox.showerror("Error", "No current lesson directory set.")
+            return
+
+        lesson_dir = self.current_lesson_dir
+        seg_path = os.path.join(lesson_dir, "segments.json")
+        if not os.path.isfile(seg_path):
+            messagebox.showerror("Error", f"Missing segments.json in:\n{lesson_dir}")
+            return
+      
+        # Load segments once
+        try:
+            with open(seg_path, "r", encoding="utf-8") as f:
+                segments = json.load(f) or []
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read segments.json:\n{e}")
+            return
+
+        # Helper to build preview text
+        def build_preview(selected: set[str], max_chars: int = 6000) -> tuple[str, dict]:
+            """
+            Returns (preview_text, stats_dict).
+            stats_dict includes char_count, num_segments, duration_sec (approx).
+            """
+            if not selected:
+                return "[Select one or more student speakers to preview]\n", {
+                    "char_count": 0,
+                    "num_segments": 0,
+                    "duration_sec": 0.0,
+                }
+
+            lines = []
+            total_chars = 0
+            nseg = 0
+            min_t = None
+            max_t = None
+
+            for s in segments:
+                spk = s.get("speaker")
+                if spk not in selected:
+                    continue
+
+                txt = s.get("text") or ""
+                if not txt:
+                    continue
+
+                st = s.get("start")
+                en = s.get("end")
+
+                # track duration bounds
+                if isinstance(st, (int, float)):
+                    min_t = st if min_t is None else min(min_t, st)
+                if isinstance(en, (int, float)):
+                    max_t = en if max_t is None else max(max_t, en)
+
+                # timestamp format mm:ss
+                def fmt(t):
+                    m = int(t // 60)
+                    sec = int(t % 60)
+                    return f"{m:02d}:{sec:02d}"
+
+                ts = ""
+                if isinstance(st, (int, float)) and isinstance(en, (int, float)):
+                    ts = f"[{fmt(st)}–{fmt(en)}] "
+
+                line = f"{ts}{spk}: {txt}".strip()
+
+                if total_chars + len(line) + 1 > max_chars:
+                    lines.append("… [preview truncated]")
+                    break
+
+                lines.append(line)
+                total_chars += len(line) + 1
+                nseg += 1
+
+            dur = 0.0
+            if min_t is not None and max_t is not None:
+                dur = max(0.0, float(max_t) - float(min_t))
+
+            return ("\n".join(lines) + ("\n" if lines else "")), {
+                "char_count": total_chars,
+                "num_segments": nseg,
+                "duration_sec": dur,
+            }
+
+
+        # Pre-select from existing mapping if present
+        speaker_map_path = os.path.join(lesson_dir, "speaker_map.json")
+        pre_selected = set()
+        if os.path.isfile(speaker_map_path):
+            try:
+                with open(speaker_map_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f) or {}
+                pre_selected = set(existing.get("student_speakers") or [])
+            except Exception:
+                pre_selected = set()
+
+        # --- Window ---
+        win = ctk.CTkToplevel(self.master)
+        win.title("Assign Student Speakers")
+        win.geometry("900x560")
+        win.minsize(860, 520)
+        win.transient(self.master)
+        win.grab_set()  # modal
+
+        # Title + help
+        header = ctk.CTkFrame(win, fg_color="transparent")
+        header.pack(fill="x", padx=14, pady=(12, 6))
+
+        ctk.CTkLabel(header, text="Assign Student Speaker(s)", font=("Roboto", 18, "bold")).pack(anchor="w")
+        ctk.CTkLabel(
+            header,
+            text="Select which diarized speaker labels correspond to the STUDENT. This is required for exports and analytics.",
+            text_color="gray",
+        ).pack(anchor="w", pady=(2, 0))
+
+        # --- Top row: Speakers (left) + Preview (right) ---
+        top = ctk.CTkFrame(win)
+        top.pack(fill="both", expand=True, padx=14, pady=(6, 10))
+
+        left = ctk.CTkFrame(top)
+        left.pack(side="left", fill="y", padx=(10, 8), pady=10)
+
+        ctk.CTkLabel(left, text="Speakers", font=("Roboto", 14, "bold")).pack(anchor="w", padx=10, pady=(8, 6))
+
+        spk_scroll = ctk.CTkScrollableFrame(left, width=240, height=320)
+        spk_scroll.pack(fill="y", padx=10, pady=(0, 10))
+
+        right = ctk.CTkFrame(top)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 10), pady=10)
+
+        ctk.CTkLabel(right, text="Transcript Preview (Student only)", font=("Roboto", 14, "bold")).pack(
+            anchor="w", padx=10, pady=(8, 6)
+        )
+
+        preview_box = ctk.CTkTextbox(right, height=320)
+        preview_box.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        preview_box.insert("1.0", "[Select one or more student speakers to preview]\n")
+        preview_box.configure(state="disabled")
+
+        preview_meta = ctk.CTkLabel(right, text="Chars: 0", text_color="gray")
+        preview_meta.pack(anchor="w", padx=10, pady=(0, 6))
+
+        # State vars
+        spk_vars: dict[str, ctk.BooleanVar] = {}
+
+        def update_preview(_evt=None):
+            selected = {spk for spk, v in spk_vars.items() if v.get()}
+            text, stats = build_preview(selected)
+
+            preview_box.configure(state="normal")
+            preview_box.delete("1.0", "end")
+            preview_box.insert("1.0", text)
+            preview_box.configure(state="disabled")
+
+            preview_meta.configure(
+                text=f"Chars: {stats['char_count']}   Segments: {stats['num_segments']}   ~Duration: {stats['duration_sec']/60:.1f} min"
+            )
+
+            btn_save.configure(state="normal" if selected else "disabled")
+
+
+        # Build speaker checkboxes
+        for spk in speakers:
+            var = ctk.BooleanVar(value=(spk in pre_selected))
+            spk_vars[spk] = var
+            cb = ctk.CTkCheckBox(spk_scroll, text=spk, variable=var, command=update_preview)
+            cb.pack(anchor="w", padx=10, pady=6)
+
+        # Initialize preview
+        self.master.after(0, update_preview)
+
+        # --- Bottom row: buttons ---
+        bottom = ctk.CTkFrame(win)
+        bottom.pack(fill="x", padx=14, pady=(0, 14))
+
+        # Status / warning line
+        status_lbl = ctk.CTkLabel(bottom, text="", text_color="gray")
+        status_lbl.pack(side="left", padx=10, pady=10)
+
+        def do_save():
+            selected = [spk for spk, v in spk_vars.items() if v.get()]
+            if not selected:
+                messagebox.showwarning("Required", "Please select at least one Student speaker.")
+                return
+
+            # Write speaker_map.json
+            payload = {
+                "version": 1,
+                "assigned_at": datetime.now().isoformat(timespec="seconds"),
+                "student_speakers": selected,
+                "num_student_speakers": len(selected),
+                "map": {spk: ("student" if spk in selected else "other") for spk in speakers},
+            }
+            try:
+                with open(speaker_map_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to write speaker_map.json:\n{e}")
+                return
+
+            # Patch meta.json
+            meta_path = os.path.join(lesson_dir, "meta.json")
+            meta = {}
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f) or {}
+                except Exception:
+                    meta = {}
+
+            meta["has_speaker_map"] = True
+            meta["student_speakers"] = selected
+            meta["speaker_map_file"] = "speaker_map.json"
+            meta["speaker_map_updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+            try:
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to update meta.json:\n{e}")
+                return
+
+            win.grab_release()
+            win.destroy()
+            self.master.after(0, self._update_analyze_ui_state)
+
+        def do_cancel():
+            # If you truly want to *insist*, you can remove Cancel entirely.
+            # For now: allow cancel but keep gating active (buttons disabled until assigned).
+            self.master.after(0, self._update_analyze_ui_state)
+            win.grab_release()
+            win.destroy()
+
+        btn_cancel = ctk.CTkButton(bottom, text="Close", width=120, fg_color="transparent", border_width=2, command=do_cancel)
+        btn_cancel.pack(side="right", padx=(6, 10), pady=10)
+
+        btn_save = ctk.CTkButton(bottom, text="Save Assignment", width=180, command=do_save)
+        btn_save.pack(side="right", padx=(10, 6), pady=10)
+
+        # Disable save until selection
+        btn_save.configure(state="normal" if pre_selected else "disabled")
+
     # --- EXPORTS ---
 
     def export_srt(self):
@@ -1388,6 +1977,11 @@ class DiarizationApp:
             messagebox.showinfo("Export", "Saved TXT")
 
     def export_speaker_audio(self):
+        if self.current_lesson_dir and not self._has_speaker_assignment(self.current_lesson_dir):
+            messagebox.showwarning("Action required", "Please assign Student speaker(s) first.")
+            self._enforce_speaker_assignment_after_save()
+            return
+
         path = filedialog.askdirectory()
         if path:
             self.pipeline.export_speaker_audios(path)

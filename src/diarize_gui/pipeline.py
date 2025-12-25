@@ -125,7 +125,10 @@ class DiarizationPipelineRunner:
         audio_path: str,
         output_dir: str,
         model_size: str = "small",
-        language: str = None
+        language: str = None,
+        num_speakers: Optional[int] = None,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
        
         ):
         """
@@ -186,7 +189,21 @@ class DiarizationPipelineRunner:
             raise RuntimeError(f"Failed to load offline Pyannote model: {e}")
 
         # Run inference
-        annotation = diar_pipeline(audio_path)
+        # new:
+        kwargs = {}
+        if num_speakers:
+            kwargs["num_speakers"] = int(num_speakers)
+        if min_speakers:
+            kwargs["min_speakers"] = int(min_speakers)
+        if max_speakers:
+            kwargs["max_speakers"] = int(max_speakers)
+
+        try:
+            annotation = diar_pipeline(audio_path, **kwargs)
+        except TypeError:
+            # If the loaded pipeline doesn't accept these kwargs for some reason,
+            # fall back gracefully.
+            annotation = diar_pipeline(audio_path)
         # -----------------------------------
 
         segments = []
@@ -428,8 +445,18 @@ class DiarizationPipelineRunner:
 
         return meta
 
-
     # ---------- Export helpers (unchanged) ----------
+
+    def _infer_recorded_at_iso(self, audio_path: str | None) -> str | None:
+        if not audio_path:
+            return None
+        try:
+            # Use mtime (portable). It’s seconds since epoch.
+            ts = os.path.getmtime(audio_path)
+            return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+        except Exception:
+            return None
+
     def _lesson_duration_sec(self) -> float:
         """Best-effort duration from segments/diarization."""
         ends = []
@@ -515,7 +542,8 @@ class DiarizationPipelineRunner:
 
         # 4) meta.json
         meta = {
-            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "processed_at": datetime.now().isoformat(timespec="seconds"),
+            "recorded_at": self._infer_recorded_at_iso(self.last_audio_path),
             "profile": profile_name,
             "source_audio_path": self.last_audio_path,   # critical for future speaker WAV export
             "saved_audio_filename": "audio.wav",  # if you copy it
