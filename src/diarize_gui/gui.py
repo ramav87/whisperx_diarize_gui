@@ -763,7 +763,8 @@ class DiarizationApp:
             self.dashboard = DashboardFrame(
                 self.tab_dash, 
                 profile_name=self.profile_name, 
-                profile_dir=self._profile_dir()
+                profile_dir=self._profile_dir(),
+                pipeline=self.pipeline  
             )
             self.dashboard.pack(fill="both", expand=True)
             # ----------------------
@@ -1987,9 +1988,32 @@ class DiarizationApp:
             self.pipeline.export_speaker_audios(path)
             messagebox.showinfo("Export", "Saved Speaker Audios")
 
+
 def main():
     root = ctk.CTk()
     app = DiarizationApp(root)
+    
+    def on_closing():
+        # 1. Stop Ollama
+        app._cleanup_ollama()
+        
+        # 2. Force Matplotlib to close all charts
+        try:
+            import matplotlib.pyplot as plt
+            plt.close('all')
+        except ImportError:
+            pass
+
+        # 3. Destroy the GUI
+        root.destroy()
+        
+        # 4. Force kill the process (ensures no background threads hang)
+        import sys
+        sys.exit(0)
+
+    # Bind the window's "X" button to our cleanup function
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    
     root.mainloop()
 
 if __name__ == "__main__":

@@ -120,6 +120,110 @@ class DiarizationPipelineRunner:
         self._set_status("Loaded segments from TXT")
         self._set_progress(100)
 
+    def compute_ai_metrics(self, lesson_dir, model="llama3.2", mode="ollama"):
+        """
+        Robustly computes metrics. 
+        Attempts strict JSON parsing first, falls back to text scraping if model refuses JSON.
+        """
+        import json
+        import re
+        
+        # 1. Build Transcript
+        seg_path = os.path.join(lesson_dir, "segments.json")
+        transcript_path = os.path.join(lesson_dir, "transcript.txt")
+        output_path = os.path.join(lesson_dir, "ai_stats.json")
+        
+        text_content = ""
+        if os.path.exists(seg_path):
+            try:
+                with open(seg_path, 'r', encoding='utf-8') as f:
+                    segs = json.load(f)
+                for s in segs:
+                    text_content += f"{s.get('speaker', 'Unknown')}: {s.get('text', '')}\n"
+            except: pass
+        
+        if not text_content and os.path.exists(transcript_path):
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                text_content = f.read()
+
+        if not text_content: return False
+        if len(text_content) > 8000: text_content = text_content[:8000]
+
+        # 2. Strict Prompt (Updated for Bilingual Words)
+        prompt = (
+            "Analyze this language lesson. Identify the Student's mistakes.\n"
+            "Respond with a strict JSON object using these keys:\n"
+            "grammar_score (0-100), topics (list of 3 strings), golden_words (list of 3 complex words), corrections (int), feedback (string).\n\n"
+            "IMPORTANT FORMATTING:\n"
+            "- 'golden_words' must be in the format: \"SpanishWord (EnglishTranslation)\"\n"
+            "- Example: [\"desafortunadamente (unfortunately)\", \"hipótesis (hypothesis)\"]\n\n"
+            "Example JSON:\n"
+            "{\"grammar_score\": 75, \"topics\": [\"Food\", \"Travel\"], \"golden_words\": [\"exquisito (exquisite)\", \"viaje (journey)\"], \"corrections\": 4, \"feedback\": \"Watch your past tense.\"}\n\n"
+            "JSON ONLY. NO MARKDOWN."
+        )
+
+        try:
+            # 3. Call LLM
+            raw_response = self.analyze_with_llm(
+                user_prompt=prompt,
+                model=model,
+                provider=mode,
+                external_text=text_content 
+            )
+            
+            # --- STRATEGY A: Try Parse JSON ---
+            try:
+                clean = raw_response.replace("```json", "").replace("```", "").strip()
+                start = clean.find('{')
+                end = clean.rfind('}') + 1
+                if start != -1 and end != 0:
+                    json_str = clean[start:end]
+                    data = json.loads(json_str)
+                    self._save_json(data, output_path)
+                    return True
+            except:
+                print("JSON parsing failed, attempting text scrape...")
+
+            # --- STRATEGY B: Scrape Text (Fallback) ---
+            fallback_data = {
+                "grammar_score": 70,
+                "topics": ["General Conversation"],
+                "golden_words": [],
+                "corrections": 0,
+                "feedback": "Keep practicing!"
+            }
+
+            score_match = re.search(r"Score:?\**\s*(\d+)", raw_response, re.IGNORECASE)
+            if score_match: fallback_data["grammar_score"] = int(score_match.group(1))
+
+            # Updated Regex to capture words potentially in parentheses
+            words_section = re.search(r"Golden Words:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
+            if words_section:
+                # Capture the whole line content after the bullet
+                words = re.findall(r"-\s*\*?([^\n]+)", words_section.group(1))
+                if words: 
+                    # Clean up bolding marks if any
+                    clean_words = [w.replace('*', '').strip() for w in words]
+                    fallback_data["golden_words"] = clean_words[:3]
+
+            corr_section = re.search(r"Corrections:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
+            if corr_section:
+                count = corr_section.group(1).count("\n-")
+                if count > 0: fallback_data["corrections"] = count
+
+            self._save_json(fallback_data, output_path)
+            return True
+
+        except Exception as e:
+            print(f"Error computing AI metrics: {e}")
+            return False
+
+    def _save_json(self, data, path):
+        import json
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        print(f"AI Stats saved to {path}")
+
     def process_audio(
         self,
         audio_path: str,
@@ -319,16 +423,25 @@ class DiarizationPipelineRunner:
         api_key: Optional[str] = None,
         provider: str = "ollama",
         speakers: Optional[List[str]] = None,
-        max_chars: int = DEFAULT_MAX_CHARS,
+        max_chars: int = 25000, # Default value assumption
+        external_text: Optional[str] = None, 
     ) -> str:
         if not user_prompt.strip():
             raise ValueError("Prompt is empty.")
 
-        transcript = self.get_transcript_text(
-            include_speaker=True,
-            speaker_filters=speakers,
-            max_chars=max_chars,
-        )
+        # LOGIC CHANGE: Use provided text if available, otherwise fetch from current state
+        if external_text:
+            transcript = external_text
+            # Truncate if needed to avoid context overflow
+            if len(transcript) > max_chars:
+                transcript = transcript[:max_chars] + "...(truncated)"
+        else:
+            # Original behavior
+            transcript = self.get_transcript_text(
+                include_speaker=True,
+                speaker_filters=speakers,
+                max_chars=max_chars,
+            )
 
         speakers_str = ", ".join(speakers) if speakers else "TODOS"
         combined_prompt = (
@@ -340,9 +453,9 @@ class DiarizationPipelineRunner:
         )
 
         if provider == "openai":
-
             from .openai_provider import OpenAIProvider
-            client = OpenAIProvider(api_key=api_key, model=model or "gpt-5.1")
+            # Ensure model has a fallback
+            client = OpenAIProvider(api_key=api_key, model=model or "gpt-4o")
 
             self._set_status(f"Calling OpenAI ({client.model})...")
             self._set_progress(50)
@@ -351,12 +464,12 @@ class DiarizationPipelineRunner:
             self._set_progress(100)
 
             return text
+            
         elif provider == "ollama":
             api_url = api_url or os.environ.get(
                 "LLM_ANALYSIS_URL", "http://localhost:11434/api/generate"
             )
             
-            # Override env var if model is passed
             model = model or os.environ.get("LLM_ANALYSIS_MODEL", "mistral")
 
             headers = {}
@@ -373,6 +486,7 @@ class DiarizationPipelineRunner:
             self._set_progress(50)
 
             import requests
+            # Increase timeout for slower local models
             resp = requests.post(api_url, json=payload, headers=headers, timeout=600)
             resp.raise_for_status()
             data = resp.json()
@@ -384,10 +498,7 @@ class DiarizationPipelineRunner:
                 try:
                     text = data["choices"][0]["message"]["content"]
                 except Exception:
-                    try:
-                        text = data["choices"][0]["text"]
-                    except Exception:
-                        pass
+                    pass
 
             if not text:
                 raise RuntimeError(f"Could not parse LLM response: {data}")
@@ -395,6 +506,8 @@ class DiarizationPipelineRunner:
             self._set_status("Analysis done")
             self._set_progress(100)
             return text
+            
+        return "Error: Unknown provider"
 
     def load_lesson_artifacts(self, lesson_dir: str):
         """
