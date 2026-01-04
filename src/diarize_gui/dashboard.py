@@ -137,13 +137,15 @@ class DashboardFrame(ctk.CTkFrame):
             # Process loop
             processed = 0
             for i, path in enumerate(to_process):
-                # Update status safely from thread
                 msg = f"Analyzing {i+1}/{total}..."
                 self.after(0, lambda m=msg: self.status_lbl.configure(text=m))
                 
-                # Run Pipeline (this blocks for ~30s per lesson)
-                self.pipeline.compute_ai_metrics(path, model="llama3.2")
-                processed += 1
+                # Check return value
+                success = self.pipeline.compute_ai_metrics(path, model="llama3.2")
+                if success:
+                    processed += 1
+                else:
+                    print(f"Skipping lesson {path} due to AI error.")
             
             self.after(0, lambda: self._on_ai_finished(processed, total))
 

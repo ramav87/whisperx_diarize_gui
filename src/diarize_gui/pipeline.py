@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import re
 from typing import Callable, Optional, List
@@ -120,6 +121,18 @@ class DiarizationPipelineRunner:
         self._set_status("Loaded segments from TXT")
         self._set_progress(100)
 
+    def _save_json(self, data, path):
+        """
+        Helper to save data to a JSON file.
+        """
+        import json
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"Saved AI metrics to: {path}")
+        except Exception as e:
+            print(f"Error saving JSON to {path}: {e}")
+            
     def compute_ai_metrics(self, lesson_dir, model="llama3.2", mode="ollama"):
         """
         Robustly computes metrics. 
@@ -153,7 +166,7 @@ class DiarizationPipelineRunner:
         if not text_content: return False
         if len(text_content) > 8000: text_content = text_content[:8000]
 
-        # 2. Strict Prompt (Updated for Bilingual Words)
+        # 2. Strict Prompt
         prompt = (
             "Analyze this language lesson. Identify the Student's mistakes.\n"
             "Respond with a strict JSON object using these keys:\n"
@@ -175,6 +188,13 @@ class DiarizationPipelineRunner:
                 external_text=text_content 
             )
             
+            # --- CRITICAL FIX START ---
+            # Check if the LLM call actually failed before trying to parse
+            if raw_response.startswith("Error:"):
+                print(f"LLM Analysis Failed for {lesson_dir}: {raw_response}")
+                return False  # Return False so we don't save a garbage file
+            # --- CRITICAL FIX END ---
+            
             # --- STRATEGY A: Try Parse JSON ---
             try:
                 clean = raw_response.replace("```json", "").replace("```", "").strip()
@@ -189,6 +209,8 @@ class DiarizationPipelineRunner:
                 print("JSON parsing failed, attempting text scrape...")
 
             # --- STRATEGY B: Scrape Text (Fallback) ---
+            # ... (Rest of your fallback logic remains the same) ...
+            
             fallback_data = {
                 "grammar_score": 70,
                 "topics": ["General Conversation"],
@@ -196,17 +218,16 @@ class DiarizationPipelineRunner:
                 "corrections": 0,
                 "feedback": "Keep practicing!"
             }
-
+            
+            # ... (Regex matching code) ...
+            
             score_match = re.search(r"Score:?\**\s*(\d+)", raw_response, re.IGNORECASE)
             if score_match: fallback_data["grammar_score"] = int(score_match.group(1))
 
-            # Updated Regex to capture words potentially in parentheses
             words_section = re.search(r"Golden Words:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
             if words_section:
-                # Capture the whole line content after the bullet
                 words = re.findall(r"-\s*\*?([^\n]+)", words_section.group(1))
                 if words: 
-                    # Clean up bolding marks if any
                     clean_words = [w.replace('*', '').strip() for w in words]
                     fallback_data["golden_words"] = clean_words[:3]
 
@@ -221,12 +242,6 @@ class DiarizationPipelineRunner:
         except Exception as e:
             print(f"Error computing AI metrics: {e}")
             return False
-
-    def _save_json(self, data, path):
-        import json
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
-        print(f"AI Stats saved to {path}")
 
     def _ensure_model_exists(self, model_name: str):
         """
