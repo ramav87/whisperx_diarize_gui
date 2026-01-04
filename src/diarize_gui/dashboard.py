@@ -9,6 +9,7 @@ import customtkinter as ctk
 import matplotlib.pyplot as plt
 import matplotlib
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.dates as mdates
 
 # Use a safe backend for macOS/Windows
 matplotlib.use("TkAgg")
@@ -18,14 +19,14 @@ class DashboardFrame(ctk.CTkFrame):
         super().__init__(master, **kwargs)
         self.profile_name = str(profile_name) if profile_name else "Student"
         self.profile_dir = profile_dir
-        self.pipeline = pipeline # Access to backend for AI calls
+        self.pipeline = pipeline 
         
         # Colors
         self.color_primary = "#3B8ED0"     
         self.color_student = "#4CAF50"     
         self.color_tutor = "#FF9800"       
         self.color_bad    = "#E57373"      
-        self.color_ai     = "#9C27B0"      # Purple for AI stats
+        self.color_ai     = "#9C27B0"      
         self.bg_figure = "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#ffffff"
         self.text_color = "white" if ctk.get_appearance_mode() == "Dark" else "black"
 
@@ -54,8 +55,8 @@ class DashboardFrame(ctk.CTkFrame):
         self.row2 = ctk.CTkFrame(self, fg_color="transparent")
         self.row2.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(5, 10))
         
-        self.card_grammar = self._create_kpi_card(self.row2, "Grammar Score", "--", color=self.color_ai)
-        self.card_golden = self._create_kpi_card(self.row2, "Golden Words", "--", color=self.color_ai)
+        self.card_grammar = self._create_kpi_card(self.row2, "Avg Grammar", "--", color=self.color_ai)
+        self.card_golden = self._create_kpi_card(self.row2, "Recent Golden Words", "--", color=self.color_ai)
         self.card_latency = self._create_kpi_card(self.row2, "Avg Latency", "0.0s")
         self.card_max_turn = self._create_kpi_card(self.row2, "Longest Turn", "0s")
 
@@ -64,18 +65,14 @@ class DashboardFrame(ctk.CTkFrame):
         self.card_latency.pack(side="left", expand=True, fill="x", padx=5)
         self.card_max_turn.pack(side="left", expand=True, fill="x", padx=5)
 
-        # 3. Charts Area
-        self.charts_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.charts_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=5)
-        self.charts_frame.grid_columnconfigure(0, weight=1)
-        self.charts_frame.grid_columnconfigure(1, weight=1)
-
-        self.chart_frame_left = ctk.CTkFrame(self.charts_frame)
-        self.chart_frame_left.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        # 3. Charts Area (Now Tabbed!)
+        self.chart_tabs = ctk.CTkTabview(self)
+        self.chart_tabs.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=5)
         
-        self.chart_frame_right = ctk.CTkFrame(self.charts_frame)
-        self.chart_frame_right.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-
+        self.tab_activity = self.chart_tabs.add("Activity")
+        self.tab_fluency = self.chart_tabs.add("Fluency")
+        self.tab_grammar = self.chart_tabs.add("Grammar AI")
+        
         # 4. Controls Row
         self.controls_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.controls_frame.grid(row=3, column=0, columnspan=2, pady=10)
@@ -83,7 +80,7 @@ class DashboardFrame(ctk.CTkFrame):
         self.refresh_btn = ctk.CTkButton(self.controls_frame, text="Refresh Data", command=self.refresh_data)
         self.refresh_btn.pack(side="left", padx=10)
 
-        self.ai_btn = ctk.CTkButton(self.controls_frame, text="✨ Compute AI Metrics", 
+        self.ai_btn = ctk.CTkButton(self.controls_frame, text="✨ Compute All AI Metrics", 
                                     fg_color=self.color_ai, hover_color="#7B1FA2",
                                     command=self.run_ai_analysis)
         self.ai_btn.pack(side="left", padx=10)
@@ -100,9 +97,10 @@ class DashboardFrame(ctk.CTkFrame):
         lbl_title = ctk.CTkLabel(frame, text=title.upper(), font=("Roboto", 11), text_color=t_color)
         lbl_title.pack(pady=(8,0))
         
-        # Use a smaller font if value is long (like a list of words)
+        # Use a smaller font if value is long
         font_size = 20
-        if len(value) > 15: font_size = 12
+        if len(value) > 20: font_size = 12
+        elif len(value) > 10: font_size = 14
         
         lbl_val = ctk.CTkLabel(frame, text=value, font=("Roboto", font_size, "bold"))
         lbl_val.pack(pady=(0,8))
@@ -110,46 +108,54 @@ class DashboardFrame(ctk.CTkFrame):
         return frame
 
     def run_ai_analysis(self):
-        """Spawns a thread to run LLM analysis on all lessons missing ai_stats."""
+        """Runs LLM analysis on ALL lessons missing ai_stats."""
         if not self.pipeline:
             self.status_lbl.configure(text="Error: Pipeline not connected")
             return
             
         self.ai_btn.configure(state="disabled", text="Computing...")
-        self.status_lbl.configure(text="Analyzing latest lesson with LLM...")
         
         def _thread_target():
             lessons_dir = os.path.join(self.profile_dir, "lessons")
             if not os.path.isdir(lessons_dir): return
             
-            # Find most recent lesson without stats, or all? 
-            # Let's just do the most recent one for speed/demo purposes
             all_lessons = sorted(os.listdir(lessons_dir), reverse=True)
+            to_process = []
             
-            count = 0
+            # Identify work first
             for lid in all_lessons:
                 path = os.path.join(lessons_dir, lid)
                 if not os.path.isdir(path): continue
-                
-                stats_path = os.path.join(path, "ai_stats.json")
-                if not os.path.exists(stats_path):
-                    # Found a lesson needing analysis
-                    success = self.pipeline.compute_ai_metrics(path, model="gemma:2b")
-                    if success: count += 1
-                    # Stop after 1 to avoid freezing app for minutes if user has 50 lessons
-                    break 
+                if not os.path.exists(os.path.join(path, "ai_stats.json")):
+                    to_process.append(path)
             
-            self.after(0, lambda: self._on_ai_finished(count))
+            total = len(to_process)
+            if total == 0:
+                self.after(0, lambda: self._on_ai_finished(0, 0))
+                return
+
+            # Process loop
+            processed = 0
+            for i, path in enumerate(to_process):
+                # Update status safely from thread
+                msg = f"Analyzing {i+1}/{total}..."
+                self.after(0, lambda m=msg: self.status_lbl.configure(text=m))
+                
+                # Run Pipeline (this blocks for ~30s per lesson)
+                self.pipeline.compute_ai_metrics(path, model="llama3.2")
+                processed += 1
+            
+            self.after(0, lambda: self._on_ai_finished(processed, total))
 
         threading.Thread(target=_thread_target, daemon=True).start()
 
-    def _on_ai_finished(self, count):
-        self.ai_btn.configure(state="normal", text="✨ Compute AI Metrics")
-        if count > 0:
-            self.status_lbl.configure(text=f"Analyzed {count} lesson(s)!")
-            self.refresh_data()
+    def _on_ai_finished(self, count, total):
+        self.ai_btn.configure(state="normal", text="✨ Compute All AI Metrics")
+        if total == 0:
+            self.status_lbl.configure(text="All lessons already analyzed!")
         else:
-            self.status_lbl.configure(text="No new lessons to analyze.")
+            self.status_lbl.configure(text=f"Finished analyzing {count} lessons.")
+            self.refresh_data()
 
     def refresh_data(self):
         if not self.profile_dir or not os.path.exists(self.profile_dir): return
@@ -161,13 +167,12 @@ class DashboardFrame(ctk.CTkFrame):
         total_recording_sec = 0.0
         student_speaking_sec = 0.0
         student_total_words = 0
-        
         total_latency_sum = 0.0
         total_latency_count = 0
         max_turn_duration = 0.0
         
         # AI Accumulators
-        grammar_scores = []
+        all_grammar_scores = [] # list of (date, score)
         golden_words_all = []
         
         student_words_by_month = defaultdict(int)
@@ -187,47 +192,45 @@ class DashboardFrame(ctk.CTkFrame):
                 with open(meta_path, 'r', encoding='utf-8') as f: meta = json.load(f)
                 with open(seg_path, 'r', encoding='utf-8') as f: segments = json.load(f)
                 
-                # --- AI Data Loading ---
-                if os.path.exists(ai_path):
-                    try:
-                        with open(ai_path, 'r', encoding='utf-8') as f: ai_data = json.load(f)
-                        if "grammar_score" in ai_data: grammar_scores.append(ai_data["grammar_score"])
-                        if "golden_words" in ai_data: golden_words_all.extend(ai_data["golden_words"])
-                    except: pass
-
-                # --- Identity Logic ---
-                student_ids = set()
-                if "student_speakers" in meta: student_ids.update(meta["student_speakers"])
-                # Fallback logic could go here if needed...
-                
-                # --- Metrics ---
-                lesson_dur = float(meta.get("duration_sec", 0.0))
-                total_recording_sec += lesson_dur
-                
-                # --- UPDATED DATE PARSING LOGIC ---
+                # --- Date Parsing (Reused Logic) ---
                 dt_obj = None
-                
-                # 1. Priority: 'recorded_at' (The actual lesson time)
                 if "recorded_at" in meta and meta["recorded_at"]:
                     try: dt_obj = datetime.fromisoformat(meta["recorded_at"])
                     except: pass
-                
-                # 2. Fallback: 'created_at' (When file was made)
-                if not dt_obj and "created_at" in meta and meta["created_at"]:
+                if not dt_obj and "created_at" in meta:
                     try: dt_obj = datetime.fromisoformat(meta["created_at"])
                     except: pass
-                
-                # 3. Last Resort: Folder Name (timestamp format)
                 if not dt_obj:
                     try: dt_obj = datetime.strptime(lesson_id.split("_")[0], "%Y%m%d")
                     except: pass
                 
                 month_key = dt_obj.strftime("%Y-%m") if dt_obj else "Unknown"
+
+                # --- AI Data Loading ---
+                if os.path.exists(ai_path):
+                    try:
+                        with open(ai_path, 'r', encoding='utf-8') as f: ai_data = json.load(f)
+                        if "grammar_score" in ai_data and dt_obj:
+                            score = ai_data["grammar_score"]
+                            # Basic validation to ensure it's a number
+                            if isinstance(score, (int, float)):
+                                all_grammar_scores.append((dt_obj, score))
+                        if "golden_words" in ai_data: 
+                            golden_words_all.extend(ai_data["golden_words"])
+                    except: pass
+
+                # --- Identity Logic ---
+                student_ids = set()
+                if "student_speakers" in meta: student_ids.update(meta["student_speakers"])
+                
+                # --- Standard Metrics ---
+                lesson_dur = float(meta.get("duration_sec", 0.0))
+                total_recording_sec += lesson_dur
                 has_data = True
 
                 lesson_student_words = 0
                 lesson_student_sec = 0.0
-                lesson_latency_sum = 0.0
+                lesson_lat_sum = 0.0
                 lesson_lat_cnt = 0
                 last_end = 0.0
                 last_was_student = False
@@ -251,7 +254,7 @@ class DashboardFrame(ctk.CTkFrame):
                         if i > 0 and not last_was_student:
                             lat = start - last_end
                             if 0.0 < lat < 10.0:
-                                lesson_latency_sum += lat
+                                lesson_lat_sum += lat
                                 lesson_lat_cnt += 1
                         last_was_student = True
                     else:
@@ -259,19 +262,19 @@ class DashboardFrame(ctk.CTkFrame):
                     last_end = end
 
                 student_words_by_month[month_key] += lesson_student_words
-                total_latency_sum += lesson_latency_sum
+                total_latency_sum += lesson_lat_sum
                 total_latency_count += lesson_lat_cnt
                 student_speaking_sec += lesson_student_sec
                 
                 if lesson_student_sec > 10 and dt_obj:
                     wpm = (lesson_student_words / (lesson_student_sec/60))
-                    lat = (lesson_latency_sum / lesson_lat_cnt) if lesson_lat_cnt else 0
+                    lat = (lesson_lat_sum / lesson_lat_cnt) if lesson_lat_cnt else 0
                     fluency_trend.append((dt_obj, wpm, lat))
 
             except Exception as e:
                 print(f"Skipping {lesson_id}: {e}")
 
-        # --- UPDATE UI ---
+        # --- UPDATE UI CARDS ---
         if not has_data:
             self.card_total_time.value_label.configure(text="0.0")
             return
@@ -289,15 +292,16 @@ class DashboardFrame(ctk.CTkFrame):
         self.card_max_turn.value_label.configure(text=f"{max_turn_duration:.1f}s")
 
         # --- UPDATE AI CARDS ---
-        if grammar_scores:
-            avg_gram = sum(grammar_scores) / len(grammar_scores)
+        if all_grammar_scores:
+            # Calculate Average
+            scores_only = [x[1] for x in all_grammar_scores]
+            avg_gram = sum(scores_only) / len(scores_only)
             self.card_grammar.value_label.configure(text=f"{avg_gram:.0f}/100")
         else:
             self.card_grammar.value_label.configure(text="--")
 
         if golden_words_all:
-            # Show last 3 unique words (assuming simple strings)
-            # Reverse list to show newest first, then take 3
+            # Show last 3 unique words
             unique_gold = []
             seen = set()
             for w in reversed(golden_words_all):
@@ -306,17 +310,21 @@ class DashboardFrame(ctk.CTkFrame):
                     seen.add(w)
                 if len(unique_gold) >= 3: break
             
+            # Use smaller font if text is long
             text_gold = "\n".join(unique_gold)
-            self.card_golden.value_label.configure(text=text_gold, font=("Roboto", 12))
+            self.card_golden.value_label.configure(text=text_gold)
         else:
             self.card_golden.value_label.configure(text="No Analysis")
 
-        # Plots
-        self._plot_activity(student_words_by_month)
-        self._plot_fluency(fluency_trend)
+        # --- PLOTS (In Tabs) ---
+        self._plot_activity(student_words_by_month, self.tab_activity)
+        self._plot_fluency(fluency_trend, self.tab_fluency)
+        self._plot_grammar(all_grammar_scores, self.tab_grammar)
 
-    def _plot_activity(self, data):
-        for widget in self.chart_frame_left.winfo_children(): widget.destroy()
+    # --- PLOT FUNCTIONS ---
+
+    def _plot_activity(self, data, parent_tab):
+        for widget in parent_tab.winfo_children(): widget.destroy()
         if not data: return
 
         sorted_keys = sorted(data.keys())
@@ -326,26 +334,26 @@ class DashboardFrame(ctk.CTkFrame):
             try: labels.append(datetime.strptime(k, "%Y-%m").strftime("%b"))
             except: labels.append(str(k))
 
-        fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+        fig, ax = plt.subplots(figsize=(5, 3.5), dpi=100)
         fig.patch.set_facecolor(self.bg_figure)
         ax.set_facecolor(self.bg_figure)
         
         ax.bar(labels, values, color=self.color_student)
-        ax.set_title("Volume (Words)", color=self.text_color, fontsize=10)
-        ax.tick_params(colors=self.text_color, labelsize=8)
+        ax.set_title("Total Words Spoken (Monthly)", color=self.text_color, fontsize=10)
+        ax.tick_params(colors=self.text_color, labelsize=9)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.spines['bottom'].set_color(self.text_color)
         ax.spines['left'].set_color(self.text_color)
 
-        canvas = FigureCanvasTkAgg(fig, master=self.chart_frame_left)
+        canvas = FigureCanvasTkAgg(fig, master=parent_tab)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
-    def _plot_fluency(self, trend_data):
-        for widget in self.chart_frame_right.winfo_children(): widget.destroy()
+    def _plot_fluency(self, trend_data, parent_tab):
+        for widget in parent_tab.winfo_children(): widget.destroy()
         if len(trend_data) < 2:
-            ctk.CTkLabel(self.chart_frame_right, text="Need more data").pack(expand=True)
+            ctk.CTkLabel(parent_tab, text="Need more lessons to show trend").pack(expand=True)
             return
 
         trend_data.sort(key=lambda x: x[0])
@@ -353,16 +361,15 @@ class DashboardFrame(ctk.CTkFrame):
         wpms = [x[1] for x in trend_data]
         lats = [x[2] for x in trend_data]
 
-        fig, ax1 = plt.subplots(figsize=(4, 3), dpi=100)
+        fig, ax1 = plt.subplots(figsize=(5, 3.5), dpi=100)
         fig.patch.set_facecolor(self.bg_figure)
         ax1.set_facecolor(self.bg_figure)
 
         color = self.color_student
-        ax1.set_title("Fluency Trend", color=self.text_color, fontsize=10)
         ax1.plot(dates, wpms, color=color, marker='o', label="WPM")
-        ax1.set_ylabel("WPM", color=color, fontsize=8)
-        ax1.tick_params(axis='y', labelcolor=color, labelsize=8)
-        ax1.tick_params(axis='x', colors=self.text_color, labelsize=8)
+        ax1.set_ylabel("WPM", color=color, fontsize=9)
+        ax1.tick_params(axis='y', labelcolor=color, labelsize=9)
+        ax1.tick_params(axis='x', colors=self.text_color, labelsize=9)
         ax1.spines['top'].set_visible(False)
         ax1.spines['bottom'].set_color(self.text_color)
         ax1.spines['left'].set_color(self.text_color)
@@ -370,14 +377,44 @@ class DashboardFrame(ctk.CTkFrame):
         ax2 = ax1.twinx() 
         color2 = self.color_bad 
         ax2.plot(dates, lats, color=color2, marker='x', linestyle='--', label="Lat")
-        ax2.set_ylabel("Latency (s)", color=color2, fontsize=8)
-        ax2.tick_params(axis='y', labelcolor=color2, labelsize=8)
+        ax2.set_ylabel("Latency (s)", color=color2, fontsize=9)
+        ax2.tick_params(axis='y', labelcolor=color2, labelsize=9)
         ax2.spines['top'].set_visible(False)
         ax2.spines['right'].set_color(self.text_color)
+        ax2.spines['bottom'].set_visible(False)
 
-        import matplotlib.dates as mdates
         ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
         
-        canvas = FigureCanvasTkAgg(fig, master=self.chart_frame_right)
+        canvas = FigureCanvasTkAgg(fig, master=parent_tab)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _plot_grammar(self, scores_data, parent_tab):
+        for widget in parent_tab.winfo_children(): widget.destroy()
+        if len(scores_data) < 2:
+            ctk.CTkLabel(parent_tab, text="Compute AI metrics for more lessons to see trend.").pack(expand=True)
+            return
+
+        scores_data.sort(key=lambda x: x[0])
+        dates = [x[0] for x in scores_data]
+        scores = [x[1] for x in scores_data]
+
+        fig, ax = plt.subplots(figsize=(5, 3.5), dpi=100)
+        fig.patch.set_facecolor(self.bg_figure)
+        ax.set_facecolor(self.bg_figure)
+        
+        ax.plot(dates, scores, color=self.color_ai, marker='D', linewidth=2)
+        ax.set_title("Grammar Accuracy Score (0-100)", color=self.text_color, fontsize=10)
+        ax.set_ylim(0, 105) # Keep scale consistent
+        
+        ax.tick_params(colors=self.text_color, labelsize=9)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_color(self.text_color)
+        ax.spines['left'].set_color(self.text_color)
+        
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+
+        canvas = FigureCanvasTkAgg(fig, master=parent_tab)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)

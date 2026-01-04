@@ -423,20 +423,18 @@ class DiarizationPipelineRunner:
         api_key: Optional[str] = None,
         provider: str = "ollama",
         speakers: Optional[List[str]] = None,
-        max_chars: int = 25000, # Default value assumption
-        external_text: Optional[str] = None, 
+        max_chars: int = 25000,
+        external_text: Optional[str] = None,
     ) -> str:
         if not user_prompt.strip():
             raise ValueError("Prompt is empty.")
 
-        # LOGIC CHANGE: Use provided text if available, otherwise fetch from current state
+        # Text Selection Logic
         if external_text:
             transcript = external_text
-            # Truncate if needed to avoid context overflow
             if len(transcript) > max_chars:
                 transcript = transcript[:max_chars] + "...(truncated)"
         else:
-            # Original behavior
             transcript = self.get_transcript_text(
                 include_speaker=True,
                 speaker_filters=speakers,
@@ -454,58 +452,48 @@ class DiarizationPipelineRunner:
 
         if provider == "openai":
             from .openai_provider import OpenAIProvider
-            # Ensure model has a fallback
             client = OpenAIProvider(api_key=api_key, model=model or "gpt-4o")
-
             self._set_status(f"Calling OpenAI ({client.model})...")
             self._set_progress(50)
-            text = client.analyze(combined_prompt)
-            self._set_status("Analysis done")
-            self._set_progress(100)
-
-            return text
+            return client.analyze(combined_prompt)
             
         elif provider == "ollama":
-            api_url = api_url or os.environ.get(
-                "LLM_ANALYSIS_URL", "http://localhost:11434/api/generate"
-            )
-            
-            model = model or os.environ.get("LLM_ANALYSIS_MODEL", "mistral")
-
-            headers = {}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            # FIX: Hardcode the default port 11434 unless explicitly passed
+            # This ignores any bad '11435' environment variables
+            target_url = api_url or "http://localhost:11434/api/generate"
+            target_model = model or "llama3.2"
 
             payload = {
-                "model": model,
+                "model": target_model,
                 "prompt": combined_prompt,
                 "stream": False,
             }
 
-            self._set_status(f"Calling analysis model ({model})...")
-            self._set_progress(50)
-
+            self._set_status(f"Calling Ollama ({target_model})...")
+            
             import requests
-            # Increase timeout for slower local models
-            resp = requests.post(api_url, json=payload, headers=headers, timeout=600)
-            resp.raise_for_status()
-            data = resp.json()
+            try:
+                resp = requests.post(target_url, json=payload, timeout=600)
+                
+                # Custom Error Handling for 404 (Model Not Found)
+                if resp.status_code == 404:
+                    print(f"ERROR: Ollama returned 404. It likely cannot find model '{target_model}' or the URL '{target_url}' is wrong.")
+                    return "Error: Model not found. Please run 'ollama pull llama3.2' in terminal."
+                    
+                resp.raise_for_status()
+                data = resp.json()
 
-            text = None
-            if isinstance(data, dict) and "response" in data:
-                text = data["response"]
-            if text is None and "choices" in data:
-                try:
-                    text = data["choices"][0]["message"]["content"]
-                except Exception:
-                    pass
+                text = data.get("response")
+                if not text:
+                     raise RuntimeError(f"Empty response from Ollama: {data}")
+                
+                self._set_status("Analysis done")
+                return text
 
-            if not text:
-                raise RuntimeError(f"Could not parse LLM response: {data}")
-
-            self._set_status("Analysis done")
-            self._set_progress(100)
-            return text
+            except requests.exceptions.ConnectionError:
+                return "Error: Could not connect to Ollama. Is the app running? (Run 'ollama serve' in terminal)"
+            except Exception as e:
+                return f"Error calling Ollama: {e}"
             
         return "Error: Unknown provider"
 
