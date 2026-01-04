@@ -125,6 +125,10 @@ class DiarizationPipelineRunner:
         Robustly computes metrics. 
         Attempts strict JSON parsing first, falls back to text scraping if model refuses JSON.
         """
+        # --- NEW: Ensure Model Exists before we start ---
+        if mode == "ollama":
+            self._ensure_model_exists(model)
+        # ------------------------------------------------
         import json
         import re
         
@@ -223,6 +227,63 @@ class DiarizationPipelineRunner:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
         print(f"AI Stats saved to {path}")
+
+    def _ensure_model_exists(self, model_name: str):
+        """
+        Checks if the Ollama model exists. If not, downloads it automatically.
+        """
+        import subprocess
+        
+        # 1. Setup Paths & Env (Same as your GUI logic)
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            # Simple resource finding for dev mode
+            base_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "resources")
+            if not os.path.exists(os.path.join(base_path, "ollama")):
+                 # Fallback if resources isn't where we expect relative to pipeline.py
+                 base_path = os.getcwd() 
+
+        # Locate Binary
+        ollama_bin = os.path.join(base_path, "deps", "ollama")
+        if not os.path.exists(ollama_bin):
+            ollama_bin = os.path.join(base_path, "ollama")
+            
+        if not os.path.exists(ollama_bin):
+            print(f"WARNING: Could not find Ollama binary at {ollama_bin} to check for model.")
+            return
+
+        # Setup Env
+        env = os.environ.copy()
+        env["OLLAMA_MODELS"] = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+        env["OLLAMA_HOST"] = "127.0.0.1:11435"
+
+        # 2. Check if model exists
+        try:
+            print(f"Checking if model '{model_name}' exists...")
+            result = subprocess.run(
+                [ollama_bin, "list"], 
+                env=env, 
+                capture_output=True, 
+                text=True
+            )
+            
+            if model_name not in result.stdout:
+                print(f"Model '{model_name}' not found. Downloading automatically... (This may take time)")
+                self._set_status(f"Downloading AI model ({model_name})...")
+                
+                # Run Pull
+                subprocess.run(
+                    [ollama_bin, "pull", model_name], 
+                    env=env, 
+                    check=True
+                )
+                print(f"Model '{model_name}' downloaded successfully.")
+            else:
+                print(f"Model '{model_name}' is ready.")
+
+        except Exception as e:
+            print(f"Failed to auto-download model: {e}")
 
     def process_audio(
         self,
@@ -458,9 +519,7 @@ class DiarizationPipelineRunner:
             return client.analyze(combined_prompt)
             
         elif provider == "ollama":
-            # FIX: Hardcode the default port 11434 unless explicitly passed
-            # This ignores any bad '11435' environment variables
-            target_url = api_url or "http://localhost:11434/api/generate"
+            target_url = api_url or "http://127.0.0.1:11435/api/generate"
             target_model = model or "llama3.2"
 
             payload = {
