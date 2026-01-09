@@ -96,4 +96,8 @@ app = BUNDLE(
     name='DiarizeApp.app',
     icon=None,
     bundle_identifier='com.rama.diarizegui',
+    info_plist={
+        'NSMicrophoneUsageDescription': 'This app needs access to the microphone to record audio for transcription.',
+        'NSHighResolutionCapable': 'True'
+    },
 )

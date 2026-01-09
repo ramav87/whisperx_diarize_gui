@@ -1,7 +1,9 @@
 import os
+import sys
 import json
 import re
 from typing import Callable, Optional, List
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -119,12 +121,195 @@ class DiarizationPipelineRunner:
         self._set_status("Loaded segments from TXT")
         self._set_progress(100)
 
+    def _save_json(self, data, path):
+        """
+        Helper to save data to a JSON file.
+        """
+        import json
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"Saved AI metrics to: {path}")
+        except Exception as e:
+            print(f"Error saving JSON to {path}: {e}")
+            
+    def compute_ai_metrics(self, lesson_dir, model="llama3.2", mode="ollama"):
+        """
+        Robustly computes metrics. 
+        Attempts strict JSON parsing first, falls back to text scraping if model refuses JSON.
+        """
+        # --- NEW: Ensure Model Exists before we start ---
+        if mode == "ollama":
+            self._ensure_model_exists(model)
+        # ------------------------------------------------
+        import json
+        import re
+        
+        # 1. Build Transcript
+        seg_path = os.path.join(lesson_dir, "segments.json")
+        transcript_path = os.path.join(lesson_dir, "transcript.txt")
+        output_path = os.path.join(lesson_dir, "ai_stats.json")
+        
+        text_content = ""
+        if os.path.exists(seg_path):
+            try:
+                with open(seg_path, 'r', encoding='utf-8') as f:
+                    segs = json.load(f)
+                for s in segs:
+                    text_content += f"{s.get('speaker', 'Unknown')}: {s.get('text', '')}\n"
+            except: pass
+        
+        if not text_content and os.path.exists(transcript_path):
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                text_content = f.read()
+
+        if not text_content: return False
+        if len(text_content) > 8000: text_content = text_content[:8000]
+
+        # 2. Strict Prompt
+        prompt = (
+            "Analyze this language lesson. Identify the Student's mistakes.\n"
+            "Respond with a strict JSON object using these keys:\n"
+            "grammar_score (0-100), topics (list of 3 strings), golden_words (list of 3 complex words), corrections (int), feedback (string).\n\n"
+            "IMPORTANT FORMATTING:\n"
+            "- 'golden_words' must be in the format: \"SpanishWord (EnglishTranslation)\"\n"
+            "- Example: [\"desafortunadamente (unfortunately)\", \"hipótesis (hypothesis)\"]\n\n"
+            "Example JSON:\n"
+            "{\"grammar_score\": 75, \"topics\": [\"Food\", \"Travel\"], \"golden_words\": [\"exquisito (exquisite)\", \"viaje (journey)\"], \"corrections\": 4, \"feedback\": \"Watch your past tense.\"}\n\n"
+            "JSON ONLY. NO MARKDOWN."
+        )
+
+        try:
+            # 3. Call LLM
+            raw_response = self.analyze_with_llm(
+                user_prompt=prompt,
+                model=model,
+                provider=mode,
+                external_text=text_content 
+            )
+            
+            # --- CRITICAL FIX START ---
+            # Check if the LLM call actually failed before trying to parse
+            if raw_response.startswith("Error:"):
+                print(f"LLM Analysis Failed for {lesson_dir}: {raw_response}")
+                return False  # Return False so we don't save a garbage file
+            # --- CRITICAL FIX END ---
+            
+            # --- STRATEGY A: Try Parse JSON ---
+            try:
+                clean = raw_response.replace("```json", "").replace("```", "").strip()
+                start = clean.find('{')
+                end = clean.rfind('}') + 1
+                if start != -1 and end != 0:
+                    json_str = clean[start:end]
+                    data = json.loads(json_str)
+                    self._save_json(data, output_path)
+                    return True
+            except:
+                print("JSON parsing failed, attempting text scrape...")
+
+            # --- STRATEGY B: Scrape Text (Fallback) ---
+            # ... (Rest of your fallback logic remains the same) ...
+            
+            fallback_data = {
+                "grammar_score": 70,
+                "topics": ["General Conversation"],
+                "golden_words": [],
+                "corrections": 0,
+                "feedback": "Keep practicing!"
+            }
+            
+            # ... (Regex matching code) ...
+            
+            score_match = re.search(r"Score:?\**\s*(\d+)", raw_response, re.IGNORECASE)
+            if score_match: fallback_data["grammar_score"] = int(score_match.group(1))
+
+            words_section = re.search(r"Golden Words:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
+            if words_section:
+                words = re.findall(r"-\s*\*?([^\n]+)", words_section.group(1))
+                if words: 
+                    clean_words = [w.replace('*', '').strip() for w in words]
+                    fallback_data["golden_words"] = clean_words[:3]
+
+            corr_section = re.search(r"Corrections:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
+            if corr_section:
+                count = corr_section.group(1).count("\n-")
+                if count > 0: fallback_data["corrections"] = count
+
+            self._save_json(fallback_data, output_path)
+            return True
+
+        except Exception as e:
+            print(f"Error computing AI metrics: {e}")
+            return False
+
+    def _ensure_model_exists(self, model_name: str):
+        """
+        Checks if the Ollama model exists. If not, downloads it automatically.
+        """
+        import subprocess
+        
+        # 1. Setup Paths & Env (Same as your GUI logic)
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            # Simple resource finding for dev mode
+            base_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "resources")
+            if not os.path.exists(os.path.join(base_path, "ollama")):
+                 # Fallback if resources isn't where we expect relative to pipeline.py
+                 base_path = os.getcwd() 
+
+        # Locate Binary
+        ollama_bin = os.path.join(base_path, "deps", "ollama")
+        if not os.path.exists(ollama_bin):
+            ollama_bin = os.path.join(base_path, "ollama")
+            
+        if not os.path.exists(ollama_bin):
+            print(f"WARNING: Could not find Ollama binary at {ollama_bin} to check for model.")
+            return
+
+        # Setup Env
+        env = os.environ.copy()
+        env["OLLAMA_MODELS"] = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+        env["OLLAMA_HOST"] = "127.0.0.1:11435"
+
+        # 2. Check if model exists
+        try:
+            print(f"Checking if model '{model_name}' exists...")
+            result = subprocess.run(
+                [ollama_bin, "list"], 
+                env=env, 
+                capture_output=True, 
+                text=True
+            )
+            
+            if model_name not in result.stdout:
+                print(f"Model '{model_name}' not found. Downloading automatically... (This may take time)")
+                self._set_status(f"Downloading AI model ({model_name})...")
+                
+                # Run Pull
+                subprocess.run(
+                    [ollama_bin, "pull", model_name], 
+                    env=env, 
+                    check=True
+                )
+                print(f"Model '{model_name}' downloaded successfully.")
+            else:
+                print(f"Model '{model_name}' is ready.")
+
+        except Exception as e:
+            print(f"Failed to auto-download model: {e}")
+
     def process_audio(
         self,
         audio_path: str,
         output_dir: str,
         model_size: str = "small",
-        # REMOVED: hf_token argument is no longer needed
+        language: str = None,
+        num_speakers: Optional[int] = None,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+       
         ):
         """
         Run transcription + alignment + diarization on the given audio file.
@@ -154,7 +339,7 @@ class DiarizationPipelineRunner:
 
         self._set_status("Transcribing...")
         self._set_progress(50)
-        result = model.transcribe(audio)
+        result = model.transcribe(audio, language=language, task="transcribe")
 
         self._set_status("Loading alignment model...")
         self._set_progress(60)
@@ -184,7 +369,21 @@ class DiarizationPipelineRunner:
             raise RuntimeError(f"Failed to load offline Pyannote model: {e}")
 
         # Run inference
-        annotation = diar_pipeline(audio_path)
+        # new:
+        kwargs = {}
+        if num_speakers:
+            kwargs["num_speakers"] = int(num_speakers)
+        if min_speakers:
+            kwargs["min_speakers"] = int(min_speakers)
+        if max_speakers:
+            kwargs["max_speakers"] = int(max_speakers)
+
+        try:
+            annotation = diar_pipeline(audio_path, **kwargs)
+        except TypeError:
+            # If the loaded pipeline doesn't accept these kwargs for some reason,
+            # fall back gracefully.
+            annotation = diar_pipeline(audio_path)
         # -----------------------------------
 
         segments = []
@@ -295,75 +494,293 @@ class DiarizationPipelineRunner:
     def analyze_with_llm(
         self,
         user_prompt: str,
-        model: Optional[str] = "mistral",
+        model: Optional[str] = None,
         api_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        provider: str = "ollama",
         speakers: Optional[List[str]] = None,
-        max_chars: int = DEFAULT_MAX_CHARS,
+        max_chars: int = 25000,
+        external_text: Optional[str] = None,
     ) -> str:
         if not user_prompt.strip():
             raise ValueError("Prompt is empty.")
 
-        transcript = self.get_transcript_text(
-            include_speaker=True,
-            speaker_filters=speakers,
-            max_chars=max_chars,
-        )
+        # Text Selection Logic
+        if external_text:
+            transcript = external_text
+            if len(transcript) > max_chars:
+                transcript = transcript[:max_chars] + "...(truncated)"
+        else:
+            transcript = self.get_transcript_text(
+                include_speaker=True,
+                speaker_filters=speakers,
+                max_chars=max_chars,
+            )
 
         speakers_str = ", ".join(speakers) if speakers else "TODOS"
         combined_prompt = (
             user_prompt.strip()
-            + "\n\n--- TRANSCRIPCIÓN FILTRADA (speakers: "
+            + "\n\n--- FILTERED TRANSCRIPT (speakers: "
             + speakers_str
             + ") ---\n"
             + transcript
         )
 
-        api_url = api_url or os.environ.get(
-            "LLM_ANALYSIS_URL", "http://localhost:11434/api/generate"
-        )
-        
-        # Override env var if model is passed
-        model = model or os.environ.get("LLM_ANALYSIS_MODEL", "mistral")
+        if provider == "openai":
+            from .openai_provider import OpenAIProvider
+            client = OpenAIProvider(api_key=api_key, model=model or "gpt-4o")
+            self._set_status(f"Calling OpenAI ({client.model})...")
+            self._set_progress(50)
+            return client.analyze(combined_prompt)
+            
+        elif provider == "ollama":
+            target_url = api_url or "http://127.0.0.1:11435/api/generate"
+            target_model = model or "llama3.2"
 
-        headers = {}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+            payload = {
+                "model": target_model,
+                "prompt": combined_prompt,
+                "stream": False,
+            }
 
-        payload = {
-            "model": model,
-            "prompt": combined_prompt,
-            "stream": False,
-        }
-
-        self._set_status(f"Calling analysis model ({model})...")
-        self._set_progress(50)
-
-        import requests
-        resp = requests.post(api_url, json=payload, headers=headers, timeout=600)
-        resp.raise_for_status()
-        data = resp.json()
-
-        text = None
-        if isinstance(data, dict) and "response" in data:
-            text = data["response"]
-        if text is None and "choices" in data:
+            self._set_status(f"Calling Ollama ({target_model})...")
+            
+            import requests
             try:
-                text = data["choices"][0]["message"]["content"]
-            except Exception:
-                try:
-                    text = data["choices"][0]["text"]
-                except Exception:
-                    pass
+                resp = requests.post(target_url, json=payload, timeout=600)
+                
+                # Custom Error Handling for 404 (Model Not Found)
+                if resp.status_code == 404:
+                    print(f"ERROR: Ollama returned 404. It likely cannot find model '{target_model}' or the URL '{target_url}' is wrong.")
+                    return "Error: Model not found. Please run 'ollama pull llama3.2' in terminal."
+                    
+                resp.raise_for_status()
+                data = resp.json()
 
-        if not text:
-            raise RuntimeError(f"Could not parse LLM response: {data}")
+                text = data.get("response")
+                if not text:
+                     raise RuntimeError(f"Empty response from Ollama: {data}")
+                
+                self._set_status("Analysis done")
+                return text
 
-        self._set_status("Analysis done")
-        self._set_progress(100)
-        return text
+            except requests.exceptions.ConnectionError:
+                return "Error: Could not connect to Ollama. Is the app running? (Run 'ollama serve' in terminal)"
+            except Exception as e:
+                return f"Error calling Ollama: {e}"
+            
+        return "Error: Unknown provider"
+
+    def load_lesson_artifacts(self, lesson_dir: str):
+        """
+        Restore last_result/last_diar_df/last_audio_path from a lesson folder.
+        Enables export_srt/export_txt and export_speaker_audios (if audio path exists).
+        Returns meta dict (may be empty).
+        """
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        seg_path = os.path.join(lesson_dir, "segments.json")
+        diar_path = os.path.join(lesson_dir, "diarization.json")
+
+        if not os.path.isfile(seg_path):
+            raise FileNotFoundError(f"Missing segments.json in {lesson_dir}")
+
+        with open(seg_path, "r", encoding="utf-8") as f:
+            segments = json.load(f)
+
+        # segments.json is a list of segments; pipeline expects {"segments": [...]}
+        self.last_result = {"segments": segments}
+        self.last_output_dir = lesson_dir
+
+        # Load meta (optional)
+        meta = {}
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f) or {}
+
+        # Option (2): use original audio path from meta, but only if it still exists
+        # Support multiple historical key names to be robust:
+        audio_path = (
+            meta.get("source_audio_path")
+            or meta.get("source_audio")
+            or meta.get("last_audio_path")
+            or meta.get("audio_path")
+        )
+        if audio_path and os.path.isfile(audio_path):
+            self.last_audio_path = audio_path
+        else:
+            self.last_audio_path = None
+
+        # diarization df optional (needed for speaker WAV export)
+        if os.path.isfile(diar_path):
+            with open(diar_path, "r", encoding="utf-8") as f:
+                diar = json.load(f)
+            self.last_diar_df = pd.DataFrame(diar)
+        else:
+            self.last_diar_df = None
+
+        return meta
 
     # ---------- Export helpers (unchanged) ----------
+
+    def _infer_recorded_at_iso(self, audio_path: str | None) -> str | None:
+        if not audio_path:
+            return None
+        try:
+            # Use mtime (portable). It’s seconds since epoch.
+            ts = os.path.getmtime(audio_path)
+            return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+        except Exception:
+            return None
+
+    def _lesson_duration_sec(self) -> float:
+        """Best-effort duration from segments/diarization."""
+        ends = []
+        if self.last_result and "segments" in self.last_result:
+            ends.extend([float(s.get("end") or 0.0) for s in self.last_result["segments"]])
+        if self.last_diar_df is not None and not self.last_diar_df.empty:
+            ends.extend([float(x) for x in self.last_diar_df["end"].tolist()])
+        return float(max(ends)) if ends else 0.0
+
+
+    def save_lesson_artifacts(
+        self,
+        lesson_dir: str,
+        *,
+        profile_name: Optional[str] = None,
+        whisper_model_size: Optional[str] = None,
+        language: Optional[str] = None,
+        contextual: Optional[bool] = None,
+        llm_provider: Optional[str] = None,
+        llm_model: Optional[str] = None,
+        extra_meta: Optional[dict] = None,
+        ) -> dict:
+        """
+        Persist everything needed to re-open a lesson and (optionally) re-export speaker WAVs
+        without re-running transcription/diarization.
+
+        Writes:
+        - transcript.txt
+        - segments.json  (start/end/speaker/text)
+        - diarization.json (start/end/speaker) if available
+        - meta.json
+
+        Returns meta dict.
+        """
+        if not self.last_result or "segments" not in self.last_result:
+            raise ValueError("No transcription segments available to save.")
+
+        os.makedirs(lesson_dir, exist_ok=True)
+
+        # 1) transcript.txt (human-readable)
+        transcript_path = os.path.join(lesson_dir, "transcript.txt")
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(self.get_transcript_text(include_speaker=True))
+
+        # 2) segments.json (canonical for future features)
+        segments_clean = []
+        for seg in self.last_result["segments"]:
+            segments_clean.append(
+                {
+                    "start": float(seg.get("start") or 0.0),
+                    "end": float(seg.get("end") or 0.0),
+                    "speaker": seg.get("speaker") or "UNKNOWN",
+                    "text": (seg.get("text") or "").strip(),
+                }
+            )
+
+        segments_path = os.path.join(lesson_dir, "segments.json")
+        with open(segments_path, "w", encoding="utf-8") as f:
+            json.dump(segments_clean, f, ensure_ascii=False, indent=2)
+
+        # 3) diarization-only segments (optional but important for speaker WAV export)
+        diar_path = None
+        if self.last_diar_df is not None and not self.last_diar_df.empty:
+            diar_clean = []
+            for _, row in self.last_diar_df.iterrows():
+                diar_clean.append(
+                    {
+                        "start": float(row["start"]),
+                        "end": float(row["end"]),
+                        "speaker": str(row["speaker"]),
+                    }
+                )
+            diar_path = os.path.join(lesson_dir, "diarization.json")
+            with open(diar_path, "w", encoding="utf-8") as f:
+                json.dump(diar_clean, f, ensure_ascii=False, indent=2)
+        
+        import shutil
+
+        if self.last_audio_path and os.path.isfile(self.last_audio_path):
+            dst = os.path.join(lesson_dir, "audio.wav")
+            if not os.path.isfile(dst):
+                shutil.copy2(self.last_audio_path, dst)
+
+        # 4) meta.json
+        meta = {
+            "processed_at": datetime.now().isoformat(timespec="seconds"),
+            "recorded_at": self._infer_recorded_at_iso(self.last_audio_path),
+            "profile": profile_name,
+            "source_audio_path": self.last_audio_path,   # critical for future speaker WAV export
+            "saved_audio_filename": "audio.wav",  # if you copy it
+            "output_dir": self.last_output_dir,
+            "duration_sec": self._lesson_duration_sec(),
+            "num_segments": len(segments_clean),
+            "num_speakers": len({s["speaker"] for s in segments_clean}),
+            "whisper_model_size": whisper_model_size,
+            "language": language,
+            "contextual": contextual,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "files": {
+                "transcript": "transcript.txt",
+                "segments": "segments.json",
+                "diarization": "diarization.json" if diar_path else None,
+            },
+        }
+        if extra_meta:
+            meta.update(extra_meta)
+
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        return meta
+
+    def load_lesson_artifacts(self, lesson_dir: str):
+        """
+        Restore last_result/last_diar_df/last_audio_path from a lesson folder.
+        Enables export_srt/export_txt and export_speaker_audios (if audio path exists).
+        """
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        seg_path = os.path.join(lesson_dir, "segments.json")
+        diar_path = os.path.join(lesson_dir, "diarization.json")
+
+        if not os.path.isfile(seg_path):
+            raise FileNotFoundError(f"Missing segments.json in {lesson_dir}")
+
+        with open(seg_path, "r", encoding="utf-8") as f:
+            segments = json.load(f)
+
+        self.last_result = {"segments": segments}
+        self.last_output_dir = lesson_dir
+
+        # optional meta
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            self.last_audio_path = meta.get("source_audio_path")
+        else:
+            self.last_audio_path = None
+
+        # diarization df optional
+        if os.path.isfile(diar_path):
+            with open(diar_path, "r", encoding="utf-8") as f:
+                diar = json.load(f)
+            self.last_diar_df = pd.DataFrame(diar)
+        else:
+            self.last_diar_df = None
+
+
     def export_txt(self, txt_path: str):
         if not self.last_result or "segments" not in self.last_result:
             raise ValueError("No transcription result available for TXT export.")
