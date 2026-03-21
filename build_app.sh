@@ -25,14 +25,14 @@ mkdir -p "$BASE_DIR/models"
 # This creates .../MacOS/models/pyannote/config.yaml
 cp -r resources/pyannote "$BASE_DIR/models/"
 
-# --- C. COPY FFMPEG (NEW) ---
+# --- C. COPY FFMPEG ---
 echo "Injecting FFmpeg..."
-# Create 'deps/ffmpeg' folder
 mkdir -p "$BASE_DIR/deps/ffmpeg"
-# Copy the binary
 cp resources/ffmpeg/ffmpeg "$BASE_DIR/deps/ffmpeg/"
-# Make it executable
 chmod +x "$BASE_DIR/deps/ffmpeg/ffmpeg"
+
+# NEW: Remove quarantine from the copied binary inside the app
+xattr -cr "$BASE_DIR/deps/ffmpeg/ffmpeg"
 
 # 4. Verify-A
 if [ -f "$BASE_DIR/deps/ffmpeg/ffmpeg" ]; then

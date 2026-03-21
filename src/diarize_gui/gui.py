@@ -3,6 +3,7 @@ import sys
 import threading
 import subprocess
 import json
+import re
 from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -216,9 +217,15 @@ class DiarizationApp:
 
         self.tab_studio = self.tab_view.add("Studio")
         self.tab_studio.configure(fg_color=AppTheme.BG_MAIN)
+
+        self.dashboard_scroll = ctk.CTkScrollableFrame(self.tab_dash, fg_color=AppTheme.BG_MAIN)
+        self.dashboard_scroll.pack(fill="both", expand=True, padx=0, pady=0)
         
+        self.studio_scroll = ctk.CTkScrollableFrame(self.tab_studio, fg_color=AppTheme.BG_MAIN)
+        self.studio_scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
         # Set "Studio" as the parent for all existing UI elements
-        self._build_ui(parent=self.tab_studio)
+        self._build_ui(parent=self.studio_scroll)
         
         # Initialize Dashboard (empty until profile loads)
         self.dashboard = None
@@ -256,64 +263,128 @@ class DiarizationApp:
         self.icon_folder = load_icon("folder.png")
 
     def _build_ui(self, parent):
+        def add_section_header(container, title, subtitle=None):
+            header = ctk.CTkFrame(container, fg_color="transparent")
+            header.pack(fill="x", padx=15, pady=(10, 6))
+
+            ctk.CTkLabel(
+                header,
+                text=title,
+                font=("Roboto", 14, "bold"),
+                text_color=AppTheme.TEXT_PRIMARY,
+            ).pack(anchor="w")
+
+            if subtitle:
+                ctk.CTkLabel(
+                    header,
+                    text=subtitle,
+                    font=("Roboto", 11),
+                    text_color=AppTheme.TEXT_MUTED,
+                    justify="left",
+                ).pack(anchor="w", pady=(2, 0))
+
+            return header
+
         # 1. PROFILE HEADER
         self.profile_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color=AppTheme.BG_CARD)
         self.profile_frame.pack(padx=15, pady=(15, 5), fill="x")
 
-        self.profile_label = ctk.CTkLabel(
-            self.profile_frame, 
-            text="Profile: (none)", 
-            font=("Roboto", 16, "bold"),
-            text_color=AppTheme.TEXT_PRIMARY,
-            image=self.icon_user,
-            compound="left",
-            padx=10
-        )
-        self.profile_label.pack(side="left", padx=10, pady=10)
+        profile_top = ctk.CTkFrame(self.profile_frame, fg_color="transparent")
+        profile_top.pack(fill="x", padx=10, pady=(10, 4))
+        profile_top.grid_columnconfigure(0, weight=1)
 
-        self.profile_btn = ctk.CTkButton(
-            self.profile_frame, 
-            text="Change", 
-            width=80, 
-            fg_color=AppTheme.BTN_PRIMARY,
-            hover_color=AppTheme.BTN_PRIMARY_HOVER,
-            text_color=AppTheme.BTN_TEXT_ON_BLUE,
-            command=self.set_profile
+        profile_left = ctk.CTkFrame(profile_top, fg_color="transparent")
+        profile_left.grid(row=0, column=0, sticky="w")
+
+        self.profile_title = ctk.CTkLabel(
+            profile_left,
+            text="Studio Workspace",
+            font=("Roboto", 22, "bold"),
+            text_color=AppTheme.BTN_PRIMARY,
+            anchor="w",
         )
-        self.profile_btn.pack(side="right", padx=(5, 10))
-        
+        self.profile_title.pack(anchor="w")
+
+        self.profile_subtitle = ctk.CTkLabel(
+            profile_left,
+            text="Capture, diarization, and AI feedback in one place.",
+            font=("Roboto", 12),
+            text_color=AppTheme.TEXT_MUTED,
+            anchor="w",
+        )
+        self.profile_subtitle.pack(anchor="w", pady=(2, 0))
+
+        self.profile_label = ctk.CTkLabel(
+            profile_left,
+            text="Profile: (none)",
+            font=("Roboto", 11),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
+        )
+        self.profile_label.pack(anchor="w", pady=(1, 0))
+
+        self.profile_pill = ctk.CTkLabel(
+            profile_top,
+            text="LIVE STUDIO",
+            font=("Roboto", 10, "bold"),
+            text_color=AppTheme.BTN_TEXT_ON_BLUE,
+            fg_color=AppTheme.BTN_PRIMARY,
+            corner_radius=999,
+            padx=10,
+            pady=4,
+        )
+        self.profile_pill.grid(row=0, column=1, sticky="e")
+
+        profile_actions = ctk.CTkFrame(self.profile_frame, fg_color="transparent")
+        profile_actions.pack(fill="x", padx=10, pady=(0, 10))
+
+        actions_right = ctk.CTkFrame(profile_actions, fg_color="transparent")
+        actions_right.pack(side="right")
+
         self.history_btn = ctk.CTkButton(
-            self.profile_frame, 
-            text="History", 
-            width=80, 
-            fg_color="transparent", 
+            actions_right,
+            text="History",
+            width=76,
+            height=34,
+            fg_color="transparent",
             border_width=2,
             border_color=AppTheme.BORDER_DIVIDER,
             text_color=AppTheme.TEXT_PRIMARY,
             command=self.view_history
         )
-        self.history_btn.pack(side="right", padx=0)
+        self.history_btn.pack(side="left", padx=(0, 6))
+
+        self.profile_btn = ctk.CTkButton(
+            actions_right,
+            text="Change",
+            width=76,
+            height=34,
+            fg_color=AppTheme.BTN_PRIMARY,
+            hover_color=AppTheme.BTN_PRIMARY_HOVER,
+            text_color=AppTheme.BTN_TEXT_ON_BLUE,
+            command=self.set_profile
+        )
+        self.profile_btn.pack(side="left")
 
         # 2. INPUT CARD
         self.input_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
         self.input_card.pack(padx=15, pady=5, fill="x")
-        
-        ctk.CTkLabel(
-            self.input_card, 
-            text="Input Source", 
-            font=("Roboto", 14, "bold"), 
-            text_color=AppTheme.TEXT_PRIMARY
-        ).pack(anchor="w", padx=15, pady=(10,5))
+
+        add_section_header(
+            self.input_card,
+            "Input & Capture",
+            "Select audio, load an existing transcript, or record directly into a lesson."
+        )
 
         # A. File Select
         self.file_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
-        self.file_row.pack(fill="x", padx=10, pady=5)
+        self.file_row.pack(fill="x", padx=12, pady=(0, 6))
         
         self.audio_btn = ctk.CTkButton(
             self.file_row, 
             text="Select Audio", 
             image=self.icon_folder, 
-            width=120,
+            width=132,
             fg_color=AppTheme.BTN_PRIMARY,
             hover_color=AppTheme.BTN_PRIMARY_HOVER,
             text_color=AppTheme.BTN_TEXT_ON_BLUE,
@@ -326,11 +397,14 @@ class DiarizationApp:
             text="(No file selected)", 
             text_color=AppTheme.TEXT_MUTED
         )
-        self.audio_label.pack(side="left", padx=5)
+        self.audio_label.pack(side="left", padx=(8, 5), fill="x", expand=True, anchor="w")
 
-        # Load TXT Button (at bottom)
+        self.file_actions_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
+        self.file_actions_row.pack(fill="x", padx=12, pady=(0, 8))
+
+        # Load TXT Button
         self.load_txt_btn = ctk.CTkButton(
-            self.file_row, 
+            self.file_actions_row, 
             text="Load Existing TXT", 
             fg_color="transparent", 
             border_width=1, 
@@ -339,198 +413,256 @@ class DiarizationApp:
             hover_color=AppTheme.BG_ELEVATED,
             command=self.load_diarized_txt
         )
-        self.load_txt_btn.pack(padx=5)
+        self.load_txt_btn.pack(side="left", padx=(0, 6), expand=True, fill="x")
+
+        # Batch import
+        self.batch_btn = ctk.CTkButton(
+            self.file_actions_row,
+            text="Batch Import",
+            fg_color="transparent",
+            border_width=1,
+            border_color=AppTheme.BORDER_DIVIDER,
+            text_color=AppTheme.TEXT_SECONDARY,
+            hover_color=AppTheme.BTN_PRIMARY,
+            command=self.run_batch_import
+        )
+        self.batch_btn.pack(side="left", padx=(6, 0), expand=True, fill="x")
 
         ctk.CTkLabel(
             self.input_card, 
-            text="- OR -", 
+            text="Or record live", 
             text_color=AppTheme.TEXT_MUTED, 
-            font=("Arial", 10)
-        ).pack()
+            font=("Roboto", 10, "italic")
+        ).pack(anchor="w", padx=15, pady=(0, 4))
 
         # B. Recording
-        self.rec_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
-        self.rec_row.pack(fill="x", padx=10, pady=5)
+        self.rec_device_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
+        self.rec_device_row.pack(fill="x", padx=12, pady=(0, 6))
+
+        device_label = ctk.CTkLabel(
+            self.rec_device_row,
+            text="Input device",
+            text_color=AppTheme.TEXT_PRIMARY,
+        )
+        device_label.pack(anchor="w", pady=(0, 4))
 
         # Device list
         self.input_devices = self.recorder.list_input_devices()
         dev_names = ["(default)"] + [f"{d['index']}: {d['name']}" for d in self.input_devices]
-        
+
         self.device_var = ctk.StringVar(value="(default)")
         self.device_menu = ctk.CTkOptionMenu(
-            self.rec_row, 
-            variable=self.device_var, 
-            values=dev_names, 
-            width=220, 
-            height=40,
+            self.rec_device_row,
+            variable=self.device_var,
+            values=dev_names,
+            height=38,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
             button_color=AppTheme.BORDER_DIVIDER
         )
-        self.device_menu.pack(side="left", padx=5)
+        self.device_menu.pack(fill="x")
+
+        self.rec_control_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
+        self.rec_control_row.pack(fill="x", padx=12, pady=(0, 10))
 
         self.start_rec_btn = ctk.CTkButton(
-            self.rec_row, 
-            text="REC", 
-            width=120, 
-            height=40,
-            font=("Roboto", 14, "bold"), 
+            self.rec_control_row,
+            text="REC",
+            width=104,
+            height=38,
+            font=("Roboto", 13, "bold"),
             fg_color=AppTheme.BTN_RECORD,
             hover_color=AppTheme.BTN_RECORD_HOVER,
             text_color="#FFFFFF",
-            image=self.icon_mic, 
+            image=self.icon_mic,
             command=self.start_recording
         )
-        self.start_rec_btn.pack(side="left", padx=5)
-        
+        self.start_rec_btn.pack(side="left", padx=(0, 8))
+
         self.stop_rec_btn = ctk.CTkButton(
-            self.rec_row, 
-            text="STOP", 
-            width=120,
-            height=40,
-            font=("Roboto", 14, "bold"), 
-            state="disabled", 
+            self.rec_control_row,
+            text="STOP",
+            width=104,
+            height=38,
+            font=("Roboto", 13, "bold"),
+            state="disabled",
             fg_color=AppTheme.BTN_STOP,
             text_color_disabled=AppTheme.TEXT_MUTED,
             command=self.stop_recording
         )
-        self.stop_rec_btn.pack(side="left", padx=5)
+        self.stop_rec_btn.pack(side="left", padx=(0, 10))
 
         # Mic level meter
-        self.mic_level_label = ctk.CTkLabel(self.rec_row, text="Mic:", text_color=AppTheme.TEXT_MUTED)
-        self.mic_level_bar = ctk.CTkProgressBar(self.rec_row, width=120, progress_color=AppTheme.BTN_PRIMARY)
+        self.mic_level_label = ctk.CTkLabel(self.rec_control_row, text="Mic", text_color=AppTheme.TEXT_MUTED)
+        self.mic_level_bar = ctk.CTkProgressBar(self.rec_control_row, width=140, progress_color=AppTheme.BTN_PRIMARY)
         self.mic_level_bar.set(0.0)
-        self.mic_level_db = ctk.CTkLabel(self.rec_row, text="", text_color=AppTheme.TEXT_MUTED)
+        self.mic_level_db = ctk.CTkLabel(self.rec_control_row, text="", text_color=AppTheme.TEXT_MUTED)
 
-        self.mic_level_label.pack(side="left", padx=(12, 6))
-        self.mic_level_bar.pack(side="left", padx=(0, 6))
+        self.mic_level_label.pack(side="left", padx=(0, 6))
+        self.mic_level_bar.pack(side="left", padx=(0, 6), fill="x", expand=True)
         self.mic_level_db.pack(side="left", padx=(0, 0))
 
         # 3. SETTINGS CARD
         self.settings_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
         self.settings_card.pack(padx=15, pady=10, fill="x")
         
-        ctk.CTkLabel(
-            self.settings_card, 
-            text="Processing Settings", 
-            font=("Roboto", 14, "bold"),
-            text_color=AppTheme.TEXT_PRIMARY
-        ).pack(anchor="w", padx=15, pady=(10,5))
-        
-        grid = ctk.CTkFrame(self.settings_card, fg_color="transparent")
-        grid.pack(fill="x", padx=10, pady=5)
+        add_section_header(
+            self.settings_card,
+            "Processing Settings",
+            "Tune diarization before you start the lesson."
+        )
 
-        # Output folder
+        settings_body = ctk.CTkFrame(self.settings_card, fg_color="transparent")
+        settings_body.pack(fill="x", padx=12, pady=(0, 10))
+
+        output_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        output_row.pack(fill="x", pady=(0, 8))
+
         self.out_btn = ctk.CTkButton(
-            grid, 
+            output_row, 
             text="Output Folder",
-            font=("Roboto", 18, "bold"), 
-            width=120, 
-            height=40,
+            font=("Roboto", 15, "bold"),
+            width=132,
+            height=38,
             fg_color=AppTheme.BTN_PRIMARY,
             hover_color=AppTheme.BTN_PRIMARY_HOVER,
             text_color=AppTheme.BTN_TEXT_ON_BLUE,
             command=self.select_output_dir
         )
-        self.out_btn.grid(row=0, column=0, padx=5, pady=5)
+        self.out_btn.pack(side="left", padx=(0, 10))
         
         self.output_label = ctk.CTkLabel(
-            grid, 
+            output_row, 
             text="(None)", 
-            text_color=AppTheme.TEXT_MUTED
+            text_color=AppTheme.TEXT_MUTED,
+            anchor="w",
         )
-        self.output_label.grid(row=0, column=1, padx=5, sticky="w")
+        self.output_label.pack(side="left", fill="x", expand=True)
 
-        lbl = ctk.CTkLabel(grid, text="Expected speakers:", text_color=AppTheme.TEXT_PRIMARY)
-        lbl.grid(row=0, column=1, padx=5, sticky="e")
+        speaker_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        speaker_row.pack(fill="x", pady=(0, 6))
+
+        spk_lbl = ctk.CTkLabel(speaker_row, text="Expected speakers", text_color=AppTheme.TEXT_PRIMARY)
+        spk_lbl.pack(side="left", padx=(0, 8))
         ToolTip(
-            lbl,
+            spk_lbl,
             "Set the expected number of speakers for diarization.\n"
             "• Auto: WhisperX decides (may over-split).\n"
             "• 2 is recommended for tutor/student lessons."
         )
-        lbl.configure(cursor="question_arrow")
+        spk_lbl.configure(cursor="question_arrow")
 
         self.exp_spk_var = ctk.StringVar(value="2")
         self.exp_spk_menu = ctk.CTkOptionMenu(
-            grid,
+            speaker_row,
             variable=self.exp_spk_var,
             values=["Auto", "1", "2", "3", "4", "5", "6"],
-            width=100,
+            width=96,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
             button_color=AppTheme.BORDER_DIVIDER
         )
-        self.exp_spk_menu.grid(row=0, column=2, padx=5, sticky="w")
+        self.exp_spk_menu.pack(side="left")
 
         ToolTip(self.exp_spk_menu, "For group sessions, use Auto.\nFor lessons, 2 is usually best.")
 
-        # Model Size
-        ctk.CTkLabel(grid, text="Transcription Model Size:", text_color=AppTheme.TEXT_PRIMARY).grid(row=1, column=0, padx=(0, 8), pady=5, sticky="w")
+        config_row_top = ctk.CTkFrame(settings_body, fg_color="transparent")
+        config_row_top.pack(fill="x", pady=(0, 6))
+
+        model_label = ctk.CTkLabel(config_row_top, text="Model size", text_color=AppTheme.TEXT_PRIMARY)
+        model_label.pack(side="left", padx=(0, 8))
         self.model_var = ctk.StringVar(value="small")
         self.model_menu = ctk.CTkOptionMenu(
-            grid, 
+            config_row_top,
             variable=self.model_var,
             values=["tiny", "base", "small", "medium", "large-v2"],
-            width=110,
+            width=104,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
             button_color=AppTheme.BORDER_DIVIDER
         )
-        self.model_menu.grid(row=1, column=1, padx=(0, 20), pady=5, sticky="w")
+        self.model_menu.pack(side="left", padx=(0, 18))
 
-        # Language
-        ctk.CTkLabel(grid, text="Language:", text_color=AppTheme.TEXT_PRIMARY).grid(row=1, column=2, padx=(0, 8), pady=5, sticky="w")
+        lang_label = ctk.CTkLabel(config_row_top, text="Language", text_color=AppTheme.TEXT_PRIMARY)
+        lang_label.pack(side="left", padx=(0, 8))
         self.lang_var = ctk.StringVar(value="Auto-Detect")
         self.lang_combo = ctk.CTkOptionMenu(
-            grid, variable=self.lang_var,
+            config_row_top, variable=self.lang_var,
             values=list(LANGUAGE_MAP.keys()),
-            width=140,
+            width=132,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
             button_color=AppTheme.BORDER_DIVIDER
         )
-        self.lang_combo.grid(row=1, column=3, padx=(0, 0), pady=5, sticky="w")
-        
-        # Checkbox
+        self.lang_combo.pack(side="left", padx=(0, 18))
+
+        config_row_bottom = ctk.CTkFrame(settings_body, fg_color="transparent")
+        config_row_bottom.pack(fill="x")
+
         self.context_var = ctk.BooleanVar(value=False)
         self.context_cb = ctk.CTkCheckBox(
-            grid, 
+            config_row_bottom,
             text="Context", 
             variable=self.context_var,
             text_color=AppTheme.TEXT_PRIMARY,
             hover_color=AppTheme.BTN_PRIMARY
         )
-        self.context_cb.grid(row=1, column=4, padx=(15, 0), sticky="w")
+        self.context_cb.pack(side="left")
+
+        ctk.CTkLabel(
+            config_row_bottom,
+            text="Adds a small amount of prior transcript context.",
+            text_color=AppTheme.TEXT_MUTED,
+            font=("Roboto", 10),
+        ).pack(side="left", padx=(8, 0))
 
         # 4. ACTION CARD (Run + Progress + Status)
         self.action_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
         self.action_card.pack(padx=15, pady=8, fill="x")
 
+        add_section_header(
+            self.action_card,
+            "Processing",
+            "Run transcription and diarization for the lesson currently loaded in Studio."
+        )
+
         # Run button
         self.run_btn = ctk.CTkButton(
             self.action_card,
-            text="RUN PROCESSING",
-            height=50,
-            font=("Roboto", 18, "bold"),
+            text="Run Processing",
+            height=48,
+            font=("Roboto", 17, "bold"),
             fg_color=AppTheme.BTN_PRIMARY,
             hover_color=AppTheme.BTN_PRIMARY_HOVER,
             text_color=AppTheme.BTN_TEXT_ON_BLUE,
             command=self.run_diarization
         )
-        self.run_btn.pack(padx=12, pady=(12, 8), fill="x")
+        self.run_btn.pack(padx=12, pady=(0, 8), fill="x")
+
+        secondary_action_row = ctk.CTkFrame(self.action_card, fg_color="transparent")
+        secondary_action_row.pack(fill="x", padx=12, pady=(0, 8))
 
         self.assign_btn = ctk.CTkButton(
-            self.action_card, 
+            secondary_action_row, 
             text="Assign Speakers…",
-            width=160,
-            fg_color=AppTheme.BTN_PRIMARY, 
-            hover_color=AppTheme.BTN_PRIMARY_HOVER,
-            text_color=AppTheme.BTN_TEXT_ON_BLUE,
+            fg_color="transparent", 
+            border_width=1,
+            border_color=AppTheme.BORDER_DIVIDER,
+            text_color=AppTheme.TEXT_PRIMARY,
+            hover_color=AppTheme.BG_ELEVATED,
             command=self.open_assign_speakers,
             state="disabled"
         )
-        self.assign_btn.pack(side="left", padx=8, pady=8)
+        self.assign_btn.pack(side="left", expand=True, fill="x")
+
+        self.action_hint = ctk.CTkLabel(
+            self.action_card,
+            text="Speaker assignment unlocks after processing or loading a lesson.",
+            text_color=AppTheme.TEXT_MUTED,
+            font=("Roboto", 11),
+            anchor="w",
+        )
+        self.action_hint.pack(padx=12, pady=(0, 8), anchor="w")
 
         # Progress bar
         self.progress_bar = ctk.CTkProgressBar(self.action_card, progress_color=AppTheme.BTN_SUCCESS)
@@ -546,17 +678,19 @@ class DiarizationApp:
         )
         self.status_label.pack(padx=12, pady=(0, 12), anchor="w")
 
-        # 5. POST-PROCESSING CARD
-        self.post_card = ctk.CTkFrame(parent, fg_color="transparent")
-        self.post_card.pack(padx=15, pady=5, fill="x")
-
         # Analyze card
         self.analyze_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
         self.analyze_card.pack(padx=15, pady=(6, 10), fill="x")
 
+        add_section_header(
+            self.analyze_card,
+            "AI Analysis",
+            "Generate feedback, grammar scores, and golden words for the current lesson."
+        )
+
         self.analyze_btn = ctk.CTkButton(
             self.analyze_card,
-            text="Analyze with AI Assistant",
+            text="Run AI Analysis",
             height=46,
             fg_color=AppTheme.BTN_SUCCESS,
             hover_color=AppTheme.BTN_SUCCESS_HOVER,
@@ -564,7 +698,7 @@ class DiarizationApp:
             font=("Roboto", 16, "bold"),
             command=self.analyze_transcript
         )
-        self.analyze_btn.pack(padx=12, pady=(10, 4), fill="x")
+        self.analyze_btn.pack(padx=12, pady=(0, 4), fill="x")
 
         self.analyze_help = ctk.CTkLabel(
             self.analyze_card,
@@ -576,8 +710,8 @@ class DiarizationApp:
         )
         self.analyze_help.pack(padx=12, pady=(0, 8), anchor="w")
 
-        exp_row = ctk.CTkFrame(self.post_card, fg_color="transparent")
-        exp_row.pack(fill="x", padx=10, pady=(0,10))
+        exp_row = ctk.CTkFrame(self.analyze_card, fg_color="transparent")
+        exp_row.pack(fill="x", padx=12, pady=(0, 8))
         
         # Export Buttons
         self.export_srt_btn = ctk.CTkButton(
@@ -617,13 +751,14 @@ class DiarizationApp:
         self.export_wav_btn.pack(side="left", padx=5, expand=True, fill="x")
 
         self.export_help = ctk.CTkLabel(
-            exp_row,
+            self.analyze_card,
             text="",
             text_color=AppTheme.TEXT_MUTED,
             font=("Roboto", 12),
             anchor="w",
             justify="left"
         )
+        self.export_help.pack(padx=12, pady=(0, 10), anchor="w")
         self._update_analyze_ui_state()
 
     def open_assign_speakers(self):
@@ -693,9 +828,9 @@ class DiarizationApp:
             return
 
         if not has_transcript:
-            self.analyze_help.configure(text="To enable analysis: run processing or load an existing TXT transcript.")
+            self.analyze_help.configure(text="Run processing or load a TXT transcript to enable analysis.")
             try:
-                self.export_help.configure(text="To enable export: run processing or load an existing TXT transcript.")
+                self.export_help.configure(text="Run processing or load a TXT transcript to enable export.")
             except Exception:
                 pass
             return
@@ -704,19 +839,19 @@ class DiarizationApp:
         # Now enforce speaker assignment if segments exist
         if lesson_dir and os.path.isfile(os.path.join(lesson_dir, "segments.json")):
             if not self._has_speaker_assignment(lesson_dir):
-                self.analyze_help.configure(text="Action required: Assign Student Speaker(s) before analysis.")
+                self.analyze_help.configure(text="Assign the student speaker(s) before AI analysis.")
                 try:
-                    self.export_help.configure(text="Action required: Assign Student Speaker(s) before Speaker WAV export.")
+                    self.export_help.configure(text="Assign the student speaker(s) before speaker WAV export.")
                 except Exception:
                     pass
                 return
 
         self.analyze_btn.configure(state="normal")
-        self.analyze_help.configure(text="Ready for analysis.")
+        self.analyze_help.configure(text="Ready to generate feedback for this lesson.")
 
         try:
             self.export_wav_btn.configure(state="normal")
-            self.export_help.configure(text="Ready: Speaker WAV export available.")
+            self.export_help.configure(text="Speaker WAV export is ready.")
             self._set_status("Ready for Export and Analysis")
         except Exception:
             pass
@@ -854,6 +989,82 @@ class DiarizationApp:
         # CTk progress bar is 0.0 to 1.0
         self.progress_bar.set(float(value) / 100.0)
 
+    def _refresh_dashboard_from_current_lesson(self):
+        """
+        Keep the dashboard in sync with the lesson currently loaded in the app.
+        """
+        if not getattr(self, "dashboard", None):
+            return
+
+        lesson_dir = getattr(self, "current_lesson_dir", None)
+        try:
+            self.dashboard.refresh_from_current_lesson(lesson_dir)
+        except Exception:
+            try:
+                self.dashboard.refresh_data()
+            except Exception:
+                pass
+
+    def _analysis_stats_suffix(self) -> str:
+        """
+        Ask the model to append a machine-readable summary block we can save to ai_stats.json.
+        """
+        return (
+            "\n\nAt the very end of your response, append this exact machine-readable block and nothing else inside it:\n"
+            "AI_STATS_JSON_START\n"
+            '{"grammar_score": 0, "topics": ["topic 1", "topic 2", "topic 3"], "golden_words": ["word 1 (translation)", "word 2 (translation)", "word 3 (translation)"], "corrections": 0, "feedback": "short summary"}\n'
+            "AI_STATS_JSON_END\n"
+            "Use valid JSON only between the markers. Do not wrap it in markdown fences."
+        )
+
+    def _split_analysis_response(self, text: str):
+        """
+        Return (human_readable_text, stats_dict_or_none).
+        """
+        pattern = re.compile(
+            r"\n?AI_STATS_JSON_START\s*(\{.*?\})\s*AI_STATS_JSON_END\s*$",
+            re.DOTALL,
+        )
+        match = pattern.search(text or "")
+        if not match:
+            return (text or "").strip(), None
+
+        stats_raw = match.group(1).strip()
+        analysis_text = (text or "")[: match.start()].rstrip()
+
+        try:
+            stats = json.loads(stats_raw)
+        except Exception:
+            return analysis_text.strip(), None
+
+        if not isinstance(stats, dict):
+            return analysis_text.strip(), None
+
+        try:
+            from .pipeline import DiarizationPipelineRunner
+
+            stats["golden_words"] = DiarizationPipelineRunner._normalize_golden_words(
+                stats.get("golden_words")
+            )
+        except Exception:
+            pass
+
+        return analysis_text.strip(), stats
+
+    def _write_ai_stats(self, lesson_dir: str, stats: dict, provider: str, model: str):
+        if not lesson_dir or not stats:
+            return
+
+        payload = dict(stats)
+        payload["llm_provider"] = provider
+        payload["llm_model"] = model
+        payload["analysis_updated_at"] = datetime.now().isoformat(timespec="seconds")
+        payload["source"] = "studio_analysis"
+
+        ai_stats_path = os.path.join(lesson_dir, "ai_stats.json")
+        with open(ai_stats_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
     def _enable_export_buttons(self):
         self.analyze_btn.configure(state="normal")
         self.export_srt_btn.configure(state="normal")
@@ -955,7 +1166,7 @@ class DiarizationApp:
                 self.dashboard.destroy()
             
             self.dashboard = DashboardFrame(
-                self.tab_dash, 
+                self.dashboard_scroll, 
                 profile_name=self.profile_name, 
                 profile_dir=self._profile_dir(),
                 pipeline=self.pipeline  
@@ -989,10 +1200,187 @@ class DiarizationApp:
             self.profile_name = name.strip()
             self.profile_label.configure(text=f"Profile: {self.profile_name}")
             self.profile_config = self._load_profile_config()
+    
+    # --- BATCH IMPORT LOGIC ---
+    def run_batch_import(self):
+        """
+        Allows selecting multiple audio files and processing them sequentially
+        with hardcoded settings (Medium model, Spanish, 4 Speakers).
+        """
+        if not self.profile_name:
+            messagebox.showerror("Error", "Please select a profile first.")
+            return
 
+        # 1. Multi-file selection
+        paths = filedialog.askopenfilenames(
+            title="Select Audio Files for Batch Import",
+            filetypes=[("Audio", "*.mp3 *.wav *.m4a *.flac *.ogg *.aac"), ("All", "*.*")]
+        )
+        if not paths: return
+
+        # 2. Open Settings Window
+        self._open_batch_settings_window(paths)
+
+    def _open_batch_settings_window(self, paths):
+        count = len(paths)
+        
+        # Create Popup
+        win = ctk.CTkToplevel(self.master)
+        win.title("Batch Import Settings")
+        win.geometry("400x350")
+        win.transient(self.master)
+        win.grab_set()  # Make modal
+
+        # Header
+        ctk.CTkLabel(win, text=f"Importing {count} files", font=("Roboto", 16, "bold")).pack(pady=(20, 10))
+        ctk.CTkLabel(win, text="Configure settings for all files:", text_color="gray").pack(pady=(0, 20))
+
+        # Form Container
+        form = ctk.CTkFrame(win, fg_color="transparent")
+        form.pack(padx=40, fill="x")
+
+        # 1. Model Size
+        ctk.CTkLabel(form, text="Model Size:", anchor="w").grid(row=0, column=0, sticky="w", pady=10)
+        model_var = ctk.StringVar(value="medium")
+        model_menu = ctk.CTkOptionMenu(
+            form, 
+            variable=model_var,
+            values=["tiny", "base", "small", "medium", "large-v2"]
+        )
+        model_menu.grid(row=0, column=1, sticky="e", pady=10)
+
+        # 2. Language
+        ctk.CTkLabel(form, text="Language:", anchor="w").grid(row=1, column=0, sticky="w", pady=10)
+        lang_var = ctk.StringVar(value="Spanish") # Default to Spanish as requested
+        lang_menu = ctk.CTkOptionMenu(
+            form, 
+            variable=lang_var,
+            values=list(LANGUAGE_MAP.keys())
+        )
+        lang_menu.grid(row=1, column=1, sticky="e", pady=10)
+
+        # 3. Speakers
+        ctk.CTkLabel(form, text="Speakers:", anchor="w").grid(row=2, column=0, sticky="w", pady=10)
+        spk_var = ctk.StringVar(value="4")
+        spk_menu = ctk.CTkOptionMenu(
+            form, 
+            variable=spk_var,
+            values=["Auto", "1", "2", "3", "4", "5", "6", "7", "8"]
+        )
+        spk_menu.grid(row=2, column=1, sticky="e", pady=10)
+
+        # Actions
+        def on_start():
+            # Get values
+            m_size = model_var.get()
+            l_name = lang_var.get()
+            l_code = LANGUAGE_MAP.get(l_name)
+            s_val = spk_var.get()
+            n_spk = None if s_val == "Auto" else int(s_val)
+
+            # Close window
+            win.destroy()
+
+            # Lock UI
+            self.batch_btn.configure(state="disabled")
+            self.run_btn.configure(state="disabled")
+
+            # Start Thread
+            threading.Thread(
+                target=self._run_batch_thread, 
+                args=(paths, m_size, l_code, n_spk), 
+                daemon=True
+            ).start()
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(pady=30, fill="x", padx=40)
+
+        ctk.CTkButton(btn_row, text="Cancel", fg_color="transparent", border_width=1, command=win.destroy).pack(side="left", expand=True)
+        ctk.CTkButton(btn_row, text="Start Batch", command=on_start).pack(side="right", expand=True)
+
+    def _run_batch_thread(self, paths, model_size, language, num_speakers):
+        successful_lessons = []
+        total = len(paths)
+        
+        for i, audio_path in enumerate(paths):
+            filename = os.path.basename(audio_path)
+            self._set_status(f"Batch ({i+1}/{total}): Processing {filename}...")
+            self._set_progress(0)
+
+            try:
+                # 1. Determine Date (Same logic as before)
+                try:
+                    stat = os.stat(audio_path)
+                    if hasattr(stat, 'st_birthtime'):
+                        ts = stat.st_birthtime
+                    else:
+                        ts = stat.st_mtime
+                except:
+                    ts = os.path.getmtime(audio_path)
+                
+                dt_obj = datetime.fromtimestamp(ts)
+                lesson_id = dt_obj.strftime("%Y%m%d_%H%M%S")
+                
+                # Handle duplicates
+                base_dir = self._profile_lessons_dir()
+                lesson_dir = os.path.join(base_dir, lesson_id)
+                if os.path.exists(lesson_dir):
+                    lesson_dir = os.path.join(base_dir, f"{lesson_id}_{i}")
+                
+                os.makedirs(lesson_dir, exist_ok=True)
+
+                # 2. Run Pipeline (USING PASSED ARGS)
+                self.pipeline.process_audio(
+                    audio_path=audio_path,
+                    output_dir=lesson_dir,
+                    model_size=model_size,     # <--- Use arg
+                    language=language,         # <--- Use arg
+                    num_speakers=num_speakers  # <--- Use arg
+                )
+
+                # 3. Save Artifacts
+                self.pipeline.save_lesson_artifacts(
+                    lesson_dir,
+                    profile_name=self.profile_name,
+                    whisper_model_size=model_size,
+                    language=language,  # Store the readable name or code? pipeline usually expects code.
+                    contextual=False,
+                    extra_meta={
+                        "recorded_at": dt_obj.isoformat(),
+                        "batch_imported": True
+                    }
+                )
+                
+                successful_lessons.append(lesson_dir)
+
+            except Exception as e:
+                print(f"Batch Error on {filename}: {e}")
+                continue
+
+        # Finish
+        self._set_status("Batch Import Complete")
+        self._set_progress(100)
+        self.master.after(0, lambda: self._on_batch_finished(successful_lessons))
+
+    def _on_batch_finished(self, lessons):
+        self.batch_btn.configure(state="normal")
+        self.run_btn.configure(state="normal")
+        
+        count = len(lessons)
+        if count == 0:
+            messagebox.showerror("Batch Failed", "No lessons were successfully processed.")
+            return
+
+        # Prompt for assignment
+        if messagebox.askyesno("Batch Complete", 
+                               f"Successfully imported {count} lessons.\n\n"
+                               "Would you like to assign speakers now?"):
+            self.view_history() 
+            # Note: Opening 20 modal windows sequentially is bad UX. 
+            # Sending them to History is cleaner—they can click "Load" -> "Assign" 
+            # on the specific lessons they want to fix.
 
     # --- MAIN FUNCTIONS ---
-
     def select_audio(self):
         path = filedialog.askopenfilename(filetypes=[("Audio", "*.mp3 *.wav *.m4a *.flac *.ogg"), ("All", "*.*")])
         if path:
@@ -1235,6 +1623,7 @@ class DiarizationApp:
             self.current_lesson_dir = lesson_dir
             self.output_dir = lesson_dir
             self.output_label.configure(text=os.path.basename(lesson_dir))
+            self._refresh_dashboard_from_current_lesson()
 
             self.has_result = True
             self._enable_export_buttons()
@@ -1707,6 +2096,7 @@ class DiarizationApp:
                 final_prompt += "\n\nWrite response in ENGLISH."
             else:
                 final_prompt += "\n\nEscribe la respuesta en ESPAÑOL."
+            final_prompt += self._analysis_stats_suffix()
 
             # Load existing config and update preferences
             cfg = self._load_profile_config()
@@ -1873,6 +2263,8 @@ class DiarizationApp:
                 speakers=speakers,
             )
 
+            analysis_text, ai_stats = self._split_analysis_response(res)
+
             # Ensure we have a lesson folder to attach analysis to
             if not getattr(self, "current_lesson_dir", None):
                 self.current_lesson_dir = self._new_lesson_dir()
@@ -1890,7 +2282,10 @@ class DiarizationApp:
             if self.current_lesson_dir:
                 analysis_path = os.path.join(self.current_lesson_dir, "analysis.txt")
                 with open(analysis_path, "w", encoding="utf-8") as f:
-                    f.write(res)
+                    f.write(analysis_text)
+
+                if ai_stats:
+                    self._write_ai_stats(self.current_lesson_dir, ai_stats, provider, model)
 
                 meta_path = os.path.join(self.current_lesson_dir, "meta.json")
                 meta = {}
@@ -1907,7 +2302,8 @@ class DiarizationApp:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
 
             # Show result
-            self.master.after(0, lambda text=res: self._show_analysis_window(text))
+            self.master.after(0, lambda text=analysis_text: self._show_analysis_window(text))
+            self.master.after(0, self._refresh_dashboard_from_current_lesson)
             self._set_status("Analysis Done")
             self._set_progress(100)
 

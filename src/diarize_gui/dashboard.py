@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
+from .theme import AppTheme
 
 # Use a safe backend for macOS/Windows
 matplotlib.use("TkAgg")
@@ -20,26 +21,65 @@ class DashboardFrame(ctk.CTkFrame):
         self.profile_name = str(profile_name) if profile_name else "Student"
         self.profile_dir = profile_dir
         self.pipeline = pipeline 
+        self.current_lesson_dir = None
         
         # Colors
-        self.color_primary = "#3B8ED0"     
-        self.color_student = "#4CAF50"     
-        self.color_tutor = "#FF9800"       
-        self.color_bad    = "#E57373"      
-        self.color_ai     = "#9C27B0"      
+        self.color_primary = AppTheme.BTN_PRIMARY
+        self.color_student = AppTheme.BTN_SUCCESS
+        self.color_tutor = "#C98A1A"
+        self.color_bad    = "#D76A5D"
+        self.color_ai     = "#9A4BCF"
         self.bg_figure = "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#ffffff"
-        self.text_color = "white" if ctk.get_appearance_mode() == "Dark" else "black"
+        self.text_color = AppTheme.TEXT_PRIMARY
+        self.card_bg = AppTheme.BG_CARD
+        self.card_border = AppTheme.BORDER_DIVIDER
+        self.card_subtext = AppTheme.TEXT_MUTED
 
         self.filler_pattern = re.compile(r"\b(um|uh|eh|mm|hm|este|em)\b", re.IGNORECASE)
 
         # --- UI LAYOUT ---
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(3, weight=1) 
+        self.grid_rowconfigure(4, weight=1)
+
+        # Header
+        self.header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.header_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(12, 4))
+        self.header_frame.grid_columnconfigure(0, weight=1)
+
+        self.title_label = ctk.CTkLabel(
+            self.header_frame,
+            text=f"{self.profile_name} Dashboard",
+            font=("Roboto", 22, "bold"),
+            text_color=self.color_primary,
+            anchor="w",
+        )
+        self.title_label.grid(row=0, column=0, sticky="w")
+
+        self.subtitle_label = ctk.CTkLabel(
+            self.header_frame,
+            text="Conversation trends, fluency, and AI feedback in one place.",
+            font=("Roboto", 12),
+            text_color=self.card_subtext,
+            anchor="w",
+        )
+        self.subtitle_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        self.profile_pill = ctk.CTkLabel(
+            self.header_frame,
+            text="LIVE PROFILE",
+            font=("Roboto", 10, "bold"),
+            text_color=AppTheme.BTN_TEXT_ON_BLUE,
+            fg_color=self.color_primary,
+            corner_radius=999,
+            padx=10,
+            pady=4,
+        )
+        self.profile_pill.grid(row=0, column=1, rowspan=2, sticky="e")
 
         # 1. Standard KPI Row
         self.row1 = ctk.CTkFrame(self, fg_color="transparent")
-        self.row1.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 5))
+        self.row1.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(10, 6))
         
         self.card_total_time = self._create_kpi_card(self.row1, "Total Hours", "0.0")
         self.card_student_pct = self._create_kpi_card(self.row1, "You Spoke", "0%")
@@ -53,21 +93,71 @@ class DashboardFrame(ctk.CTkFrame):
 
         # 2. Advanced / AI KPI Row
         self.row2 = ctk.CTkFrame(self, fg_color="transparent")
-        self.row2.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(5, 10))
+        self.row2.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
         
         self.card_grammar = self._create_kpi_card(self.row2, "Avg Grammar", "--", color=self.color_ai)
-        self.card_golden = self._create_kpi_card(self.row2, "Recent Golden Words", "--", color=self.color_ai)
         self.card_latency = self._create_kpi_card(self.row2, "Avg Latency", "0.0s")
         self.card_max_turn = self._create_kpi_card(self.row2, "Longest Turn", "0s")
 
         self.card_grammar.pack(side="left", expand=True, fill="x", padx=5)
-        self.card_golden.pack(side="left", expand=True, fill="x", padx=5)
         self.card_latency.pack(side="left", expand=True, fill="x", padx=5)
         self.card_max_turn.pack(side="left", expand=True, fill="x", padx=5)
 
+        # Golden words panel
+        self.golden_panel = ctk.CTkFrame(
+            self,
+            fg_color=self.card_bg,
+            corner_radius=14,
+            border_width=1,
+            border_color=self.card_border,
+        )
+        self.golden_panel.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
+        self.golden_panel.grid_columnconfigure(0, weight=1)
+
+        self.golden_header = ctk.CTkLabel(
+            self.golden_panel,
+            text="Recent Golden Words",
+            font=("Roboto", 12, "bold"),
+            text_color=self.color_ai,
+            anchor="w",
+        )
+        self.golden_header.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+
+        self.golden_hint = ctk.CTkLabel(
+            self.golden_panel,
+            text="Latest vocabulary targets pulled from AI analysis.",
+            font=("Roboto", 11),
+            text_color=self.card_subtext,
+            anchor="w",
+        )
+        self.golden_hint.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 8))
+
+        self.golden_words_container = ctk.CTkFrame(self.golden_panel, fg_color="transparent")
+        self.golden_words_container.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 14))
+        self.golden_words_container.grid_columnconfigure(0, weight=1)
+        self.golden_words_container.grid_columnconfigure(1, weight=1)
+        self.golden_words_container.grid_columnconfigure(2, weight=1)
+
+        self.golden_word_labels = []
+        for idx in range(3):
+            lbl = ctk.CTkLabel(
+                self.golden_words_container,
+                text="--",
+                fg_color=AppTheme.BG_ELEVATED,
+                text_color=self.text_color,
+                corner_radius=10,
+                padx=12,
+                pady=8,
+                justify="center",
+                anchor="center",
+                wraplength=220,
+            )
+            lbl.grid(row=0, column=idx, sticky="ew", padx=4)
+            self.golden_word_labels.append(lbl)
+
         # 3. Charts Area (Now Tabbed!)
         self.chart_tabs = ctk.CTkTabview(self)
-        self.chart_tabs.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=5)
+        self.chart_tabs.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=12, pady=6)
         
         self.tab_activity = self.chart_tabs.add("Activity")
         self.tab_fluency = self.chart_tabs.add("Fluency")
@@ -75,40 +165,76 @@ class DashboardFrame(ctk.CTkFrame):
         
         # 4. Controls Row
         self.controls_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.controls_frame.grid(row=3, column=0, columnspan=2, pady=10)
+        self.controls_frame.grid(row=5, column=0, columnspan=2, pady=(8, 12))
 
-        self.refresh_btn = ctk.CTkButton(self.controls_frame, text="Refresh Data", command=self.refresh_data)
+        self.refresh_btn = ctk.CTkButton(
+            self.controls_frame,
+            text="Refresh Dashboard",
+            command=self.refresh_data,
+            fg_color=self.color_primary,
+            hover_color=AppTheme.BTN_PRIMARY_HOVER,
+        )
         self.refresh_btn.pack(side="left", padx=10)
 
-        self.ai_btn = ctk.CTkButton(self.controls_frame, text="✨ Compute All AI Metrics", 
-                                    fg_color=self.color_ai, hover_color="#7B1FA2",
-                                    command=self.run_ai_analysis)
+        self.ai_btn = ctk.CTkButton(
+            self.controls_frame,
+            text="Compute AI Metrics",
+            fg_color=self.color_ai,
+            hover_color="#7B1FA2",
+            command=self.run_ai_analysis,
+        )
         self.ai_btn.pack(side="left", padx=10)
         
-        self.status_lbl = ctk.CTkLabel(self.controls_frame, text="", text_color="gray")
+        self.status_lbl = ctk.CTkLabel(self.controls_frame, text="", text_color=self.card_subtext)
         self.status_lbl.pack(side="left", padx=10)
 
         # Initial Load
         self.refresh_data()
 
+    def set_current_lesson_dir(self, lesson_dir):
+        self.current_lesson_dir = lesson_dir
+
+    def refresh_from_current_lesson(self, lesson_dir=None):
+        """
+        Convenience hook for the app to tell the dashboard which lesson is active,
+        then refresh the aggregate view.
+        """
+        if lesson_dir is not None:
+            self.current_lesson_dir = lesson_dir
+        self.refresh_data()
+
     def _create_kpi_card(self, parent, title, value, color=None):
-        frame = ctk.CTkFrame(parent)
+        frame = ctk.CTkFrame(
+            parent,
+            fg_color=self.card_bg,
+            corner_radius=14,
+            border_width=1,
+            border_color=self.card_border,
+            height=92,
+        )
+        frame.grid_propagate(False)
         t_color = color if color else "gray"
-        lbl_title = ctk.CTkLabel(frame, text=title.upper(), font=("Roboto", 11), text_color=t_color)
-        lbl_title.pack(pady=(8,0))
+        lbl_title = ctk.CTkLabel(frame, text=title.upper(), font=("Roboto", 11, "bold"), text_color=t_color)
+        lbl_title.pack(pady=(10,0))
         
         # Use a smaller font if value is long
         font_size = 20
         if len(value) > 20: font_size = 12
         elif len(value) > 10: font_size = 14
         
-        lbl_val = ctk.CTkLabel(frame, text=value, font=("Roboto", font_size, "bold"))
-        lbl_val.pack(pady=(0,8))
+        lbl_val = ctk.CTkLabel(
+            frame,
+            text=value,
+            font=("Roboto", font_size, "bold"),
+            wraplength=220,
+            justify="center",
+        )
+        lbl_val.pack(pady=(2,10), padx=10, fill="both", expand=True)
         frame.value_label = lbl_val
         return frame
 
     def run_ai_analysis(self):
-        """Runs LLM analysis on ALL lessons missing ai_stats."""
+        """Recomputes LLM analysis for every lesson with transcript data."""
         if not self.pipeline:
             self.status_lbl.configure(text="Error: Pipeline not connected")
             return
@@ -122,11 +248,13 @@ class DashboardFrame(ctk.CTkFrame):
             all_lessons = sorted(os.listdir(lessons_dir), reverse=True)
             to_process = []
             
-            # Identify work first
+            # Identify lessons that have enough data to analyze.
             for lid in all_lessons:
                 path = os.path.join(lessons_dir, lid)
                 if not os.path.isdir(path): continue
-                if not os.path.exists(os.path.join(path, "ai_stats.json")):
+                meta_path = os.path.join(path, "meta.json")
+                seg_path = os.path.join(path, "segments.json")
+                if os.path.isfile(meta_path) and os.path.isfile(seg_path):
                     to_process.append(path)
             
             total = len(to_process)
@@ -140,7 +268,6 @@ class DashboardFrame(ctk.CTkFrame):
                 msg = f"Analyzing {i+1}/{total}..."
                 self.after(0, lambda m=msg: self.status_lbl.configure(text=m))
                 
-                # Check return value
                 success = self.pipeline.compute_ai_metrics(path, model="llama3.2")
                 if success:
                     processed += 1
@@ -154,7 +281,7 @@ class DashboardFrame(ctk.CTkFrame):
     def _on_ai_finished(self, count, total):
         self.ai_btn.configure(state="normal", text="✨ Compute All AI Metrics")
         if total == 0:
-            self.status_lbl.configure(text="All lessons already analyzed!")
+            self.status_lbl.configure(text="No analyzable lessons found.")
         else:
             self.status_lbl.configure(text=f"Finished analyzing {count} lessons.")
             self.refresh_data()
@@ -217,8 +344,13 @@ class DashboardFrame(ctk.CTkFrame):
                             # Basic validation to ensure it's a number
                             if isinstance(score, (int, float)):
                                 all_grammar_scores.append((dt_obj, score))
-                        if "golden_words" in ai_data: 
-                            golden_words_all.extend(ai_data["golden_words"])
+                        golden_words = ai_data.get("golden_words", [])
+                        if isinstance(golden_words, str):
+                            golden_words = [golden_words]
+                        if isinstance(golden_words, list):
+                            golden_words_all.extend(
+                                str(w).strip() for w in golden_words if str(w).strip()
+                            )
                     except: pass
 
                 # --- Identity Logic ---
@@ -311,12 +443,15 @@ class DashboardFrame(ctk.CTkFrame):
                     unique_gold.append(w)
                     seen.add(w)
                 if len(unique_gold) >= 3: break
-            
-            # Use smaller font if text is long
-            text_gold = "\n".join(unique_gold)
-            self.card_golden.value_label.configure(text=text_gold)
+
+            for idx, lbl in enumerate(self.golden_word_labels):
+                if idx < len(unique_gold):
+                    lbl.configure(text=unique_gold[idx])
+                else:
+                    lbl.configure(text="--")
         else:
-            self.card_golden.value_label.configure(text="No Analysis")
+            for lbl in self.golden_word_labels:
+                lbl.configure(text="No Analysis")
 
         # --- PLOTS (In Tabs) ---
         self._plot_activity(student_words_by_month, self.tab_activity)

@@ -51,6 +51,33 @@ class DiarizationPipelineRunner:
         self.last_output_dir = None
         self.last_diar_df: Optional[pd.DataFrame] = None
 
+    @staticmethod
+    def _normalize_golden_words(value) -> List[str]:
+        """
+        Coerce model output into a clean, unique list of up to 3 strings.
+        """
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            items = [value]
+        elif isinstance(value, list):
+            items = value
+        else:
+            return []
+
+        cleaned: List[str] = []
+        seen = set()
+        for item in items:
+            text = re.sub(r"\s+", " ", str(item)).strip(" \t\r\n-•*")
+            if not text or text in seen:
+                continue
+            cleaned.append(text)
+            seen.add(text)
+            if len(cleaned) >= 3:
+                break
+        return cleaned
+
     def _set_status(self, text: str):
         if self.status_callback:
             self.status_callback(text)
@@ -203,6 +230,7 @@ class DiarizationPipelineRunner:
                 if start != -1 and end != 0:
                     json_str = clean[start:end]
                     data = json.loads(json_str)
+                    data["golden_words"] = self._normalize_golden_words(data.get("golden_words"))
                     self._save_json(data, output_path)
                     return True
             except:
@@ -228,8 +256,7 @@ class DiarizationPipelineRunner:
             if words_section:
                 words = re.findall(r"-\s*\*?([^\n]+)", words_section.group(1))
                 if words: 
-                    clean_words = [w.replace('*', '').strip() for w in words]
-                    fallback_data["golden_words"] = clean_words[:3]
+                    fallback_data["golden_words"] = self._normalize_golden_words(words)
 
             corr_section = re.search(r"Corrections:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
             if corr_section:
@@ -745,41 +772,6 @@ class DiarizationPipelineRunner:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
         return meta
-
-    def load_lesson_artifacts(self, lesson_dir: str):
-        """
-        Restore last_result/last_diar_df/last_audio_path from a lesson folder.
-        Enables export_srt/export_txt and export_speaker_audios (if audio path exists).
-        """
-        meta_path = os.path.join(lesson_dir, "meta.json")
-        seg_path = os.path.join(lesson_dir, "segments.json")
-        diar_path = os.path.join(lesson_dir, "diarization.json")
-
-        if not os.path.isfile(seg_path):
-            raise FileNotFoundError(f"Missing segments.json in {lesson_dir}")
-
-        with open(seg_path, "r", encoding="utf-8") as f:
-            segments = json.load(f)
-
-        self.last_result = {"segments": segments}
-        self.last_output_dir = lesson_dir
-
-        # optional meta
-        if os.path.isfile(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            self.last_audio_path = meta.get("source_audio_path")
-        else:
-            self.last_audio_path = None
-
-        # diarization df optional
-        if os.path.isfile(diar_path):
-            with open(diar_path, "r", encoding="utf-8") as f:
-                diar = json.load(f)
-            self.last_diar_df = pd.DataFrame(diar)
-        else:
-            self.last_diar_df = None
-
 
     def export_txt(self, txt_path: str):
         if not self.last_result or "segments" not in self.last_result:
