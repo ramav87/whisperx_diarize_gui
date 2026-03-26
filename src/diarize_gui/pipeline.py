@@ -555,7 +555,7 @@ class DiarizationPipelineRunner:
 
         if provider == "openai":
             from .openai_provider import OpenAIProvider
-            client = OpenAIProvider(api_key=api_key, model=model or "gpt-4o")
+            client = OpenAIProvider(api_key=api_key, model=model or "gpt-5.2")
             self._set_status(f"Calling OpenAI ({client.model})...")
             self._set_progress(50)
             return client.analyze(combined_prompt)

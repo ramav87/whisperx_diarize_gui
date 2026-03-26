@@ -1843,13 +1843,13 @@ class DiarizationApp:
 
         ctk.CTkLabel(model_row, text="Model:", width=60).pack(side="left")
 
-        self.ollama_models = ["mistral", "mixtral", "gemma:2b", "llama3.2"]
+        self.ollama_models = ["mistral", "mixtral", "gemma:2b", "llama3.2", "qwen2.5"]
         self.openai_models = ["gpt-4o", "gpt-4o-mini", "gpt-5.1", "gpt-5.2"]
         
         # Pick model default from profile depending on provider
         provider0 = self.analysis_provider_var.get()
         if provider0 == "openai":
-            default_model = self.profile_config.get("openai_model", "gpt-5.1")
+            default_model = self.profile_config.get("openai_model", "gpt-5.2")
         else:
             default_model = self.profile_config.get("ollama_model", "mistral")
 
@@ -1901,7 +1901,7 @@ class DiarizationApp:
             if provider == "openai":
                 self.model_menu.configure(values=self.openai_models)
                 if self.analysis_model_var.get() not in self.openai_models:
-                    self.analysis_model_var.set(self.profile_config.get("openai_model", "gpt-4o"))
+                    self.analysis_model_var.set(self.profile_config.get("openai_model", "gpt-5.2"))
                 self.openai_key_entry.configure(state="normal")
                 self.save_key_cb.configure(state="normal")
             else:
