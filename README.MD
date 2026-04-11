@@ -1,12 +1,12 @@
 # WhisperX Diarization & Analysis GUI - User Guide
 
-This application allows you to record or load audio, transcribe it using WhisperX, identify speakers (diarization), and analyze the conversation using local LLMs via Ollama.
+This application allows you to record or load audio, transcribe it using a hardware-aware backend, identify speakers (diarization), and analyze the conversation using local LLMs via Ollama.
 
 ## Prerequisites
 (The following only applies if you are not installing via the pre-built binaries)
 
 1. **Ollama:** Must be installed and running. [Download here](https://ollama.com).
-2. **HuggingFace Token:** Required for the Pyannote diarization model.
+2. **HuggingFace Token:** Required for the Pyannote diarization model when you use the standard diarization path.
    - Go to [HuggingFace Settings](https://huggingface.co/settings/tokens).
    - Create a 'Read' token.
    - You must verify you have accepted the user agreement for `pyannote/speaker-diarization-3.0`.
@@ -32,7 +32,7 @@ Click Select Existing Audio File to load .mp3, .wav, or .m4a files.
 
 3. **Run Transcription**
 Select Output Folder: Choose where files will be saved.
-Model Size: Select small or medium for speed, or large-v2 for best accuracy.
+Model Size: The default is now `large-v3` for best Spanish quality, with `turbo` available as the fast fallback.
 
 Run: Click Run Transcription + Diarization.
 Note: The first run may take time to download the Whisper models.
@@ -50,3 +50,45 @@ Click OK (Analyze). The result will appear in a new window and be saved to your 
 
 5. **Review History**
 Click View lesson history at the top to see past transcripts and AI feedback.
+
+## Spanish transcript quality
+
+The app now keeps both raw and cleaned transcript artifacts for each lesson.
+
+- `transcript_raw.txt` and `segments_raw.json` preserve the original ASR output.
+- `transcript_cleaned.txt`, `transcript.txt`, and `segments.json` contain the lightly cleaned lesson transcript used for analysis.
+- `transcript_cleaned_highlighted.txt` marks low-confidence spans so you can review noisy sections quickly.
+- `transcript_artifact.json` stores the structured lesson transcript bundle, including timestamps, speakers, confidence flags, raw text, cleaned text, and settings used.
+
+The cleanup layer is intentionally conservative. It removes obvious ASR junk and repeated fragments, but it does not paraphrase learner Spanish.
+
+Speaker review now lets you merge diarized voices by assigning multiple original speakers to the same canonical label before analysis.
+
+## Apple Silicon optimization
+
+On Apple Silicon Macs, the app now prefers a Mac-native ASR path by default:
+
+1. `backend = auto` selects `MLX Whisper` first when it is available.
+2. If MLX Whisper is not installed or cannot load a model, the app falls back to `openai-whisper` on MPS when available.
+3. If neither Apple-specific path is available, the app falls back to the existing WhisperX path.
+
+The diarization stage stays separate from ASR.
+
+- The standard diarization path remains `pyannote`.
+- In this app, pyannote is treated as a CPU stage by default on Apple Silicon.
+- A future Apple-native diarization hook is exposed behind `diarization_backend = speakerkit_future`, but the current standard path still uses pyannote.
+
+Audio is normalized to mono 16 kHz once and cached so ASR and diarization can reuse the same preprocessed WAV without repeating ffmpeg work.
+
+Recommended Apple Silicon settings:
+
+- `backend = auto`
+- `diarization_backend = pyannote`
+- `apple_compute_preference = balanced`
+- `batch_size = 1` or `2` on smaller MacBooks
+
+Notes:
+
+- `faster-whisper` / `CTranslate2` remains the non-Mac default path and does not use MPS.
+- Word timestamps are preserved when the backend supports them; otherwise the app keeps segment timestamps and records that limitation in the lesson metadata.
+- Bundled pyannote diarization will prefer a `pyannote-3.1` directory if you provide one later; otherwise it falls back to the existing `pyannote` bundle.

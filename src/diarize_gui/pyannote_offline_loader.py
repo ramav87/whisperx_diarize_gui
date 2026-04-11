@@ -2,7 +2,7 @@ import os
 import sys
 import yaml
 import tempfile
-from pyannote.audio import Pipeline
+
 
 def get_resource_base_path():
     """
@@ -25,16 +25,29 @@ def get_model_dir():
     Locate the folder containing config.yaml and bin files for Pyannote.
     """
     base_path = get_resource_base_path()
-    
+
+    candidates = [
+        os.path.join(base_path, "models", "pyannote-3.1"),
+        os.path.join(base_path, "models", "pyannote"),
+        os.path.join(base_path, "pyannote-3.1"),
+        os.path.join(base_path, "pyannote"),
+    ]
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
     if getattr(sys, 'frozen', False):
         # In the App Bundle, build_app.sh puts pyannote inside 'models'
-        # .../Contents/MacOS/models/pyannote
-        return os.path.join(base_path, "models", "pyannote")
+        # .../Contents/MacOS/models/pyannote or pyannote-3.1
+        return candidates[1]
     else:
         # In Dev Mode, it is directly in 'resources/pyannote'
-        return os.path.join(base_path, "pyannote")
+        return candidates[-1]
 
 def load_offline_pipeline():
+    from pyannote.audio import Pipeline
+
     model_dir = get_model_dir()
     config_path = os.path.join(model_dir, "config.yaml")
 

@@ -2,21 +2,27 @@ import os
 import sys
 import json
 import re
-from typing import Callable, Optional, List
+import time
+from typing import Callable, Optional, List, Any
 from datetime import datetime
 import numpy as np
 import pandas as pd
 import soundfile as sf
-import whisperx
-from pyannote.audio import Pipeline
 import requests
-from .utils import detect_device, format_timestamp
-from .pyannote_offline_loader import load_offline_pipeline  # <--- ADD THIS
+from .utils import detect_device, format_timestamp, is_apple_silicon
+from .audio_tools import preprocess_audio_mono_16k
+from .processing_backends import (
+    assign_speakers_by_overlap,
+    prepare_transcript_segments,
+    resolve_asr_backend,
+    resolve_diarization_backend,
+)
 
 StatusCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
 TIME_PATTERN = re.compile(r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\.(?P<ms>\d{3})")
 DEFAULT_MAX_CHARS = 20000
+DEFAULT_OLLAMA_ANALYSIS_MODEL = "gemma4:e4b"
 
 def parse_time_to_seconds(t: str) -> float:
     """
@@ -34,7 +40,7 @@ def parse_time_to_seconds(t: str) -> float:
 
 class DiarizationPipelineRunner:
     """
-    Encapsulates the WhisperX + diarization pipeline.
+    Encapsulates transcription + diarization with hardware-aware backend routing.
     """
 
     def __init__(
@@ -47,9 +53,12 @@ class DiarizationPipelineRunner:
 
         # store last run info for exports
         self.last_result = None
+        self.last_raw_result = None
         self.last_audio_path = None
+        self.last_preprocessed_audio_path = None
         self.last_output_dir = None
         self.last_diar_df: Optional[pd.DataFrame] = None
+        self.last_processing_meta: dict[str, Any] = {}
 
     @staticmethod
     def _normalize_golden_words(value) -> List[str]:
@@ -141,9 +150,17 @@ class DiarizationPipelineRunner:
             raise ValueError("No segments could be parsed from TXT file.")
 
         self.last_result = {"segments": segments}
+        self.last_raw_result = {"segments": segments}
         self.last_diar_df = None
         self.last_audio_path = None
+        self.last_preprocessed_audio_path = None
         self.last_output_dir = os.path.dirname(txt_path)
+        self.last_processing_meta = {
+            "asr_backend": "txt_import",
+            "diarization_backend": None,
+            "word_timestamps_available": False,
+            "notes": ["Loaded from existing TXT transcript."],
+        }
 
         self._set_status("Loaded segments from TXT")
         self._set_progress(100)
@@ -160,7 +177,7 @@ class DiarizationPipelineRunner:
         except Exception as e:
             print(f"Error saving JSON to {path}: {e}")
             
-    def compute_ai_metrics(self, lesson_dir, model="llama3.2", mode="ollama"):
+    def compute_ai_metrics(self, lesson_dir, model=DEFAULT_OLLAMA_ANALYSIS_MODEL, mode="ollama"):
         """
         Robustly computes metrics. 
         Attempts strict JSON parsing first, falls back to text scraping if model refuses JSON.
@@ -300,6 +317,10 @@ class DiarizationPipelineRunner:
         env["OLLAMA_MODELS"] = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
         env["OLLAMA_HOST"] = "127.0.0.1:11435"
 
+        if not self._wait_for_ollama_ready(ollama_bin, env):
+            print("WARNING: Ollama server is not ready yet; skipping auto-download.")
+            return
+
         # 2. Check if model exists
         try:
             print(f"Checking if model '{model_name}' exists...")
@@ -307,25 +328,122 @@ class DiarizationPipelineRunner:
                 [ollama_bin, "list"], 
                 env=env, 
                 capture_output=True, 
-                text=True
+                text=True,
+                timeout=30,
             )
+
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()
+                stdout = (result.stdout or "").strip()
+                print(f"Failed to list Ollama models (exit {result.returncode}).")
+                if stdout:
+                    print(f"stdout: {stdout}")
+                if stderr:
+                    print(f"stderr: {stderr}")
+                return
             
             if model_name not in result.stdout:
                 print(f"Model '{model_name}' not found. Downloading automatically... (This may take time)")
                 self._set_status(f"Downloading AI model ({model_name})...")
                 
                 # Run Pull
-                subprocess.run(
+                pull_result = subprocess.run(
                     [ollama_bin, "pull", model_name], 
                     env=env, 
-                    check=True
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
                 )
+                if pull_result.returncode != 0:
+                    stderr = (pull_result.stderr or "").strip()
+                    stdout = (pull_result.stdout or "").strip()
+                    print(f"Failed to download model '{model_name}' (exit {pull_result.returncode}).")
+                    if stdout:
+                        print(f"stdout: {stdout}")
+                    if stderr:
+                        print(f"stderr: {stderr}")
+                    return
+
                 print(f"Model '{model_name}' downloaded successfully.")
             else:
                 print(f"Model '{model_name}' is ready.")
 
         except Exception as e:
             print(f"Failed to auto-download model: {e}")
+
+    def _wait_for_ollama_ready(self, ollama_bin: str, env: dict, timeout_s: int = 30) -> bool:
+        """
+        Wait until the bundled Ollama server responds to `ollama list`.
+        """
+        import subprocess
+
+        deadline = time.time() + timeout_s
+        last_error = None
+        while time.time() < deadline:
+            try:
+                result = subprocess.run(
+                    [ollama_bin, "list"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    return True
+
+                stderr = (result.stderr or "").strip()
+                stdout = (result.stdout or "").strip()
+                last_error = stderr or stdout or f"exit {result.returncode}"
+            except Exception as e:
+                last_error = str(e)
+
+            time.sleep(0.5)
+
+        print(f"WARNING: Ollama server at {env.get('OLLAMA_HOST')} was not ready after {timeout_s}s: {last_error}")
+        return False
+
+    def _current_runtime_flags(self) -> dict:
+        return {
+            "apple_silicon": is_apple_silicon(),
+        }
+
+    def _build_processing_notes(self, meta: dict) -> List[str]:
+        notes = []
+        for key in ("notes", "warnings", "limitations"):
+            value = meta.get(key)
+            if isinstance(value, list):
+                notes.extend([str(v) for v in value if v])
+            elif isinstance(value, str) and value:
+                notes.append(value)
+        return notes
+
+    def _speaker_labels_from_result(self, result: dict) -> List[str]:
+        speakers = []
+        for seg in result.get("segments", []) if result else []:
+            speaker = seg.get("speaker")
+            if speaker and speaker not in speakers:
+                speakers.append(speaker)
+        return speakers
+
+    def _segments_to_text(
+        self,
+        segments: List[dict],
+        *,
+        include_speaker: bool = True,
+        highlight_low_confidence: bool = False,
+    ) -> str:
+        lines: List[str] = []
+        for seg in segments or []:
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+
+            speaker = seg.get("speaker", "")
+            label = f"{speaker}: " if include_speaker and speaker else ""
+            if highlight_low_confidence and seg.get("low_confidence"):
+                label = "[LOW] " + label
+            lines.append(label + text)
+        return "\n".join(lines)
 
     def process_audio(
         self,
@@ -336,100 +454,160 @@ class DiarizationPipelineRunner:
         num_speakers: Optional[int] = None,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
-       
-        ):
+        backend: str = "auto",
+        diarization_backend: str = "pyannote",
+        apple_compute_preference: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ):
         """
-        Run transcription + alignment + diarization on the given audio file.
+        Run transcription + diarization on the given audio file.
         """
-        
-        # REMOVED: The check for hf_token
-        
+
         self.last_audio_path = audio_path
         self.last_output_dir = output_dir
         self.last_result = None
         self.last_diar_df = None
+        self.last_preprocessed_audio_path = None
+        self.last_processing_meta = {}
 
-        self._set_status("Detecting device...")
+        self._set_status("Preparing audio...")
         self._set_progress(5)
-        device = detect_device()
-        compute_type = "int8" if device == "cpu" else "float16"
+        cache_dir = os.path.join(output_dir, ".cache")
+        preprocess = preprocess_audio_mono_16k(audio_path, cache_dir)
+        self.last_preprocessed_audio_path = preprocess.normalized_path
 
-        self._set_status(f"Loading WhisperX model ({model_size}) on {device}...")
+        asr_backend, asr_resolution = resolve_asr_backend(backend)
+        diar_backend, diar_resolution = resolve_diarization_backend(diarization_backend)
+
+        if batch_size is None:
+            preset = (apple_compute_preference or "balanced").strip().lower()
+            batch_size = {"memory_saver": 1, "balanced": 2, "quality": 4}.get(preset, 2)
+
+        device_hint = detect_device()
+        asr_config = {
+            "device": device_hint,
+            "compute_type": "int8" if device_hint == "cpu" else "float16",
+            "batch_size": batch_size,
+            "apple_compute_preference": apple_compute_preference,
+        }
+
+        self._set_status(f"Loading ASR backend ({asr_resolution['selected']})...")
         self._set_progress(15)
-        model = whisperx.load_model(
-            model_size, device=device, compute_type=compute_type
-        )
-
-        self._set_status("Loading audio...")
-        self._set_progress(25)
-        audio = whisperx.load_audio(audio_path)
-
-        self._set_status("Transcribing...")
-        self._set_progress(50)
-        result = model.transcribe(audio, language=language, task="transcribe")
-
-        self._set_status("Loading alignment model...")
-        self._set_progress(60)
-        align_model, metadata = whisperx.load_align_model(
-            language_code=result["language"], device=device
-        )
-
-        self._set_status("Aligning words...")
-        self._set_progress(70)
-        result = whisperx.align(
-            result["segments"],
-            align_model,
-            metadata,
-            audio,
-            device,
-            return_char_alignments=False,
-        )
-
-        # --- CHANGED: Use Offline Loader ---
-        self._set_status("Running diarization (offline model)...")
-        self._set_progress(85)
-
-        # Use the helper we wrote to load local files
-        try:
-            diar_pipeline = load_offline_pipeline()
-        except Exception as e:
-            raise RuntimeError(f"Failed to load offline Pyannote model: {e}")
-
-        # Run inference
-        # new:
-        kwargs = {}
-        if num_speakers:
-            kwargs["num_speakers"] = int(num_speakers)
-        if min_speakers:
-            kwargs["min_speakers"] = int(min_speakers)
-        if max_speakers:
-            kwargs["max_speakers"] = int(max_speakers)
-
-        try:
-            annotation = diar_pipeline(audio_path, **kwargs)
-        except TypeError:
-            # If the loaded pipeline doesn't accept these kwargs for some reason,
-            # fall back gracefully.
-            annotation = diar_pipeline(audio_path)
-        # -----------------------------------
-
-        segments = []
-        for segment, _, speaker in annotation.itertracks(yield_label=True):
-            segments.append(
-                {
-                    "start": float(segment.start),
-                    "end": float(segment.end),
-                    "speaker": speaker,
-                }
+        if asr_resolution.get("fallback"):
+            self._set_status(
+                f"ASR fallback active: {asr_resolution['selected']} (requested {asr_resolution['requested']})"
             )
 
-        diarize_df = pd.DataFrame(segments)
+        model_requested = model_size
+        model_used = model_size
+        model_fallback = None
+        try:
+            asr_result = asr_backend.transcribe(
+                preprocess.normalized_path,
+                model_size=model_requested,
+                language=language,
+                config=asr_config,
+            )
+        except Exception as first_error:
+            if model_requested == "large-v3":
+                model_used = "turbo"
+                model_fallback = "turbo"
+                self._set_status("large-v3 failed; retrying with turbo...")
+                try:
+                    asr_result = asr_backend.transcribe(
+                        preprocess.normalized_path,
+                        model_size=model_used,
+                        language=language,
+                        config=asr_config,
+                    )
+                except Exception:
+                    raise first_error
+            else:
+                raise
 
-        self._set_status("Assigning speakers to words/segments...")
-        result = whisperx.assign_word_speakers(diarize_df, result)
+        self._set_status("Running diarization...")
+        self._set_progress(85)
 
+        diar_segments, diar_meta = diar_backend.diarize(
+            preprocess.normalized_path,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            config={"device": "cpu" if is_apple_silicon() else device_hint},
+        )
+        diarize_df = pd.DataFrame(diar_segments)
+
+        cleaned_segments, raw_segments = prepare_transcript_segments(asr_result.segments)
+        self._set_status("Assigning speakers to cleaned transcript...")
+        result_segments = assign_speakers_by_overlap(cleaned_segments, diar_segments)
+        raw_segments_with_speakers = assign_speakers_by_overlap(raw_segments, diar_segments)
+
+        raw_result = {
+            "segments": raw_segments_with_speakers,
+            "language": asr_result.language,
+            "metadata": {
+                "transcription": {
+                    "backend": asr_result.backend,
+                    "device": asr_result.device,
+                    "compute_type": asr_result.compute_type,
+                    "requested_backend": asr_resolution["requested"],
+                    "selected_backend": asr_resolution["selected"],
+                    "fallback_backend": asr_resolution.get("fallback"),
+                    "model_requested": model_requested,
+                    "model_used": model_used,
+                    "model_fallback": model_fallback,
+                    "word_timestamps_available": asr_result.word_timestamps_available,
+                    "notes": asr_result.metadata,
+                },
+                "diarization": {
+                    "backend": diar_meta.get("backend", diar_backend.name),
+                    "device": diar_meta.get("device", "cpu"),
+                    "requested_backend": diar_resolution["requested"],
+                    "selected_backend": diar_resolution["selected"],
+                    "fallback_backend": diar_resolution.get("fallback"),
+                    "notes": diar_meta,
+                },
+                "audio": {
+                    "source_path": audio_path,
+                    "normalized_path": preprocess.normalized_path,
+                    "already_normalized": preprocess.already_normalized,
+                    "reused_cache": preprocess.reused_cache,
+                    "sample_rate": preprocess.sample_rate,
+                    "channels": preprocess.channels,
+                },
+            },
+        }
+
+        result = {
+            "segments": result_segments,
+            "language": asr_result.language,
+            "metadata": raw_result["metadata"],
+        }
+
+        self.last_raw_result = raw_result
         self.last_result = result
         self.last_diar_df = diarize_df
+        self.last_processing_meta = {
+            "backend": asr_resolution["selected"],
+            "backend_requested": asr_resolution["requested"],
+            "backend_fallback": asr_resolution.get("fallback"),
+            "device": asr_result.device,
+            "compute_type": asr_result.compute_type,
+            "model_size": model_requested,
+            "model_used": model_used,
+            "model_fallback": model_fallback,
+            "language": language,
+            "batch_size": batch_size,
+            "apple_compute_preference": apple_compute_preference,
+            "word_timestamps_available": asr_result.word_timestamps_available,
+            "diarization_backend": diar_resolution["selected"],
+            "diarization_backend_requested": diar_resolution["requested"],
+            "diarization_backend_fallback": diar_resolution.get("fallback"),
+            "apple_silicon": is_apple_silicon(),
+            "preprocessed_audio_path": preprocess.normalized_path,
+            "preprocess_reused_cache": preprocess.reused_cache,
+            "preprocess_already_normalized": preprocess.already_normalized,
+        }
 
         self._set_status("Saving output files...")
         self._set_progress(95)
@@ -438,16 +616,44 @@ class DiarizationPipelineRunner:
         txt_path = os.path.join(output_dir, f"{basename}_diarized.txt")
         json_path = os.path.join(output_dir, f"{basename}_diarized.json")
 
-        with open(txt_path, "w", encoding="utf-8") as f:
-            for seg in result.get("segments", []):
-                speaker = seg.get("speaker", "UNKNOWN")
-                start = format_timestamp(seg.get("start"))
-                end = format_timestamp(seg.get("end"))
-                text = seg.get("text", "").strip()
-                f.write(f"[{speaker} {start} - {end}] {text}\n")
+        raw_txt_path = os.path.join(output_dir, f"{basename}_diarized_raw.txt")
+        raw_json_path = os.path.join(output_dir, f"{basename}_diarized_raw.json")
+        cleaned_txt_path = os.path.join(output_dir, f"{basename}_diarized_cleaned.txt")
+        artifact_path = os.path.join(output_dir, f"{basename}_transcript_artifact.json")
+        highlighted_path = os.path.join(output_dir, f"{basename}_diarized_highlighted.txt")
 
+        raw_txt = self._segments_to_text(raw_segments_with_speakers, include_speaker=True)
+        cleaned_txt = self._segments_to_text(result_segments, include_speaker=True)
+        highlighted_txt = self._segments_to_text(result_segments, include_speaker=True, highlight_low_confidence=True)
+
+        with open(raw_txt_path, "w", encoding="utf-8") as f:
+            f.write(raw_txt + ("\n" if raw_txt else ""))
+        with open(cleaned_txt_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_txt + ("\n" if cleaned_txt else ""))
+        with open(highlighted_path, "w", encoding="utf-8") as f:
+            f.write(highlighted_txt + ("\n" if highlighted_txt else ""))
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_txt + ("\n" if cleaned_txt else ""))
+
+        with open(raw_json_path, "w", encoding="utf-8") as f:
+            json.dump(raw_result, f, ensure_ascii=False, indent=2)
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
+        with open(artifact_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "settings": self.last_processing_meta,
+                    "audio": raw_result["metadata"]["audio"],
+                    "raw_transcript": raw_txt,
+                    "cleaned_transcript": cleaned_txt,
+                    "highlighted_transcript": highlighted_txt,
+                    "raw_result": raw_result,
+                    "cleaned_result": result,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
 
         self._set_status("Done")
         self._set_progress(100)
@@ -498,25 +704,37 @@ class DiarizationPipelineRunner:
         base_url = api_url.rsplit("/api/", 1)[0]
         tags_url = f"{base_url}/api/tags"
 
+        # Give the bundled server a short grace period to come up.
+        deadline = time.time() + 15
+        last_error = None
+        while time.time() < deadline:
+            try:
+                resp = requests.get(tags_url, timeout=3)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    available_models = [m.get("name", "") for m in data.get("models", [])]
+
+                    # Simple check: exact match or match before colon
+                    # e.g. "mistral" matches "mistral:latest"
+                    for avail in available_models:
+                        if avail == model_name:
+                            return True
+                        if ":" in avail and avail.split(":")[0] == model_name:
+                            return True
+                    return False
+
+                last_error = f"HTTP {resp.status_code}"
+            except Exception as e:
+                last_error = str(e)
+
+            time.sleep(0.5)
+
         try:
-            resp = requests.get(tags_url, timeout=3)
-            if resp.status_code != 200:
-                return False
-            data = resp.json()
-            # data['models'] is a list of dicts: [{'name': 'mistral:latest', ...}, ...]
-            available_models = [m.get("name", "") for m in data.get("models", [])]
-            
-            # Simple check: exact match or match before colon
-            # e.g. "mistral" matches "mistral:latest"
-            for avail in available_models:
-                if avail == model_name:
-                    return True
-                if ":" in avail and avail.split(":")[0] == model_name:
-                    return True
-            return False
+            print(f"WARNING: Ollama tags endpoint was not reachable: {last_error}")
         except Exception:
             # If Ollama is down or network error, assume False
             return False
+        return False
 
     def analyze_with_llm(
         self,
@@ -562,7 +780,7 @@ class DiarizationPipelineRunner:
             
         elif provider == "ollama":
             target_url = api_url or "http://127.0.0.1:11435/api/generate"
-            target_model = model or "llama3.2"
+            target_model = model or DEFAULT_OLLAMA_ANALYSIS_MODEL
 
             payload = {
                 "model": target_model,
@@ -579,7 +797,7 @@ class DiarizationPipelineRunner:
                 # Custom Error Handling for 404 (Model Not Found)
                 if resp.status_code == 404:
                     print(f"ERROR: Ollama returned 404. It likely cannot find model '{target_model}' or the URL '{target_url}' is wrong.")
-                    return "Error: Model not found. Please run 'ollama pull llama3.2' in terminal."
+                    return f"Error: Model not found. Please run 'ollama pull {target_model}' in terminal."
                     
                 resp.raise_for_status()
                 data = resp.json()
@@ -606,7 +824,9 @@ class DiarizationPipelineRunner:
         """
         meta_path = os.path.join(lesson_dir, "meta.json")
         seg_path = os.path.join(lesson_dir, "segments.json")
+        raw_seg_path = os.path.join(lesson_dir, "segments_raw.json")
         diar_path = os.path.join(lesson_dir, "diarization.json")
+        artifact_path = os.path.join(lesson_dir, "transcript_artifact.json")
 
         if not os.path.isfile(seg_path):
             raise FileNotFoundError(f"Missing segments.json in {lesson_dir}")
@@ -617,12 +837,34 @@ class DiarizationPipelineRunner:
         # segments.json is a list of segments; pipeline expects {"segments": [...]}
         self.last_result = {"segments": segments}
         self.last_output_dir = lesson_dir
+        self.last_raw_result = self.last_result
+
+        if os.path.isfile(raw_seg_path):
+            try:
+                with open(raw_seg_path, "r", encoding="utf-8") as f:
+                    raw_segments = json.load(f) or []
+                self.last_raw_result = {"segments": raw_segments}
+            except Exception:
+                pass
 
         # Load meta (optional)
         meta = {}
         if os.path.isfile(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f) or {}
+        if os.path.isfile(artifact_path):
+            try:
+                with open(artifact_path, "r", encoding="utf-8") as f:
+                    artifact = json.load(f) or {}
+                if artifact.get("settings"):
+                    self.last_processing_meta = artifact["settings"]
+            except Exception:
+                artifact = {}
+        if not self.last_processing_meta:
+            self.last_processing_meta = meta.get("processing", meta.get("backend_info", {})) or {
+                "backend": meta.get("asr_backend"),
+                "diarization_backend": meta.get("diarization_backend"),
+            }
 
         # Option (2): use original audio path from meta, but only if it still exists
         # Support multiple historical key names to be robust:
@@ -636,6 +878,16 @@ class DiarizationPipelineRunner:
             self.last_audio_path = audio_path
         else:
             self.last_audio_path = None
+
+        normalized_audio_path = (
+            meta.get("normalized_audio_path")
+            or meta.get("cached_audio_path")
+            or os.path.join(lesson_dir, "normalized_audio.wav")
+        )
+        if normalized_audio_path and os.path.isfile(normalized_audio_path):
+            self.last_preprocessed_audio_path = normalized_audio_path
+        else:
+            self.last_preprocessed_audio_path = None
 
         # diarization df optional (needed for speaker WAV export)
         if os.path.isfile(diar_path):
@@ -698,24 +950,66 @@ class DiarizationPipelineRunner:
 
         os.makedirs(lesson_dir, exist_ok=True)
 
-        # 1) transcript.txt (human-readable)
-        transcript_path = os.path.join(lesson_dir, "transcript.txt")
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            f.write(self.get_transcript_text(include_speaker=True))
+        raw_segments = (self.last_raw_result or self.last_result or {}).get("segments", [])
+        cleaned_segments = (self.last_result or {}).get("segments", [])
 
-        # 2) segments.json (canonical for future features)
+        raw_segments_clean = []
+        for seg in raw_segments:
+            raw_segments_clean.append(
+                {
+                    "start": float(seg.get("start") or 0.0),
+                    "end": float(seg.get("end") or 0.0),
+                    "speaker": seg.get("speaker") or "UNKNOWN",
+                    "text": (seg.get("raw_text") or seg.get("text") or "").strip(),
+                    "confidence": float(seg.get("confidence") or 0.0) if seg.get("confidence") is not None else None,
+                    "low_confidence": bool(seg.get("low_confidence", False)),
+                    "confidence_reasons": seg.get("confidence_reasons", []),
+                }
+            )
+
         segments_clean = []
-        for seg in self.last_result["segments"]:
+        for seg in cleaned_segments:
             segments_clean.append(
                 {
                     "start": float(seg.get("start") or 0.0),
                     "end": float(seg.get("end") or 0.0),
                     "speaker": seg.get("speaker") or "UNKNOWN",
                     "text": (seg.get("text") or "").strip(),
+                    "raw_text": (seg.get("raw_text") or "").strip() or None,
+                    "cleaned_text": (seg.get("cleaned_text") or seg.get("text") or "").strip(),
+                    "confidence": float(seg.get("confidence") or 0.0) if seg.get("confidence") is not None else None,
+                    "low_confidence": bool(seg.get("low_confidence", False)),
+                    "confidence_reasons": seg.get("confidence_reasons", []),
+                    "cleanup_applied": bool(seg.get("cleanup_applied", False)),
                 }
             )
 
+        raw_transcript = self._segments_to_text(raw_segments, include_speaker=True)
+        cleaned_transcript = self._segments_to_text(cleaned_segments, include_speaker=True)
+        highlighted_transcript = self._segments_to_text(
+            cleaned_segments,
+            include_speaker=True,
+            highlight_low_confidence=True,
+        )
+
+        transcript_raw_path = os.path.join(lesson_dir, "transcript_raw.txt")
+        transcript_cleaned_path = os.path.join(lesson_dir, "transcript_cleaned.txt")
+        transcript_highlighted_path = os.path.join(lesson_dir, "transcript_cleaned_highlighted.txt")
+        transcript_path = os.path.join(lesson_dir, "transcript.txt")
+        segments_raw_path = os.path.join(lesson_dir, "segments_raw.json")
         segments_path = os.path.join(lesson_dir, "segments.json")
+
+        with open(transcript_raw_path, "w", encoding="utf-8") as f:
+            f.write(raw_transcript)
+        with open(transcript_cleaned_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_transcript)
+        with open(transcript_highlighted_path, "w", encoding="utf-8") as f:
+            f.write(highlighted_transcript)
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_transcript)
+
+        with open(segments_raw_path, "w", encoding="utf-8") as f:
+            json.dump(raw_segments_clean, f, ensure_ascii=False, indent=2)
         with open(segments_path, "w", encoding="utf-8") as f:
             json.dump(segments_clean, f, ensure_ascii=False, indent=2)
 
@@ -742,6 +1036,12 @@ class DiarizationPipelineRunner:
             if not os.path.isfile(dst):
                 shutil.copy2(self.last_audio_path, dst)
 
+        normalized_audio_path = None
+        if self.last_preprocessed_audio_path and os.path.isfile(self.last_preprocessed_audio_path):
+            normalized_audio_path = os.path.join(lesson_dir, "normalized_audio.wav")
+            if not os.path.isfile(normalized_audio_path):
+                shutil.copy2(self.last_preprocessed_audio_path, normalized_audio_path)
+
         # 4) meta.json
         meta = {
             "processed_at": datetime.now().isoformat(timespec="seconds"),
@@ -758,10 +1058,35 @@ class DiarizationPipelineRunner:
             "contextual": contextual,
             "llm_provider": llm_provider,
             "llm_model": llm_model,
+            "raw_transcript_file": "transcript_raw.txt",
+            "cleaned_transcript_file": "transcript_cleaned.txt",
+            "highlighted_transcript_file": "transcript_cleaned_highlighted.txt",
+            "raw_segments_file": "segments_raw.json",
+            "asr_backend": self.last_processing_meta.get("backend"),
+            "asr_backend_requested": self.last_processing_meta.get("backend_requested"),
+            "asr_backend_fallback": self.last_processing_meta.get("backend_fallback"),
+            "diarization_backend": self.last_processing_meta.get("diarization_backend"),
+            "diarization_backend_requested": self.last_processing_meta.get("diarization_backend_requested"),
+            "diarization_backend_fallback": self.last_processing_meta.get("diarization_backend_fallback"),
+            "device": self.last_processing_meta.get("device"),
+            "compute_type": self.last_processing_meta.get("compute_type"),
+            "batch_size": self.last_processing_meta.get("batch_size"),
+            "apple_compute_preference": self.last_processing_meta.get("apple_compute_preference"),
+            "word_timestamps_available": self.last_processing_meta.get("word_timestamps_available"),
+            "apple_silicon": self.last_processing_meta.get("apple_silicon"),
+            "preprocess_reused_cache": self.last_processing_meta.get("preprocess_reused_cache"),
+            "preprocess_already_normalized": self.last_processing_meta.get("preprocess_already_normalized"),
+            "normalized_audio_path": normalized_audio_path,
+            "processing": self.last_processing_meta,
             "files": {
                 "transcript": "transcript.txt",
+                "transcript_raw": "transcript_raw.txt",
+                "transcript_cleaned": "transcript_cleaned.txt",
                 "segments": "segments.json",
+                "segments_raw": "segments_raw.json",
                 "diarization": "diarization.json" if diar_path else None,
+                "normalized_audio": "normalized_audio.wav" if normalized_audio_path else None,
+                "transcript_artifact": "transcript_artifact.json",
             },
         }
         if extra_meta:
@@ -770,6 +1095,37 @@ class DiarizationPipelineRunner:
         meta_path = os.path.join(lesson_dir, "meta.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        artifact_path = os.path.join(lesson_dir, "transcript_artifact.json")
+        with open(artifact_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "settings": {
+                        "asr_backend": self.last_processing_meta.get("backend"),
+                        "asr_backend_requested": self.last_processing_meta.get("backend_requested"),
+                        "asr_backend_fallback": self.last_processing_meta.get("backend_fallback"),
+                        "diarization_backend": self.last_processing_meta.get("diarization_backend"),
+                        "diarization_backend_requested": self.last_processing_meta.get("diarization_backend_requested"),
+                        "diarization_backend_fallback": self.last_processing_meta.get("diarization_backend_fallback"),
+                        "device": self.last_processing_meta.get("device"),
+                        "compute_type": self.last_processing_meta.get("compute_type"),
+                        "model_size": whisper_model_size,
+                        "language": language,
+                        "batch_size": self.last_processing_meta.get("batch_size"),
+                        "apple_compute_preference": self.last_processing_meta.get("apple_compute_preference"),
+                        "apple_silicon": self.last_processing_meta.get("apple_silicon"),
+                    },
+                    "raw_transcript": raw_transcript,
+                    "cleaned_transcript": cleaned_transcript,
+                    "highlighted_transcript": highlighted_transcript,
+                    "raw_segments": raw_segments_clean,
+                    "cleaned_segments": segments_clean,
+                    "duration_sec": self._lesson_duration_sec(),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
 
         return meta
 
@@ -830,8 +1186,10 @@ class DiarizationPipelineRunner:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        audio = whisperx.load_audio(self.last_audio_path)
-        sr = 16000
+        audio_source = self.last_preprocessed_audio_path if self.last_preprocessed_audio_path else self.last_audio_path
+        audio, sr = sf.read(audio_source, dtype="float32", always_2d=False)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
 
         basename = os.path.splitext(os.path.basename(self.last_audio_path))[0]
 

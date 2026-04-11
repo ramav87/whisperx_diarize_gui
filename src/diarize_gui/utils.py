@@ -1,19 +1,53 @@
 """
-Utility functions for device selection and timestamp formatting.
+Utility functions for hardware detection, timestamp formatting, and config helpers.
 """
+
+import base64
+import os
+import platform
+import sys
+from typing import Dict, Optional
 
 import torch
 
 
 def detect_device() -> str:
     """
-    Choose best available device for WhisperX: cuda > cpu.
-    (We deliberately do NOT return 'mps' because WhisperX
-    does not support it and will raise 'unsupported device mps'.)
+    Choose the best device for the current runtime.
+    WhisperX paths still prefer cuda > cpu, while Apple Silicon
+    specific backends can separately use MPS when supported.
     """
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+def is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def is_apple_silicon() -> bool:
+    return is_macos() and platform.machine().lower() in {"arm64", "aarch64"}
+
+
+def detect_processing_platform() -> str:
+    """
+    Returns one of: 'apple_silicon', 'mac_intel', 'other'.
+    """
+    if is_apple_silicon():
+        return "apple_silicon"
+    if is_macos():
+        return "mac_intel"
+    return "other"
+
+
+def default_asr_backend() -> str:
+    """
+    Runtime default for transcription backend.
+    """
+    if is_apple_silicon():
+        return "auto"
+    return "whisperx"
 
 
 def format_timestamp(seconds: float) -> str:
@@ -32,8 +66,6 @@ def format_timestamp(seconds: float) -> str:
     s = s % 60
 
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-import base64
 
 _OBFUSCATION_PREFIX = "obf:v1:"
 

@@ -11,6 +11,8 @@ import matplotlib
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
 from .theme import AppTheme
+from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL
+from .lesson_selection import select_pending_ai_lesson_dirs
 
 # Use a safe backend for macOS/Windows
 matplotlib.use("TkAgg")
@@ -234,7 +236,7 @@ class DashboardFrame(ctk.CTkFrame):
         return frame
 
     def run_ai_analysis(self):
-        """Recomputes LLM analysis for every lesson with transcript data."""
+        """Recomputes LLM analysis for the newest unprocessed lessons only."""
         if not self.pipeline:
             self.status_lbl.configure(text="Error: Pipeline not connected")
             return
@@ -244,18 +246,8 @@ class DashboardFrame(ctk.CTkFrame):
         def _thread_target():
             lessons_dir = os.path.join(self.profile_dir, "lessons")
             if not os.path.isdir(lessons_dir): return
-            
-            all_lessons = sorted(os.listdir(lessons_dir), reverse=True)
-            to_process = []
-            
-            # Identify lessons that have enough data to analyze.
-            for lid in all_lessons:
-                path = os.path.join(lessons_dir, lid)
-                if not os.path.isdir(path): continue
-                meta_path = os.path.join(path, "meta.json")
-                seg_path = os.path.join(path, "segments.json")
-                if os.path.isfile(meta_path) and os.path.isfile(seg_path):
-                    to_process.append(path)
+
+            to_process = select_pending_ai_lesson_dirs(lessons_dir)
             
             total = len(to_process)
             if total == 0:
@@ -268,7 +260,7 @@ class DashboardFrame(ctk.CTkFrame):
                 msg = f"Analyzing {i+1}/{total}..."
                 self.after(0, lambda m=msg: self.status_lbl.configure(text=m))
                 
-                success = self.pipeline.compute_ai_metrics(path, model="llama3.2")
+                success = self.pipeline.compute_ai_metrics(path, model=DEFAULT_OLLAMA_ANALYSIS_MODEL)
                 if success:
                     processed += 1
                 else:
@@ -279,7 +271,7 @@ class DashboardFrame(ctk.CTkFrame):
         threading.Thread(target=_thread_target, daemon=True).start()
 
     def _on_ai_finished(self, count, total):
-        self.ai_btn.configure(state="normal", text="✨ Compute All AI Metrics")
+        self.ai_btn.configure(state="normal", text="✨ Compute Recent AI Metrics")
         if total == 0:
             self.status_lbl.configure(text="No analyzable lessons found.")
         else:

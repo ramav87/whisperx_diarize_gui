@@ -11,8 +11,11 @@ import customtkinter as ctk
 from PIL import Image
 import stat
 import math
+import time
+from urllib.request import urlopen
 from .dashboard import DashboardFrame
 from .theme import AppTheme
+from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL
 
 # Import backend logic
 from .utils import obfuscate_secret, deobfuscate_secret, estimate_openai_cost
@@ -99,6 +102,28 @@ def start_bundled_ollama():
     except Exception as e:
         print(f"Failed to start bundled Ollama: {e}")
         return None
+
+
+def wait_for_ollama_server(timeout_s: int = 30) -> bool:
+    """
+    Wait for the bundled Ollama server to start responding.
+    """
+    url = "http://127.0.0.1:11435/api/tags"
+    deadline = time.time() + timeout_s
+    last_error = None
+
+    while time.time() < deadline:
+        try:
+            with urlopen(url, timeout=3) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception as e:
+            last_error = str(e)
+
+        time.sleep(0.5)
+
+    print(f"WARNING: Ollama server was not ready after {timeout_s}s: {last_error}")
+    return False
         
 def setup_ffmpeg_environment():
     """
@@ -571,11 +596,11 @@ class DiarizationApp:
 
         model_label = ctk.CTkLabel(config_row_top, text="Model size", text_color=AppTheme.TEXT_PRIMARY)
         model_label.pack(side="left", padx=(0, 8))
-        self.model_var = ctk.StringVar(value="small")
+        self.model_var = ctk.StringVar(value="large-v3")
         self.model_menu = ctk.CTkOptionMenu(
             config_row_top,
             variable=self.model_var,
-            values=["tiny", "base", "small", "medium", "large-v2"],
+            values=["turbo", "tiny", "base", "small", "medium", "large-v3", "large-v2"],
             width=104,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
@@ -615,6 +640,88 @@ class DiarizationApp:
             text_color=AppTheme.TEXT_MUTED,
             font=("Roboto", 10),
         ).pack(side="left", padx=(8, 0))
+
+        # Hardware-aware backend controls
+        backend_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        backend_row.pack(fill="x", pady=(10, 0))
+
+        asr_label = ctk.CTkLabel(backend_row, text="ASR backend", text_color=AppTheme.TEXT_PRIMARY)
+        asr_label.pack(side="left", padx=(0, 8))
+        ToolTip(
+            asr_label,
+            "Auto uses MLX Whisper on Apple Silicon when available.\n"
+            "Fallbacks: openai-whisper on MPS/CPU, then WhisperX."
+        )
+
+        self.backend_var = ctk.StringVar(value=self.profile_config.get("asr_backend", "auto"))
+        self.backend_menu = ctk.CTkOptionMenu(
+            backend_row,
+            variable=self.backend_var,
+            values=["auto", "mlx", "whisper_mps", "whisperx"],
+            width=132,
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+            button_color=AppTheme.BORDER_DIVIDER
+        )
+        self.backend_menu.pack(side="left", padx=(0, 18))
+
+        diar_label = ctk.CTkLabel(backend_row, text="Diarization", text_color=AppTheme.TEXT_PRIMARY)
+        diar_label.pack(side="left", padx=(0, 8))
+        ToolTip(
+            diar_label,
+            "Pyannote remains the default. SpeakerKit is a future Apple-native hook."
+        )
+
+        self.diar_backend_var = ctk.StringVar(value=self.profile_config.get("diarization_backend", "pyannote"))
+        self.diar_backend_menu = ctk.CTkOptionMenu(
+            backend_row,
+            variable=self.diar_backend_var,
+            values=["pyannote", "speakerkit_future"],
+            width=160,
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+            button_color=AppTheme.BORDER_DIVIDER
+        )
+        self.diar_backend_menu.pack(side="left", padx=(0, 18))
+
+        tune_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        tune_row.pack(fill="x", pady=(8, 0))
+
+        apple_label = ctk.CTkLabel(tune_row, text="Apple preset", text_color=AppTheme.TEXT_PRIMARY)
+        apple_label.pack(side="left", padx=(0, 8))
+        ToolTip(
+            apple_label,
+            "Balanced keeps memory usage conservative.\n"
+            "Memory Saver reduces batch size; Quality is slightly more aggressive."
+        )
+
+        self.apple_compute_var = ctk.StringVar(value=self.profile_config.get("apple_compute_preference", "balanced"))
+        self.apple_compute_menu = ctk.CTkOptionMenu(
+            tune_row,
+            variable=self.apple_compute_var,
+            values=["memory_saver", "balanced", "quality"],
+            width=132,
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+            button_color=AppTheme.BORDER_DIVIDER
+        )
+        self.apple_compute_menu.pack(side="left", padx=(0, 18))
+
+        batch_label = ctk.CTkLabel(tune_row, text="Batch size", text_color=AppTheme.TEXT_PRIMARY)
+        batch_label.pack(side="left", padx=(0, 8))
+        ToolTip(batch_label, "Smaller batch sizes are safer on MacBooks with limited memory.")
+
+        self.batch_size_var = ctk.StringVar(value=str(self.profile_config.get("batch_size", "2")))
+        self.batch_size_menu = ctk.CTkOptionMenu(
+            tune_row,
+            variable=self.batch_size_var,
+            values=["1", "2", "4", "8"],
+            width=96,
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+            button_color=AppTheme.BORDER_DIVIDER
+        )
+        self.batch_size_menu.pack(side="left")
 
         # 4. ACTION CARD (Run + Progress + Status)
         self.action_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
@@ -977,6 +1084,32 @@ class DiarizationApp:
         except Exception as e:
             messagebox.showerror("Error", f"Could not save profile config: {e}")
 
+    def _apply_profile_config_to_controls(self):
+        cfg = self.profile_config or {}
+        for attr, key in (
+            ("model_var", "whisper_model_size"),
+            ("lang_var", "language"),
+            ("context_var", "contextual"),
+            ("backend_var", "asr_backend"),
+            ("diar_backend_var", "diarization_backend"),
+            ("apple_compute_var", "apple_compute_preference"),
+            ("batch_size_var", "batch_size"),
+        ):
+            if not hasattr(self, attr):
+                continue
+            try:
+                widget_var = getattr(self, attr)
+                value = cfg.get(key)
+                if value is not None:
+                    if key == "batch_size":
+                        widget_var.set(str(value))
+                    elif key == "contextual":
+                        widget_var.set(bool(value))
+                    else:
+                        widget_var.set(value)
+            except Exception:
+                pass
+
     def _cleanup_ollama(self):
         if hasattr(self, 'ollama_process') and self.ollama_process:
             self.ollama_process.terminate()
@@ -1159,6 +1292,7 @@ class DiarizationApp:
             self.profile_name = name
             self.profile_label.configure(text=f"Profile: {name}")
             self.profile_config = self._load_profile_config()
+            self._apply_profile_config_to_controls()
             
             # --- ADD THIS BLOCK ---
             # Reload Dashboard
@@ -1200,6 +1334,7 @@ class DiarizationApp:
             self.profile_name = name.strip()
             self.profile_label.configure(text=f"Profile: {self.profile_name}")
             self.profile_config = self._load_profile_config()
+            self._apply_profile_config_to_controls()
     
     # --- BATCH IMPORT LOGIC ---
     def run_batch_import(self):
@@ -1241,11 +1376,11 @@ class DiarizationApp:
 
         # 1. Model Size
         ctk.CTkLabel(form, text="Model Size:", anchor="w").grid(row=0, column=0, sticky="w", pady=10)
-        model_var = ctk.StringVar(value="medium")
+        model_var = ctk.StringVar(value="large-v3")
         model_menu = ctk.CTkOptionMenu(
             form, 
             variable=model_var,
-            values=["tiny", "base", "small", "medium", "large-v2"]
+            values=["turbo", "tiny", "base", "small", "medium", "large-v3", "large-v2"]
         )
         model_menu.grid(row=0, column=1, sticky="e", pady=10)
 
@@ -1335,7 +1470,11 @@ class DiarizationApp:
                     output_dir=lesson_dir,
                     model_size=model_size,     # <--- Use arg
                     language=language,         # <--- Use arg
-                    num_speakers=num_speakers  # <--- Use arg
+                    num_speakers=num_speakers,  # <--- Use arg
+                    backend=self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                    diarization_backend=self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                    apple_compute_preference=self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else None,
+                    batch_size=int(self.batch_size_var.get()) if hasattr(self, "batch_size_var") and str(self.batch_size_var.get()).isdigit() else None,
                 )
 
                 # 3. Save Artifacts
@@ -1347,7 +1486,9 @@ class DiarizationApp:
                     contextual=False,
                     extra_meta={
                         "recorded_at": dt_obj.isoformat(),
-                        "batch_imported": True
+                        "batch_imported": True,
+                        "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                        "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
                     }
                 )
                 
@@ -1449,6 +1590,10 @@ class DiarizationApp:
                 model_size=self.model_var.get(),
                 language=lang_code,
                 num_speakers=num_speakers,
+                backend=self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                diarization_backend=self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                apple_compute_preference=self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else None,
+                batch_size=int(self.batch_size_var.get()) if hasattr(self, "batch_size_var") and str(self.batch_size_var.get()).isdigit() else None,
             )
             self.has_result = True
             self.master.after(0, self._enable_export_buttons)
@@ -1458,13 +1603,31 @@ class DiarizationApp:
             try:
                 self.current_lesson_dir = self._new_lesson_dir()
                 if self.current_lesson_dir:
+                    cfg = self._load_profile_config()
+                    cfg.update(
+                        {
+                            "whisper_model_size": self.model_var.get(),
+                            "language": self.lang_var.get(),
+                            "contextual": self.context_var.get(),
+                            "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                            "apple_compute_preference": self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else "balanced",
+                            "batch_size": self.batch_size_var.get() if hasattr(self, "batch_size_var") else "2",
+                        }
+                    )
+                    self._save_profile_config(cfg)
+                    self.profile_config = cfg
                     self.pipeline.save_lesson_artifacts(
                         self.current_lesson_dir,
                         profile_name=self.profile_name,
                         whisper_model_size=self.model_var.get(),
                         language=self.lang_var.get(),
                         contextual=self.context_var.get(),
-                        extra_meta={"recorded_at": self.recorder.recorded_at_time}
+                        extra_meta={
+                            "recorded_at": self.recorder.recorded_at_time,
+                            "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                        }
                     )
                     self.master.after(0, self._enforce_speaker_assignment_after_save)
             except Exception as e:
@@ -1498,6 +1661,10 @@ class DiarizationApp:
                             whisper_model_size=None,
                             language=None,
                             contextual=None,
+                            extra_meta={
+                                "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                                "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                            },
                         )
                         self.master.after(0, self._enforce_speaker_assignment_after_save)
                 except Exception as e:
@@ -1561,13 +1728,23 @@ class DiarizationApp:
             dur = meta.get("duration_sec", 0.0)
             nspk = meta.get("num_speakers", "—")
             nseg = meta.get("num_segments", "—")
+            asr_backend = meta.get("asr_backend", "—")
+            asr_device = meta.get("device", "—")
+            diar_backend = meta.get("diarization_backend", "—")
+            fallback = meta.get("asr_backend_fallback") or meta.get("diarization_backend_fallback")
+            fallback_line = f"\nFallback: {fallback}" if fallback else ""
 
             card = ctk.CTkFrame(scroll, fg_color="#2B2B2B")
             card.pack(fill="x", pady=5)
 
             lbl = ctk.CTkLabel(
                 card,
-                text=f"Date: {ts}\nSpeakers: {nspk} | Segments: {nseg} | Duration: {dur/60:.1f} min\nLLM: {provider} / {model}",
+                text=(
+                    f"Date: {ts}\n"
+                    f"Speakers: {nspk} | Segments: {nseg} | Duration: {dur/60:.1f} min\n"
+                    f"ASR: {asr_backend} ({asr_device}) | Diarization: {diar_backend}\n"
+                    f"LLM: {provider} / {model}{fallback_line}"
+                ),
                 justify="left",
             )
             lbl.pack(side="left", padx=10, pady=8)
@@ -1679,6 +1856,14 @@ class DiarizationApp:
 
         audio_status = ctk.CTkLabel(header, text=audio_text, text_color=audio_color)
         audio_status.pack(side="left", padx=(10, 8), pady=8)
+
+        btn_export_analysis = ctk.CTkButton(
+            header,
+            text="Export analysis…",
+            width=150,
+            command=lambda d=lesson_dir: self._export_lesson_analysis(d),
+        )
+        btn_export_analysis.pack(side="right", padx=(0, 10), pady=8)
 
         btn_relink = ctk.CTkButton(
             header,
@@ -1843,7 +2028,7 @@ class DiarizationApp:
 
         ctk.CTkLabel(model_row, text="Model:", width=60).pack(side="left")
 
-        self.ollama_models = ["mistral", "mixtral", "gemma:2b", "llama3.2", "qwen2.5"]
+        self.ollama_models = ["mistral", "mixtral", "gemma:2b", DEFAULT_OLLAMA_ANALYSIS_MODEL, "qwen2.5"]
         self.openai_models = ["gpt-4o", "gpt-4o-mini", "gpt-5.1", "gpt-5.2"]
         
         # Pick model default from profile depending on provider
@@ -1851,7 +2036,7 @@ class DiarizationApp:
         if provider0 == "openai":
             default_model = self.profile_config.get("openai_model", "gpt-5.2")
         else:
-            default_model = self.profile_config.get("ollama_model", "mistral")
+            default_model = self.profile_config.get("ollama_model", DEFAULT_OLLAMA_ANALYSIS_MODEL)
 
         self.analysis_model_var = ctk.StringVar(value=default_model)
 
@@ -1907,7 +2092,7 @@ class DiarizationApp:
             else:
                 self.model_menu.configure(values=self.ollama_models)
                 if self.analysis_model_var.get() not in self.ollama_models:
-                    self.analysis_model_var.set(self.profile_config.get("ollama_model", "mistral"))
+                    self.analysis_model_var.set(DEFAULT_OLLAMA_ANALYSIS_MODEL)
                 self.openai_key_entry.configure(state="disabled")
                 self.save_key_cb.configure(state="disabled")
             update_cost_estimate()
@@ -2200,7 +2385,23 @@ class DiarizationApp:
                 if not os.path.exists(ollama_bin):
                     raise FileNotFoundError(f"Ollama binary not found at: {ollama_bin}")
 
-                subprocess.run([ollama_bin, "pull", model_name], env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if not wait_for_ollama_server(timeout_s=30):
+                    raise RuntimeError("Ollama server did not become ready in time.")
+
+                result = subprocess.run(
+                    [ollama_bin, "pull", model_name],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=3600,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        "Ollama pull failed.\n"
+                        f"stdout:\n{result.stdout or ''}\n"
+                        f"stderr:\n{result.stderr or ''}"
+                    )
                 self.master.after(0, lambda: messagebox.showinfo("Success", "Model Installed!"))
             except Exception as e:
                 msg = str(e)
@@ -2416,13 +2617,16 @@ class DiarizationApp:
         # Pre-select from existing mapping if present
         speaker_map_path = os.path.join(lesson_dir, "speaker_map.json")
         pre_selected = set()
+        existing_map = {}
         if os.path.isfile(speaker_map_path):
             try:
                 with open(speaker_map_path, "r", encoding="utf-8") as f:
                     existing = json.load(f) or {}
                 pre_selected = set(existing.get("student_speakers") or [])
+                existing_map = existing.get("map") or {}
             except Exception:
                 pre_selected = set()
+                existing_map = {}
 
         # --- Window ---
         win = ctk.CTkToplevel(self.master)
@@ -2472,6 +2676,7 @@ class DiarizationApp:
 
         # State vars
         spk_vars: dict[str, ctk.BooleanVar] = {}
+        canonical_vars: dict[str, ctk.StringVar] = {}
 
         def update_preview(_evt=None):
             selected = {spk for spk, v in spk_vars.items() if v.get()}
@@ -2489,12 +2694,27 @@ class DiarizationApp:
             btn_save.configure(state="normal" if selected else "disabled")
 
 
-        # Build speaker checkboxes
+        # Build speaker review rows
         for spk in speakers:
             var = ctk.BooleanVar(value=(spk in pre_selected))
             spk_vars[spk] = var
-            cb = ctk.CTkCheckBox(spk_scroll, text=spk, variable=var, command=update_preview)
-            cb.pack(anchor="w", padx=10, pady=6)
+            row = ctk.CTkFrame(spk_scroll, fg_color="transparent")
+            row.pack(fill="x", padx=6, pady=6)
+
+            cb = ctk.CTkCheckBox(row, text="Student", variable=var, command=update_preview, width=90)
+            cb.pack(side="left")
+
+            ctk.CTkLabel(row, text=spk, width=110, anchor="w").pack(side="left", padx=(6, 6))
+
+            canonical_var = ctk.StringVar(value=str(existing_map.get(spk, spk)))
+            canonical_vars[spk] = canonical_var
+            canonical_entry = ctk.CTkEntry(
+                row,
+                textvariable=canonical_var,
+                width=110,
+                placeholder_text="Canonical",
+            )
+            canonical_entry.pack(side="left", padx=(0, 6), fill="x", expand=True)
 
         # Initialize preview
         self.master.after(0, update_preview)
@@ -2513,13 +2733,21 @@ class DiarizationApp:
                 messagebox.showwarning("Required", "Please select at least one Student speaker.")
                 return
 
+            speaker_map = {}
+            for spk, var in canonical_vars.items():
+                canonical = (var.get() or spk).strip()
+                speaker_map[spk] = canonical or spk
+
+            student_canonical = sorted({speaker_map.get(spk, spk) for spk in selected})
+
             # Write speaker_map.json
             payload = {
                 "version": 1,
                 "assigned_at": datetime.now().isoformat(timespec="seconds"),
-                "student_speakers": selected,
-                "num_student_speakers": len(selected),
-                "map": {spk: ("student" if spk in selected else "other") for spk in speakers},
+                "student_speakers": student_canonical,
+                "num_student_speakers": len(student_canonical),
+                "map": speaker_map,
+                "original_speakers": speakers,
             }
             try:
                 with open(speaker_map_path, "w", encoding="utf-8") as f:
@@ -2528,28 +2756,131 @@ class DiarizationApp:
                 messagebox.showerror("Error", f"Failed to write speaker_map.json:\n{e}")
                 return
 
-            # Patch meta.json
-            meta_path = os.path.join(lesson_dir, "meta.json")
-            meta = {}
-            if os.path.isfile(meta_path):
-                try:
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f) or {}
-                except Exception:
-                    meta = {}
-
-            meta["has_speaker_map"] = True
-            meta["student_speakers"] = selected
-            meta["speaker_map_file"] = "speaker_map.json"
-            meta["speaker_map_updated_at"] = datetime.now().isoformat(timespec="seconds")
-
+            # Rewrite cleaned lesson artifacts so analysis sees the merged labels
             try:
-                with open(meta_path, "w", encoding="utf-8") as f:
-                    json.dump(meta, f, ensure_ascii=False, indent=2)
+                segments_path = os.path.join(lesson_dir, "segments.json")
+                transcript_path = os.path.join(lesson_dir, "transcript.txt")
+                transcript_cleaned_path = os.path.join(lesson_dir, "transcript_cleaned.txt")
+                transcript_highlighted_path = os.path.join(lesson_dir, "transcript_cleaned_highlighted.txt")
+                artifact_path = os.path.join(lesson_dir, "transcript_artifact.json")
+                meta_path = os.path.join(lesson_dir, "meta.json")
+                diar_path = os.path.join(lesson_dir, "diarization.json")
+
+                with open(segments_path, "r", encoding="utf-8") as f:
+                    current_segments = json.load(f) or []
+
+                updated_segments = []
+                for seg in current_segments:
+                    updated = dict(seg)
+                    src_spk = str(updated.get("speaker") or "UNKNOWN")
+                    updated["speaker"] = speaker_map.get(src_spk, src_spk)
+                    updated_segments.append(updated)
+
+                raw_seg_path = os.path.join(lesson_dir, "segments_raw.json")
+                raw_segments = []
+                if os.path.isfile(raw_seg_path):
+                    try:
+                        with open(raw_seg_path, "r", encoding="utf-8") as f:
+                            raw_segments = json.load(f) or []
+                    except Exception:
+                        raw_segments = []
+
+                updated_raw_segments = []
+                for seg in raw_segments:
+                    updated = dict(seg)
+                    src_spk = str(updated.get("speaker") or "UNKNOWN")
+                    updated["speaker"] = speaker_map.get(src_spk, src_spk)
+                    updated_raw_segments.append(updated)
+
+                def fmt_line(seg, highlight=False):
+                    speaker = seg.get("speaker", "UNKNOWN")
+                    text = (seg.get("text") or "").strip()
+                    label = "[LOW] " if highlight and seg.get("low_confidence") else ""
+                    return f"{label}{speaker}: {text}"
+
+                cleaned_text = "\n".join(fmt_line(seg) for seg in updated_segments)
+                highlighted_text = "\n".join(fmt_line(seg, highlight=True) for seg in updated_segments)
+                raw_text = "\n".join(fmt_line(seg) for seg in updated_raw_segments)
+
+                with open(segments_path, "w", encoding="utf-8") as f:
+                    json.dump(updated_segments, f, ensure_ascii=False, indent=2)
+                if os.path.isfile(raw_seg_path):
+                    with open(raw_seg_path, "w", encoding="utf-8") as f:
+                        json.dump(updated_raw_segments, f, ensure_ascii=False, indent=2)
+
+                with open(transcript_path, "w", encoding="utf-8") as f:
+                    f.write(cleaned_text + ("\n" if cleaned_text else ""))
+                if os.path.isfile(transcript_cleaned_path):
+                    with open(transcript_cleaned_path, "w", encoding="utf-8") as f:
+                        f.write(cleaned_text + ("\n" if cleaned_text else ""))
+                if os.path.isfile(transcript_highlighted_path):
+                    with open(transcript_highlighted_path, "w", encoding="utf-8") as f:
+                        f.write(highlighted_text + ("\n" if highlighted_text else ""))
+
+                if os.path.isfile(artifact_path):
+                    try:
+                        with open(artifact_path, "r", encoding="utf-8") as f:
+                            artifact = json.load(f) or {}
+                    except Exception:
+                        artifact = {}
+                    artifact["cleaned_transcript"] = cleaned_text
+                    artifact["highlighted_transcript"] = highlighted_text
+                    artifact["cleaned_segments"] = updated_segments
+                    artifact["raw_segments"] = updated_raw_segments or artifact.get("raw_segments", [])
+                    artifact["speaker_map"] = payload
+                    with open(artifact_path, "w", encoding="utf-8") as f:
+                        json.dump(artifact, f, ensure_ascii=False, indent=2)
+
+                if os.path.isfile(meta_path):
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f) or {}
+                    except Exception:
+                        meta = {}
+                    meta["has_speaker_map"] = True
+                    meta["student_speakers"] = student_canonical
+                    meta["speaker_map_file"] = "speaker_map.json"
+                    meta["speaker_map_updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    with open(meta_path, "w", encoding="utf-8") as f:
+                        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+                if os.path.isfile(diar_path):
+                    try:
+                        with open(diar_path, "r", encoding="utf-8") as f:
+                            diarization = json.load(f) or []
+                        updated_diar = []
+                        for seg in diarization:
+                            updated = dict(seg)
+                            src_spk = str(updated.get("speaker") or "UNKNOWN")
+                            updated["speaker"] = speaker_map.get(src_spk, src_spk)
+                            updated_diar.append(updated)
+                        with open(diar_path, "w", encoding="utf-8") as f:
+                            json.dump(updated_diar, f, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+
+                self.pipeline.last_result = {"segments": updated_segments}
+                self.pipeline.last_raw_result = {"segments": updated_raw_segments or raw_segments}
+                self.pipeline.last_diar_df = None
+                if os.path.isfile(diar_path):
+                    try:
+                        with open(diar_path, "r", encoding="utf-8") as f:
+                            diarization = json.load(f) or []
+                        import pandas as pd
+
+                        self.pipeline.last_diar_df = pd.DataFrame(diarization)
+                    except Exception:
+                        pass
+                self.pipeline.last_processing_meta = {
+                    **(self.pipeline.last_processing_meta or {}),
+                    "speaker_map": speaker_map,
+                    "student_speakers": student_canonical,
+                }
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to update meta.json:\n{e}")
+                messagebox.showerror("Error", f"Failed to rewrite lesson artifacts:\n{e}")
                 return
 
+            # Patch meta.json
             win.grab_release()
             win.destroy()
             self.master.after(0, self._update_analyze_ui_state)
@@ -2584,6 +2915,37 @@ class DiarizationApp:
             self.pipeline.export_txt(path)
             messagebox.showinfo("Export", "Saved TXT")
 
+    def _export_lesson_analysis(self, lesson_dir: str):
+        analysis_path = os.path.join(lesson_dir, "analysis.txt")
+        if not os.path.isfile(analysis_path):
+            messagebox.showwarning(
+                "Analysis not found",
+                "This lesson does not have a saved analysis.txt file yet.",
+            )
+            return
+
+        default_name = f"{os.path.basename(lesson_dir)}_analysis.txt"
+        path = filedialog.asksaveasfilename(
+            title="Export lesson analysis",
+            defaultextension=".txt",
+            initialfile=default_name,
+            filetypes=[
+                ("Text file", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            with open(analysis_path, "r", encoding="utf-8") as src:
+                content = src.read()
+            with open(path, "w", encoding="utf-8") as dst:
+                dst.write(content)
+            messagebox.showinfo("Export", f"Saved analysis to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
     def export_speaker_audio(self):
         if self.current_lesson_dir and not self._has_speaker_assignment(self.current_lesson_dir):
             messagebox.showwarning("Action required", "Please assign Student speaker(s) first.")
@@ -2594,6 +2956,7 @@ class DiarizationApp:
         if path:
             self.pipeline.export_speaker_audios(path)
             messagebox.showinfo("Export", "Saved Speaker Audios")
+
 
 
 def main():

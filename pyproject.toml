@@ -9,12 +9,14 @@ description = "Simple Tkinter GUI for WhisperX transcription + diarization with 
 authors = [
   { name = "Rama Vasudevan" },
 ]
-readme = "README.md"
+readme = "README.MD"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 
 dependencies = [
   "whisperx",
+  "openai-whisper; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "mlx-whisper; platform_system == 'Darwin' and platform_machine == 'arm64'",
   "torch",
   "torchaudio",
   "sounddevice",
