@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 import re
 from dataclasses import dataclass
@@ -14,6 +15,46 @@ def _safe_import(module_name: str):
         return importlib.import_module(module_name)
     except Exception:
         return None
+
+
+def _patch_pyannote_token_alias() -> None:
+    """Allow WhisperX's `token=` calls to work with pyannote.audio 3.x.
+
+    WhisperX versions in this app call Pyannote VAD with `token=...`, while
+    pyannote.audio 3.x expects `use_auth_token=...`. Without this alias, the
+    unexpected keyword is forwarded to Inference and ASR fails before diarization.
+    """
+    try:
+        from pyannote.audio.core.model import Model
+        from pyannote.audio.pipelines.voice_activity_detection import VoiceActivityDetection
+    except Exception:
+        return
+
+    if not getattr(VoiceActivityDetection.__init__, "_diarize_token_alias", False):
+        original_vad_init = VoiceActivityDetection.__init__
+
+        def vad_init(self, *args, **kwargs):
+            token = kwargs.pop("token", None)
+            if token is not None and kwargs.get("use_auth_token") is None:
+                kwargs["use_auth_token"] = token
+            return original_vad_init(self, *args, **kwargs)
+
+        vad_init._diarize_token_alias = True
+        VoiceActivityDetection.__init__ = vad_init
+
+    if "token" not in inspect.signature(Model.from_pretrained).parameters and not getattr(
+        Model.from_pretrained, "_diarize_token_alias", False
+    ):
+        original_model_from_pretrained = Model.from_pretrained
+
+        def model_from_pretrained(cls, checkpoint, *args, **kwargs):
+            token = kwargs.pop("token", None)
+            if token is not None and kwargs.get("use_auth_token") is None:
+                kwargs["use_auth_token"] = token
+            return original_model_from_pretrained(checkpoint, *args, **kwargs)
+
+        model_from_pretrained._diarize_token_alias = True
+        Model.from_pretrained = classmethod(model_from_pretrained)
 
 
 def _backend_status(config: Optional[dict], text: str, progress: Optional[float] = None) -> None:
@@ -340,6 +381,7 @@ class WhisperXBackend(ASRBackendBase):
         language: Optional[str],
         config: Optional[dict] = None,
     ) -> ASRRunResult:
+        _patch_pyannote_token_alias()
         whisperx = _safe_import("whisperx")
         if whisperx is None:
             raise RuntimeError("WhisperX is not installed.")
