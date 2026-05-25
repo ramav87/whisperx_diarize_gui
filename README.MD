@@ -17,6 +17,36 @@ This application allows you to record or load audio, transcribe it using a hardw
    ```bash
    export HUGGINGFACE_TOKEN="your_hf_token_here"
 
+## Server mode for tablet clients
+
+The Android tablet version should use this project as a processing server rather
+than trying to run WhisperX, pyannote, and local LLMs on the tablet itself.
+
+Start the API server on the Linux machine:
+
+```bash
+diarize-server
+```
+
+By default the server listens on `0.0.0.0:8000` and stores uploaded audio,
+jobs, and lessons under `~/.local/share/diarize-server`.
+
+Useful environment variables:
+
+```bash
+export DIARIZE_SERVER_HOST=0.0.0.0
+export DIARIZE_SERVER_PORT=8000
+export DIARIZE_SERVER_DATA_DIR=/srv/diarize-server
+```
+
+Initial API endpoints:
+
+- `GET /api/health`
+- `POST /api/jobs` with multipart field `audio`
+- `GET /api/jobs/{job_id}`
+- `GET /api/lessons`
+- `GET /api/lessons/{lesson_id}`
+
 ## Usage Workflow
 1. **Profile Selection**
 On launch, select an existing profile (e.g., "Spanish_Lessons") or create a new one. This saves your lesson history separately.
