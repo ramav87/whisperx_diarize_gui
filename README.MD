@@ -47,6 +47,44 @@ Initial API endpoints:
 - `GET /api/lessons`
 - `GET /api/lessons/{lesson_id}`
 
+## Linux server install
+
+For a permanent Linux host, install the app under `/opt/diarize-server` and run
+it with `systemd`.
+
+1. Clone the repo on the server and check out the branch you want to run.
+2. Run the installer as root or with `sudo`:
+
+```bash
+sudo bash deploy/install_linux_server.sh
+```
+
+The installer will:
+
+- create a dedicated `diarize` system user
+- create `/opt/diarize-server` and `/srv/diarize-server`
+- create a virtual environment
+- install the package into that environment
+- install and start the `diarize-server.service` unit
+
+Helpful commands:
+
+```bash
+systemctl status diarize-server
+journalctl -u diarize-server -f
+sudo systemctl restart diarize-server
+```
+
+If you need a different install path, set environment variables before running
+the installer:
+
+```bash
+INSTALL_DIR=/opt/diarize-server \
+DATA_DIR=/srv/diarize-server \
+BRANCH=optimized \
+sudo bash deploy/install_linux_server.sh
+```
+
 ## Usage Workflow
 1. **Profile Selection**
 On launch, select an existing profile (e.g., "Spanish_Lessons") or create a new one. This saves your lesson history separately.
