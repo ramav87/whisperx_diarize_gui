@@ -23,6 +23,11 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v uv >/dev/null 2>&1; then
+  echo "Missing uv. Install it first: https://docs.astral.sh/uv/getting-started/installation/"
+  exit 1
+fi
+
 if ! command -v systemctl >/dev/null 2>&1; then
   echo "This installer expects systemd/systemctl."
   exit 1
@@ -50,11 +55,11 @@ fi
 ("${AS_DIARIZE[@]}" git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH")
 
 if [[ ! -d "$INSTALL_DIR/.venv" ]]; then
-  "${AS_DIARIZE[@]}" "$PYTHON_BIN" -m venv "$INSTALL_DIR/.venv"
+  "${AS_DIARIZE[@]}" uv venv --python "$PYTHON_BIN" "$INSTALL_DIR/.venv"
 fi
 
-"${AS_DIARIZE[@]}" "$INSTALL_DIR/.venv/bin/pip" install -U pip
-"${AS_DIARIZE[@]}" "$INSTALL_DIR/.venv/bin/pip" install "$INSTALL_DIR"
+"${AS_DIARIZE[@]}" uv pip install --python "$INSTALL_DIR/.venv/bin/python" -U pip
+"${AS_DIARIZE[@]}" uv pip install --python "$INSTALL_DIR/.venv/bin/python" -e "$INSTALL_DIR"
 
 install -m 0644 "$INSTALL_DIR/deploy/diarize-server.service" "/etc/systemd/system/$SERVICE_NAME.service"
 systemctl daemon-reload

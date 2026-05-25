@@ -53,7 +53,8 @@ For a permanent Linux host, install the app under `/opt/diarize-server` and run
 it with `systemd`.
 
 1. Clone the repo on the server and check out the branch you want to run.
-2. Run the installer as root or with `sudo`:
+2. Make sure `uv` is installed on the server.
+3. Run the installer as root or with `sudo`:
 
 ```bash
 sudo bash deploy/install_linux_server.sh
@@ -63,7 +64,7 @@ The installer will:
 
 - create a dedicated `diarize` system user
 - create `/opt/diarize-server` and `/srv/diarize-server`
-- create a virtual environment
+- create a `uv` virtual environment
 - install the package into that environment
 - install and start the `diarize-server.service` unit
 
