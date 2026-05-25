@@ -561,9 +561,9 @@ class PyannoteDiarizationBackend(DiarizationBackendBase):
         max_speakers: Optional[int] = None,
         config: Optional[dict] = None,
     ) -> Tuple[List[dict], Dict[str, Any]]:
-        from .pyannote_offline_loader import load_offline_pipeline
+        from .pyannote_offline_loader import load_pyannote_pipeline
 
-        pipeline = load_offline_pipeline()
+        pipeline = load_pyannote_pipeline()
         kwargs: Dict[str, Any] = {}
         if num_speakers:
             kwargs["num_speakers"] = int(num_speakers)

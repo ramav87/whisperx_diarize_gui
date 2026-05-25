@@ -103,3 +103,29 @@ def load_offline_pipeline():
                 os.remove(tmp_config_path)
             except:
                 pass
+
+
+def load_huggingface_pipeline():
+    from pyannote.audio import Pipeline
+
+    model_id = os.environ.get("DIARIZE_PYANNOTE_MODEL", "pyannote/speaker-diarization-3.1")
+    token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "Offline Pyannote config was not found and no HuggingFace token is configured. "
+            "Set HUGGINGFACE_TOKEN in the service environment or install resources/pyannote/config.yaml."
+        )
+
+    print(f"Loading Pyannote pipeline from HuggingFace: {model_id}")
+    try:
+        return Pipeline.from_pretrained(model_id, use_auth_token=token)
+    except TypeError:
+        return Pipeline.from_pretrained(model_id, token=token)
+
+
+def load_pyannote_pipeline():
+    model_dir = get_model_dir()
+    config_path = os.path.join(model_dir, "config.yaml")
+    if os.path.exists(config_path):
+        return load_offline_pipeline()
+    return load_huggingface_pipeline()

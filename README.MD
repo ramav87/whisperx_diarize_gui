@@ -76,6 +76,18 @@ journalctl -u diarize-server -f
 sudo systemctl restart diarize-server
 ```
 
+For HuggingFace pyannote diarization on the Linux server, put your token in the
+optional service environment file:
+
+```bash
+sudo install -m 0600 /dev/null /etc/diarize-server.env
+echo 'HUGGINGFACE_TOKEN=your_hf_token_here' | sudo tee /etc/diarize-server.env
+sudo systemctl restart diarize-server
+```
+
+The server uses the offline `resources/pyannote` bundle when present. Otherwise
+it falls back to `pyannote/speaker-diarization-3.1` through HuggingFace.
+
 If you need a different install path, set environment variables before running
 the installer:
 
