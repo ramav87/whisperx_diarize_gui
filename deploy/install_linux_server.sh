@@ -34,18 +34,8 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
-if command -v runuser >/dev/null 2>&1; then
-  AS_DIARIZE=(runuser -u diarize --)
-elif command -v sudo >/dev/null 2>&1; then
-  AS_DIARIZE=(sudo -u diarize)
-else
-  echo "Need either runuser or sudo to switch to the diarize user."
-  exit 1
-fi
-
 id -u diarize >/dev/null 2>&1 || useradd --system --create-home --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin diarize
 mkdir -p "$INSTALL_DIR" "$DATA_DIR"
-chown -R diarize:diarize "$INSTALL_DIR" "$DATA_DIR"
 
 if [[ -d "$INSTALL_DIR/.git" ]]; then
   echo "Using existing git checkout in $INSTALL_DIR"
@@ -55,19 +45,21 @@ else
     echo "Move it aside or point INSTALL_DIR at a clean directory, then rerun."
     exit 1
   fi
-  "${AS_DIARIZE[@]}" git clone "$REPO_URL" "$INSTALL_DIR"
+  git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
-("${AS_DIARIZE[@]}" git -C "$INSTALL_DIR" fetch origin "$BRANCH")
-("${AS_DIARIZE[@]}" git -C "$INSTALL_DIR" checkout "$BRANCH")
-("${AS_DIARIZE[@]}" git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH")
+git -C "$INSTALL_DIR" fetch origin "$BRANCH"
+git -C "$INSTALL_DIR" checkout "$BRANCH"
+git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH"
 
 if [[ ! -d "$INSTALL_DIR/.venv" ]]; then
-  "${AS_DIARIZE[@]}" "$UV_BIN" venv --python "$PYTHON_BIN" "$INSTALL_DIR/.venv"
+  "$UV_BIN" venv --python "$PYTHON_BIN" "$INSTALL_DIR/.venv"
 fi
 
-"${AS_DIARIZE[@]}" "$UV_BIN" pip install --python "$INSTALL_DIR/.venv/bin/python" -U pip
-"${AS_DIARIZE[@]}" "$UV_BIN" pip install --python "$INSTALL_DIR/.venv/bin/python" -e "$INSTALL_DIR"
+"$UV_BIN" pip install --python "$INSTALL_DIR/.venv/bin/python" -U pip
+"$UV_BIN" pip install --python "$INSTALL_DIR/.venv/bin/python" -e "$INSTALL_DIR"
+
+chown -R diarize:diarize "$INSTALL_DIR" "$DATA_DIR"
 
 install -m 0644 "$INSTALL_DIR/deploy/diarize-server.service" "/etc/systemd/system/$SERVICE_NAME.service"
 systemctl daemon-reload
