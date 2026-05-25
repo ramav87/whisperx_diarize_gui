@@ -1,11 +1,17 @@
 import unittest
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from diarize_gui.pipeline import DiarizationPipelineRunner
 from diarize_gui.processing_backends import (
+    ASRRunResult,
     assign_speakers_by_overlap,
     clean_transcript_text,
     prepare_transcript_segments,
     resolve_asr_backend,
+    single_speaker_diarization_from_segments,
 )
 
 
@@ -76,6 +82,70 @@ class ProcessingBackendTests(unittest.TestCase):
         self.assertEqual(cleaned[0]["text"], "eh hola")
         self.assertIn("confidence", cleaned[0])
         self.assertTrue(cleaned[0]["low_confidence"])
+
+    def test_single_speaker_diarization_uses_transcript_timestamps(self):
+        diarization = single_speaker_diarization_from_segments(
+            [
+                {"start": 1.0, "end": 2.5, "text": "hola"},
+                {"start": 2.5, "end": 4.0, "text": "mundo"},
+            ]
+        )
+
+        self.assertEqual(
+            diarization,
+            [
+                {"start": 1.0, "end": 2.5, "speaker": "SPEAKER_00"},
+                {"start": 2.5, "end": 4.0, "speaker": "SPEAKER_00"},
+            ],
+        )
+
+    def test_pipeline_falls_back_when_diarization_backend_fails(self):
+        class FakeAsrBackend:
+            name = "fake_asr"
+
+            def transcribe(self, audio_path, *, model_size, language=None, config=None):
+                return ASRRunResult(
+                    segments=[{"start": 0.0, "end": 1.0, "text": "hola"}],
+                    language="es",
+                    backend=self.name,
+                    device="cpu",
+                    compute_type="int8",
+                    word_timestamps_available=False,
+                    metadata={},
+                )
+
+        class FailingDiarizationBackend:
+            name = "pyannote"
+
+            def diarize(self, *args, **kwargs):
+                raise FileNotFoundError("Offline Pyannote config not found")
+
+        with tempfile.TemporaryDirectory() as root:
+            output_dir = Path(root)
+            preprocess = SimpleNamespace(
+                normalized_path=str(output_dir / "normalized.wav"),
+                already_normalized=False,
+                reused_cache=False,
+                sample_rate=16000,
+                channels=1,
+            )
+            with patch("diarize_gui.pipeline.preprocess_audio_mono_16k", return_value=preprocess), patch(
+                "diarize_gui.pipeline.resolve_asr_backend",
+                return_value=(FakeAsrBackend(), {"requested": "auto", "selected": "fake_asr", "fallback": None}),
+            ), patch(
+                "diarize_gui.pipeline.resolve_diarization_backend",
+                return_value=(
+                    FailingDiarizationBackend(),
+                    {"requested": "pyannote", "selected": "pyannote", "fallback": None, "notes": []},
+                ),
+            ):
+                runner = DiarizationPipelineRunner()
+                _, json_path = runner.process_audio("lesson.wav", str(output_dir))
+
+            self.assertEqual(runner.last_processing_meta["diarization_backend_fallback"], "single_speaker")
+            self.assertEqual(runner.last_result["segments"][0]["speaker"], "SPEAKER_00")
+            self.assertEqual(runner.last_result["metadata"]["diarization"]["backend"], "single_speaker_fallback")
+            self.assertTrue(Path(json_path).exists())
 
 
 if __name__ == "__main__":

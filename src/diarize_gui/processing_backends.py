@@ -280,6 +280,30 @@ def assign_speakers_by_overlap(
     return assigned
 
 
+def single_speaker_diarization_from_segments(
+    segments: List[dict],
+    speaker: str = "SPEAKER_00",
+) -> List[dict]:
+    """
+    Build a minimal diarization track from transcript timestamps.
+
+    This is used only as a resilience fallback when the configured diarization
+    backend cannot initialize. It preserves usable transcripts while making the
+    degraded speaker labeling explicit in metadata.
+    """
+    diarization = []
+    for seg in segments or []:
+        try:
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start))
+        except Exception:
+            continue
+        if end < start:
+            end = start
+        diarization.append({"start": start, "end": end, "speaker": speaker})
+    return diarization
+
+
 @dataclass
 class ASRRunResult:
     segments: List[dict]

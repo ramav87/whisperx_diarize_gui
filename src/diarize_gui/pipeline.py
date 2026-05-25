@@ -18,6 +18,7 @@ from .processing_backends import (
     prepare_transcript_segments,
     resolve_asr_backend,
     resolve_diarization_backend,
+    single_speaker_diarization_from_segments,
 )
 from .metrics.context_adjusted import build_context_metrics
 
@@ -631,13 +632,31 @@ class DiarizationPipelineRunner:
 
         self._set_step(4, total_steps, "ASR complete; starting diarization...", 84)
 
-        diar_segments, diar_meta = diar_backend.diarize(
-            preprocess.normalized_path,
-            num_speakers=num_speakers,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-            config={"device": "cpu" if is_apple_silicon() else device_hint},
-        )
+        try:
+            diar_segments, diar_meta = diar_backend.diarize(
+                preprocess.normalized_path,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                config={"device": "cpu" if is_apple_silicon() else device_hint},
+            )
+        except Exception as diar_error:
+            diar_segments = single_speaker_diarization_from_segments(asr_result.segments)
+            diar_resolution["fallback"] = "single_speaker"
+            diar_meta = {
+                "backend": "single_speaker_fallback",
+                "device": "none",
+                "error": str(diar_error),
+                "notes": [
+                    "Configured diarization backend failed, so transcript segments were labeled as a single speaker.",
+                ],
+            }
+            self._set_step(
+                4,
+                total_steps,
+                "Diarization unavailable; continuing with single speaker labels...",
+                86,
+            )
         diarize_df = pd.DataFrame(diar_segments)
 
         self._set_step(5, total_steps, "Cleaning transcript segments...", 88)
