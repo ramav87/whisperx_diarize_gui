@@ -83,7 +83,14 @@ the installer:
 INSTALL_DIR=/opt/diarize-server \
 DATA_DIR=/srv/diarize-server \
 BRANCH=optimized \
+UV_BIN=/home/rama/local/bin/uv \
 sudo bash deploy/install_linux_server.sh
+```
+
+You can also pass the `uv` binary as the first argument:
+
+```bash
+sudo bash deploy/install_linux_server.sh /home/rama/local/bin/uv
 ```
 
 ## Usage Workflow

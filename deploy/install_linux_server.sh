@@ -7,6 +7,7 @@ DATA_DIR="${DATA_DIR:-/srv/diarize-server}"
 SERVICE_NAME="${SERVICE_NAME:-diarize-server}"
 BRANCH="${BRANCH:-optimized}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+UV_BIN="${UV_BIN:-${1:-uv}}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run this installer with sudo or as root."
@@ -23,8 +24,8 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v uv >/dev/null 2>&1; then
-  echo "Missing uv. Install it first: https://docs.astral.sh/uv/getting-started/installation/"
+if ! command -v "$UV_BIN" >/dev/null 2>&1; then
+  echo "Missing uv at '$UV_BIN'. Install it first: https://docs.astral.sh/uv/getting-started/installation/"
   exit 1
 fi
 
@@ -55,11 +56,11 @@ fi
 ("${AS_DIARIZE[@]}" git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH")
 
 if [[ ! -d "$INSTALL_DIR/.venv" ]]; then
-  "${AS_DIARIZE[@]}" uv venv --python "$PYTHON_BIN" "$INSTALL_DIR/.venv"
+  "${AS_DIARIZE[@]}" "$UV_BIN" venv --python "$PYTHON_BIN" "$INSTALL_DIR/.venv"
 fi
 
-"${AS_DIARIZE[@]}" uv pip install --python "$INSTALL_DIR/.venv/bin/python" -U pip
-"${AS_DIARIZE[@]}" uv pip install --python "$INSTALL_DIR/.venv/bin/python" -e "$INSTALL_DIR"
+"${AS_DIARIZE[@]}" "$UV_BIN" pip install --python "$INSTALL_DIR/.venv/bin/python" -U pip
+"${AS_DIARIZE[@]}" "$UV_BIN" pip install --python "$INSTALL_DIR/.venv/bin/python" -e "$INSTALL_DIR"
 
 install -m 0644 "$INSTALL_DIR/deploy/diarize-server.service" "/etc/systemd/system/$SERVICE_NAME.service"
 systemctl daemon-reload
