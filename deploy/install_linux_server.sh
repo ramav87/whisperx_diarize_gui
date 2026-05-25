@@ -48,6 +48,7 @@ else
   git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
+git config --global --add safe.directory "$INSTALL_DIR"
 git -C "$INSTALL_DIR" fetch origin "$BRANCH"
 git -C "$INSTALL_DIR" checkout "$BRANCH"
 git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH"
