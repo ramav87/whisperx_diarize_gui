@@ -12,6 +12,7 @@ Environment=DIARIZE_SERVER_HOST=0.0.0.0
 Environment=DIARIZE_SERVER_PORT=8000
 Environment=DIARIZE_SERVER_DATA_DIR=/srv/diarize-server
 EnvironmentFile=-/etc/diarize-server.env
+Environment=PYTHONPATH=/opt/diarize-server/src
 Environment=PATH=/opt/diarize-server/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/opt/diarize-server/.venv/bin/diarize-server
 Restart=always
