@@ -4,6 +4,12 @@ import yaml
 import tempfile
 
 
+# Pyannote 3.x checkpoints require full Lightning checkpoint loading. PyTorch
+# 2.6+ defaults torch.load to weights_only=True, which rejects these trusted
+# local Pyannote checkpoints unless this compatibility flag is set first.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
+
 def get_resource_base_path():
     """
     Returns the base directory where resources (like 'deps' or 'ollama') are located.
@@ -69,19 +75,23 @@ def load_offline_pipeline():
     params = config.get("pipeline", {}).get("params", {})
 
     def make_absolute(rel_path):
-        # Turn "./segmentation.bin" into "/Users/.../segmentation.bin"
-        filename = os.path.basename(rel_path) 
-        return os.path.join(model_dir, filename)
+        return os.path.abspath(os.path.join(model_dir, rel_path))
+
+    def local_model_config(rel_path):
+        path = make_absolute(str(rel_path))
+        if os.path.isdir(path):
+            return {"checkpoint": os.path.join(path, "pytorch_model.bin")}
+        return path
 
     if "segmentation" in params:
         # Only fix if it looks like a relative path
         if str(params["segmentation"]).startswith("."):
-            params["segmentation"] = make_absolute(params["segmentation"])
+            params["segmentation"] = local_model_config(params["segmentation"])
             print(f"Patched segmentation path: {params['segmentation']}")
 
     if "embedding" in params:
         if str(params["embedding"]).startswith("."):
-            params["embedding"] = make_absolute(params["embedding"])
+            params["embedding"] = local_model_config(params["embedding"])
             print(f"Patched embedding path: {params['embedding']}")
 
     # 3. Write to a temporary file
