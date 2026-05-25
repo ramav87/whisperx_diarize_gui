@@ -1,0 +1,22 @@
+[Unit]
+Description=Diarize Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=diarize
+Group=diarize
+WorkingDirectory=/opt/diarize-server
+Environment=DIARIZE_SERVER_HOST=0.0.0.0
+Environment=DIARIZE_SERVER_PORT=8000
+Environment=DIARIZE_SERVER_DATA_DIR=/srv/diarize-server
+Environment=PATH=/opt/diarize-server/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/diarize-server/.venv/bin/diarize-server
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
