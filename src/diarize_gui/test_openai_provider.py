@@ -4,7 +4,7 @@ from diarize_gui.openai_provider import OpenAIProvider
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="gpt-5.2")
+    ap.add_argument("--model", default="gpt-5.4")
     ap.add_argument("--prompt", default="Return exactly: OK")
     args = ap.parse_args()
 

@@ -116,6 +116,18 @@ OPENAI_PRICING_PER_1M = {
         "input": 1.75,
         "output": 14.00,
     },
+    "gpt-5.4": {
+        "input": 2.50,
+        "output": 15.00,
+    },
+    "gpt-5.4-mini": {
+        "input": 0.75,
+        "output": 4.50,
+    },
+    "gpt-5.5": {
+        "input": 5.00,
+        "output": 30.00,
+    },
 }
 
 # ==============================

@@ -16,6 +16,16 @@ def _safe_import(module_name: str):
         return None
 
 
+def _backend_status(config: Optional[dict], text: str, progress: Optional[float] = None) -> None:
+    config = config or {}
+    status_callback = config.get("status_callback")
+    progress_callback = config.get("progress_callback")
+    if status_callback:
+        status_callback(text)
+    if progress is not None and progress_callback:
+        progress_callback(progress)
+
+
 def _model_name_for_mlx(model_size: str) -> str:
     size = (model_size or "small").strip()
     if size.startswith("mlx-community/"):
@@ -314,22 +324,27 @@ class WhisperXBackend(ASRBackendBase):
         compute_type = (config or {}).get("compute_type") or ("int8" if device == "cpu" else "float16")
         batch_size = (config or {}).get("batch_size")
 
+        _backend_status(config, f"Loading WhisperX model ({model_size}, {device}/{compute_type})...", 20)
         model = whisperx.load_model(model_size, device=device, compute_type=compute_type)
+        _backend_status(config, "Loading normalized audio for ASR...", 28)
         audio = whisperx.load_audio(audio_path)
         transcribe_kwargs = {"language": language, "task": "transcribe"}
         if batch_size is not None:
             transcribe_kwargs["batch_size"] = int(batch_size)
 
+        _backend_status(config, f"Transcribing audio with WhisperX (batch {batch_size or 'default'})...", 35)
         try:
             result = model.transcribe(audio, **transcribe_kwargs)
         except TypeError:
             transcribe_kwargs.pop("batch_size", None)
             result = model.transcribe(audio, **transcribe_kwargs)
 
+        _backend_status(config, "Loading word-alignment model...", 72)
         align_model, metadata = whisperx.load_align_model(
             language_code=result.get("language") or language,
             device=device,
         )
+        _backend_status(config, "Aligning transcript word timestamps...", 78)
         aligned = whisperx.align(
             result["segments"],
             align_model,
@@ -374,7 +389,9 @@ class WhisperMPBackend(ASRBackendBase):
         else:
             device = "cpu"
 
+        _backend_status(config, f"Loading openai-whisper model ({model_size}, {device})...", 20)
         model = whisper.load_model(model_size, device=device)
+        _backend_status(config, f"Transcribing audio with openai-whisper ({device})...", 35)
         result = model.transcribe(
             audio_path,
             language=language,
@@ -423,6 +440,7 @@ class MLXWhisperBackend(ASRBackendBase):
         if language:
             kwargs["language"] = language
 
+        _backend_status(config, f"Loading/transcribing with MLX Whisper ({model_ref})...", 25)
         try:
             result = mlx_whisper.transcribe(audio_path, word_timestamps=True, **kwargs)
         except TypeError:

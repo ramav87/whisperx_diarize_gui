@@ -22,7 +22,7 @@ class OpenAIProvider:
       https://platform.openai.com/docs/api-reference/responses
     """
     api_key: str
-    model: str = "gpt-5.2"  # you can override per-call too
+    model: str = "gpt-5.4"  # you can override per-call too
     base_url: str = "https://api.openai.com/v1"
     timeout_s: int = 600
 

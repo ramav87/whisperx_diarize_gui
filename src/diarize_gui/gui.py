@@ -16,6 +16,10 @@ from urllib.request import urlopen
 from .dashboard import DashboardFrame
 from .theme import AppTheme
 from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL
+from .metrics.context_adjusted import (
+    build_context_metrics,
+    interpretation_for_context_metrics,
+)
 
 # Import backend logic
 from .utils import obfuscate_secret, deobfuscate_secret, estimate_openai_cost
@@ -1145,10 +1149,27 @@ class DiarizationApp:
         return (
             "\n\nAt the very end of your response, append this exact machine-readable block and nothing else inside it:\n"
             "AI_STATS_JSON_START\n"
-            '{"grammar_score": 0, "topics": ["topic 1", "topic 2", "topic 3"], "golden_words": ["word 1 (translation)", "word 2 (translation)", "word 3 (translation)"], "corrections": 0, "feedback": "short summary"}\n'
+            '{"grammar_score": 75, "topics": ["topic 1", "topic 2", "topic 3"], "golden_words": ["word 1 (translation)", "word 2 (translation)", "word 3 (translation)"], "corrections": 0, "feedback": "short summary", "topic_difficulty": 3, "idea_density": 3, "abstraction_level": 4, "cognitive_branching": 4, "technical_density": 2, "discourse_depth": 4, "lexical_retrieval_pressure": 3, "topic_tags": ["tag 1", "tag 2"], "context_notes": "short rationale focused on linguistic and cognitive load", "self_repair_observations": "short observation"}\n'
             "AI_STATS_JSON_END\n"
-            "Use valid JSON only between the markers. Do not wrap it in markdown fences."
+            "Use valid JSON only between the markers. Do not wrap it in markdown fences. "
+            "grammar_score must be an integer from 0 to 100, where 100 means near-native accuracy and 70 means understandable speech with recurring errors. Do not use a 1-10 scale. "
+            "For topic_difficulty use 1=daily life/simple narration, 2=familiar concrete topic, 3=opinion/explanation, 4=abstract argument, 5=technical/political/scientific/financial/philosophical or highly abstract. "
+            "For idea_density use 1=simple narration, 2=concrete personal topic, 3=opinion with reasons, 4=abstract argument with multiple clauses, 5=dense technical/political/scientific explanation. "
+            "For abstraction_level, cognitive_branching, technical_density, discourse_depth, and lexical_retrieval_pressure use 1-10 where 10 means very high conceptual or retrieval load. "
+            "Do not grade intelligence or opinions; estimate only session load."
         )
+
+    def _normalize_ai_grammar_score(self, score):
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            return score
+
+        if 0 < value <= 10:
+            value *= 10
+
+        value = float(max(0, min(100, value)))
+        return int(value) if value.is_integer() else value
 
     def _split_analysis_response(self, text: str):
         """
@@ -1173,6 +1194,9 @@ class DiarizationApp:
         if not isinstance(stats, dict):
             return analysis_text.strip(), None
 
+        if "grammar_score" in stats:
+            stats["grammar_score"] = self._normalize_ai_grammar_score(stats.get("grammar_score"))
+
         try:
             from .pipeline import DiarizationPipelineRunner
 
@@ -1189,6 +1213,31 @@ class DiarizationApp:
             return
 
         payload = dict(stats)
+        if "grammar_score" in payload:
+            payload["grammar_score"] = self._normalize_ai_grammar_score(payload.get("grammar_score"))
+
+        context = payload.get("context_metrics") if isinstance(payload.get("context_metrics"), dict) else {}
+        raw_wpm = self._compute_lesson_raw_wpm(lesson_dir)
+        payload["context_metrics"] = build_context_metrics(
+            raw_grammar_score=payload.get("grammar_score", context.get("raw_grammar_score")),
+            raw_wpm=raw_wpm if raw_wpm is not None else context.get("raw_wpm"),
+            practice_hours_last_7_days=context.get("practice_hours_last_7_days"),
+            topic_difficulty=payload.get("topic_difficulty", context.get("topic_difficulty")),
+            idea_density=payload.get("idea_density", context.get("idea_density")),
+            abstraction_level=payload.get("abstraction_level", context.get("abstraction_level")),
+            cognitive_branching=payload.get("cognitive_branching", context.get("cognitive_branching")),
+            technical_density=payload.get("technical_density", context.get("technical_density")),
+            discourse_depth=payload.get("discourse_depth", context.get("discourse_depth")),
+            lexical_retrieval_pressure=payload.get(
+                "lexical_retrieval_pressure",
+                context.get("lexical_retrieval_pressure"),
+            ),
+            fatigue_or_stress=context.get("fatigue_or_stress"),
+            long_pauses_per_min=context.get("long_pauses_per_min"),
+            self_repairs_per_min=context.get("self_repairs_per_min"),
+            filled_pauses_per_min=context.get("filled_pauses_per_min"),
+            notes=payload.get("context_notes", context.get("notes")),
+        )
         payload["llm_provider"] = provider
         payload["llm_model"] = model
         payload["analysis_updated_at"] = datetime.now().isoformat(timespec="seconds")
@@ -1224,6 +1273,47 @@ class DiarizationApp:
     def _write_json_file(self, path: str, data: dict) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _format_metric_value(self, value, suffix: str = "") -> str:
+        if value is None:
+            return "--"
+        if isinstance(value, bool):
+            return self._yes_no(value)
+        if isinstance(value, (int, float)):
+            text = f"{value:.1f}" if abs(float(value) - int(value)) > 0.01 else f"{int(value)}"
+            return f"{text}{suffix}"
+        return str(value)
+
+    def _yes_no(self, value) -> str:
+        if value is None:
+            return "--"
+        return "yes" if bool(value) else "no"
+
+    def _compute_lesson_raw_wpm(self, lesson_dir: str):
+        meta = self._read_json_file(os.path.join(lesson_dir, "meta.json"))
+        segments = self._read_json_file(os.path.join(lesson_dir, "segments.json"))
+        if not isinstance(segments, list):
+            return None
+
+        student_ids = set(meta.get("student_speakers", []))
+        words = 0
+        seconds = 0.0
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            spk = seg.get("speaker", "UNKNOWN")
+            is_student = (spk in student_ids) or (not student_ids and "01" in str(spk))
+            if not is_student:
+                continue
+            try:
+                start = float(seg.get("start", 0))
+                end = float(seg.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            text = str(seg.get("text", "")).strip()
+            seconds += max(0.0, end - start)
+            words += len(text.split())
+        return (words / (seconds / 60.0)) if seconds > 10 else None
 
     def _reassociate_audio_for_lesson(self, lesson_dir: str, status_label=None):
         # Let user pick an audio file
@@ -1878,6 +1968,7 @@ class DiarizationApp:
 
         t_tab = tabview.add("Transcript")
         a_tab = tabview.add("Analysis")
+        c_tab = tabview.add("Context Metrics")
 
         # --- Transcript ---
         t_box = ctk.CTkTextbox(t_tab)
@@ -1904,6 +1995,153 @@ class DiarizationApp:
             a_box.insert("1.0", "No analysis available for this lesson.")
 
         a_box.configure(state="disabled")
+
+        # --- Context-adjusted metrics ---
+        ai_stats = self._read_json_file(os.path.join(lesson_dir, "ai_stats.json"))
+        context = ai_stats.get("context_metrics") if isinstance(ai_stats.get("context_metrics"), dict) else {}
+        raw_wpm = self._compute_lesson_raw_wpm(lesson_dir)
+        context = build_context_metrics(
+            raw_grammar_score=ai_stats.get("grammar_score", context.get("raw_grammar_score")),
+            raw_wpm=raw_wpm if raw_wpm is not None else context.get("raw_wpm"),
+            practice_hours_last_7_days=context.get("practice_hours_last_7_days"),
+            topic_difficulty=ai_stats.get("topic_difficulty", context.get("topic_difficulty")),
+            idea_density=ai_stats.get("idea_density", context.get("idea_density")),
+            abstraction_level=ai_stats.get("abstraction_level", context.get("abstraction_level")),
+            cognitive_branching=ai_stats.get("cognitive_branching", context.get("cognitive_branching")),
+            technical_density=ai_stats.get("technical_density", context.get("technical_density")),
+            discourse_depth=ai_stats.get("discourse_depth", context.get("discourse_depth")),
+            lexical_retrieval_pressure=ai_stats.get(
+                "lexical_retrieval_pressure",
+                context.get("lexical_retrieval_pressure"),
+            ),
+            fatigue_or_stress=context.get("fatigue_or_stress"),
+            long_pauses_per_min=context.get("long_pauses_per_min"),
+            self_repairs_per_min=context.get("self_repairs_per_min"),
+            filled_pauses_per_min=context.get("filled_pauses_per_min"),
+            notes=ai_stats.get("context_notes", context.get("notes")),
+        )
+
+        form = ctk.CTkFrame(c_tab)
+        form.pack(fill="x", padx=8, pady=(8, 4))
+        context_entries = {}
+        editable_fields = [
+            ("practice_hours_last_7_days", "Practice hrs 7d"),
+            ("topic_difficulty", "Topic difficulty"),
+            ("idea_density", "Idea density"),
+            ("abstraction_level", "Abstraction"),
+            ("cognitive_branching", "Branching"),
+            ("technical_density", "Technical density"),
+            ("discourse_depth", "Discourse depth"),
+            ("lexical_retrieval_pressure", "Lexical pressure"),
+            ("fatigue_or_stress", "Fatigue/stress"),
+            ("long_pauses_per_min", "Long pauses/min"),
+            ("self_repairs_per_min", "Repairs/min"),
+            ("filled_pauses_per_min", "Filled pauses/min"),
+        ]
+        for idx, (key, label) in enumerate(editable_fields):
+            row = idx // 2
+            col = (idx % 2) * 2
+            ctk.CTkLabel(form, text=label, anchor="w").grid(row=row, column=col, sticky="w", padx=(8, 4), pady=4)
+            entry = ctk.CTkEntry(form, width=100)
+            value = context.get(key)
+            if value is not None:
+                entry.insert(0, self._format_metric_value(value))
+            entry.grid(row=row, column=col + 1, sticky="ew", padx=(0, 8), pady=4)
+            context_entries[key] = entry
+        form.grid_columnconfigure(1, weight=1)
+        form.grid_columnconfigure(3, weight=1)
+
+        c_box = ctk.CTkTextbox(c_tab)
+        c_box.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+        def refresh_context_box(updated_context):
+            c_box.configure(state="normal")
+            c_box.delete("1.0", "end")
+            lines = [
+                "Context-Adjusted Metrics",
+                "",
+                f"Raw Grammar Score: {self._format_metric_value(updated_context.get('raw_grammar_score'), '/100')}",
+                f"Context-Adjusted Grammar Score: {self._format_metric_value(updated_context.get('adjusted_grammar_score'), '/100')}",
+                f"Raw WPM: {self._format_metric_value(updated_context.get('raw_wpm'))}",
+                f"Cognitive-Load-Adjusted WPM: {self._format_metric_value(updated_context.get('cognitive_load_adjusted_wpm'))}",
+                f"Fluency Under Load: {self._format_metric_value(updated_context.get('fluency_under_load'))}",
+                f"Effective Fluency: {self._format_metric_value(updated_context.get('effective_fluency_score'), '/100')}",
+                f"Complexity Resilience: {self._format_metric_value(updated_context.get('complexity_resilience_score'), '/100')}",
+                f"Conceptual Load: {self._format_metric_value(updated_context.get('conceptual_load_score'), '/10')}",
+                f"Topic Difficulty: {self._format_metric_value(updated_context.get('topic_difficulty'))}",
+                f"Idea Density: {self._format_metric_value(updated_context.get('idea_density'))}",
+                f"Abstraction: {self._format_metric_value(updated_context.get('abstraction_level'), '/10')}",
+                f"Cognitive Branching: {self._format_metric_value(updated_context.get('cognitive_branching'), '/10')}",
+                f"Technical Density: {self._format_metric_value(updated_context.get('technical_density'), '/10')}",
+                f"Discourse Depth: {self._format_metric_value(updated_context.get('discourse_depth'), '/10')}",
+                f"Lexical Retrieval Pressure: {self._format_metric_value(updated_context.get('lexical_retrieval_pressure'), '/10')}",
+                f"Practice Hours Last 7 Days: {self._format_metric_value(updated_context.get('practice_hours_last_7_days'))}",
+                f"Fatigue/Stress: {self._format_metric_value(updated_context.get('fatigue_or_stress'))}",
+                f"Cold Session: {self._yes_no(updated_context.get('cold_session'))}",
+                f"Hard Topic: {self._yes_no(updated_context.get('hard_topic'))}",
+                f"High Idea Density: {self._yes_no(updated_context.get('high_idea_density'))}",
+                "",
+                "Interpretation",
+                interpretation_for_context_metrics(updated_context),
+            ]
+            notes = updated_context.get("notes") or ai_stats.get("context_notes")
+            if notes:
+                lines.extend(["", "Notes", str(notes)])
+            topic_tags = ai_stats.get("topic_tags")
+            if isinstance(topic_tags, list) and topic_tags:
+                lines.extend(["", "Topic Tags", ", ".join(str(tag) for tag in topic_tags)])
+            c_box.insert("1.0", "\n".join(lines))
+            c_box.configure(state="disabled")
+
+        def parse_entry_value(entry):
+            text = entry.get().strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+
+        def save_context_metrics():
+            updated = build_context_metrics(
+                raw_grammar_score=ai_stats.get("grammar_score", context.get("raw_grammar_score")),
+                raw_wpm=raw_wpm if raw_wpm is not None else context.get("raw_wpm"),
+                practice_hours_last_7_days=parse_entry_value(context_entries["practice_hours_last_7_days"]),
+                topic_difficulty=parse_entry_value(context_entries["topic_difficulty"]),
+                idea_density=parse_entry_value(context_entries["idea_density"]),
+                abstraction_level=parse_entry_value(context_entries["abstraction_level"]),
+                cognitive_branching=parse_entry_value(context_entries["cognitive_branching"]),
+                technical_density=parse_entry_value(context_entries["technical_density"]),
+                discourse_depth=parse_entry_value(context_entries["discourse_depth"]),
+                lexical_retrieval_pressure=parse_entry_value(context_entries["lexical_retrieval_pressure"]),
+                fatigue_or_stress=parse_entry_value(context_entries["fatigue_or_stress"]),
+                long_pauses_per_min=parse_entry_value(context_entries["long_pauses_per_min"]),
+                self_repairs_per_min=parse_entry_value(context_entries["self_repairs_per_min"]),
+                filled_pauses_per_min=parse_entry_value(context_entries["filled_pauses_per_min"]),
+                notes=ai_stats.get("context_notes", context.get("notes")),
+            )
+            ai_stats["context_metrics"] = updated
+            if "topic_difficulty" in updated:
+                ai_stats["topic_difficulty"] = updated.get("topic_difficulty")
+            if "idea_density" in updated:
+                ai_stats["idea_density"] = updated.get("idea_density")
+            for key in (
+                "abstraction_level",
+                "cognitive_branching",
+                "technical_density",
+                "discourse_depth",
+                "lexical_retrieval_pressure",
+            ):
+                if key in updated:
+                    ai_stats[key] = updated.get(key)
+            self._write_json_file(os.path.join(lesson_dir, "ai_stats.json"), ai_stats)
+            refresh_context_box(updated)
+            self._refresh_dashboard_from_current_lesson()
+
+        save_btn = ctk.CTkButton(form, text="Save Context", width=130, command=save_context_metrics)
+        save_btn.grid(row=(len(editable_fields) + 1) // 2, column=0, columnspan=4, sticky="e", padx=8, pady=(4, 8))
+
+        refresh_context_box(context)
 
     # --- ANALYSIS FLOW ---
     def analyze_transcript(self):
@@ -2029,12 +2267,12 @@ class DiarizationApp:
         ctk.CTkLabel(model_row, text="Model:", width=60).pack(side="left")
 
         self.ollama_models = ["mistral", "mixtral", "gemma:2b", DEFAULT_OLLAMA_ANALYSIS_MODEL, "qwen2.5"]
-        self.openai_models = ["gpt-4o", "gpt-4o-mini", "gpt-5.1", "gpt-5.2"]
+        self.openai_models = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.2", "gpt-5.1", "gpt-4o", "gpt-4o-mini"]
         
         # Pick model default from profile depending on provider
         provider0 = self.analysis_provider_var.get()
         if provider0 == "openai":
-            default_model = self.profile_config.get("openai_model", "gpt-5.2")
+            default_model = self.profile_config.get("openai_model", "gpt-5.4")
         else:
             default_model = self.profile_config.get("ollama_model", DEFAULT_OLLAMA_ANALYSIS_MODEL)
 
@@ -2086,7 +2324,7 @@ class DiarizationApp:
             if provider == "openai":
                 self.model_menu.configure(values=self.openai_models)
                 if self.analysis_model_var.get() not in self.openai_models:
-                    self.analysis_model_var.set(self.profile_config.get("openai_model", "gpt-5.2"))
+                    self.analysis_model_var.set(self.profile_config.get("openai_model", "gpt-5.4"))
                 self.openai_key_entry.configure(state="normal")
                 self.save_key_cb.configure(state="normal")
             else:

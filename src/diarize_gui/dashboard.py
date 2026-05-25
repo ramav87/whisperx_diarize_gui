@@ -2,7 +2,7 @@ import os
 import json
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 import tkinter as tk
 import customtkinter as ctk
@@ -12,10 +12,57 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
 from .theme import AppTheme
 from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL
-from .lesson_selection import select_pending_ai_lesson_dirs
+from .lesson_selection import select_all_incomplete_ai_lesson_dirs, select_pending_ai_lesson_dirs
+from .metrics.context_adjusted import build_context_metrics, compute_automaticity_gap
+from .utils import deobfuscate_secret
 
 # Use a safe backend for macOS/Windows
 matplotlib.use("TkAgg")
+
+
+class DashboardToolTip:
+    def __init__(self, widget, text, delay=500):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.tipwindow = None
+        self.after_id = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _schedule(self, _=None):
+        self.after_id = self.widget.after(self.delay, self._show)
+
+    def _show(self):
+        if self.tipwindow:
+            return
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() - 10
+        self.tipwindow = tw = ctk.CTkToplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.attributes("-topmost", True)
+        label = ctk.CTkLabel(
+            tw,
+            text=self.text,
+            fg_color="#2B2B2B",
+            text_color="#E6E6E6",
+            corner_radius=6,
+            padx=8,
+            pady=4,
+            justify="left",
+            wraplength=320,
+        )
+        label.pack()
+
+    def _hide(self, _=None):
+        if self.after_id:
+            self.widget.after_cancel(self.after_id)
+            self.after_id = None
+        if self.tipwindow:
+            self.tipwindow.destroy()
+            self.tipwindow = None
+
 
 class DashboardFrame(ctk.CTkFrame):
     def __init__(self, master, profile_name, profile_dir, pipeline=None, **kwargs):
@@ -98,10 +145,12 @@ class DashboardFrame(ctk.CTkFrame):
         self.row2.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
         
         self.card_grammar = self._create_kpi_card(self.row2, "Avg Grammar", "--", color=self.color_ai)
+        self.card_auto_gap = self._create_kpi_card(self.row2, "Automaticity Gap", "--", color=self.color_ai)
         self.card_latency = self._create_kpi_card(self.row2, "Avg Latency", "0.0s")
         self.card_max_turn = self._create_kpi_card(self.row2, "Longest Turn", "0s")
 
         self.card_grammar.pack(side="left", expand=True, fill="x", padx=5)
+        self.card_auto_gap.pack(side="left", expand=True, fill="x", padx=5)
         self.card_latency.pack(side="left", expand=True, fill="x", padx=5)
         self.card_max_turn.pack(side="left", expand=True, fill="x", padx=5)
 
@@ -164,6 +213,7 @@ class DashboardFrame(ctk.CTkFrame):
         self.tab_activity = self.chart_tabs.add("Activity")
         self.tab_fluency = self.chart_tabs.add("Fluency")
         self.tab_grammar = self.chart_tabs.add("Grammar AI")
+        self.tab_context = self.chart_tabs.add("Context")
         
         # 4. Controls Row
         self.controls_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -180,15 +230,26 @@ class DashboardFrame(ctk.CTkFrame):
 
         self.ai_btn = ctk.CTkButton(
             self.controls_frame,
-            text="Compute AI Metrics",
+            text="Compute Recent AI Metrics",
             fg_color=self.color_ai,
             hover_color="#7B1FA2",
             command=self.run_ai_analysis,
         )
         self.ai_btn.pack(side="left", padx=10)
+
+        self.ai_backfill_btn = ctk.CTkButton(
+            self.controls_frame,
+            text="Backfill All AI Metrics",
+            fg_color="#7B1FA2",
+            hover_color="#5E167A",
+            command=self.run_ai_backfill,
+        )
+        self.ai_backfill_btn.pack(side="left", padx=10)
         
         self.status_lbl = ctk.CTkLabel(self.controls_frame, text="", text_color=self.card_subtext)
         self.status_lbl.pack(side="left", padx=10)
+
+        self._install_tooltips()
 
         # Initial Load
         self.refresh_data()
@@ -233,56 +294,187 @@ class DashboardFrame(ctk.CTkFrame):
         )
         lbl_val.pack(pady=(2,10), padx=10, fill="both", expand=True)
         frame.value_label = lbl_val
+        frame.title_label = lbl_title
         return frame
 
+    def _add_tooltip(self, widget, text):
+        DashboardToolTip(widget, text)
+        for child in widget.winfo_children():
+            DashboardToolTip(child, text)
+
+    def _install_tooltips(self):
+        self._add_tooltip(
+            self.card_total_time,
+            "Total lesson recording time in this profile, using each lesson's saved duration.",
+        )
+        self._add_tooltip(
+            self.card_student_pct,
+            "The share of total lesson time where your assigned student speaker was talking.",
+        )
+        self._add_tooltip(
+            self.card_wpm,
+            "Your average speaking speed: student words divided by student speaking minutes.",
+        )
+        self._add_tooltip(
+            self.card_words,
+            "Total words attributed to your assigned student speaker across all lessons.",
+        )
+        self._add_tooltip(
+            self.card_grammar,
+            "Average AI grammar score across lessons with completed AI analysis.",
+        )
+        self._add_tooltip(
+            self.card_auto_gap,
+            "Warm-session grammar average minus cold-session grammar average over the latest 10 analyzed lessons. "
+            "Warm means at least 1 hour of practice in the prior 7 days; cold means less. "
+            "A positive gap suggests you perform better after recent practice.",
+        )
+        self._add_tooltip(
+            self.card_latency,
+            "Average pause before you respond after another speaker, ignoring pauses over 10 seconds.",
+        )
+        self._add_tooltip(
+            self.card_max_turn,
+            "The longest single student speaking turn found in your lessons.",
+        )
+        self._add_tooltip(
+            self.golden_panel,
+            "Recent target vocabulary from completed AI analyses, deduplicated from newest lessons backward.",
+        )
+        DashboardToolTip(
+            self.ai_btn,
+            "Analyze the newest incomplete lessons only. Stops once it reaches an older lesson that already has complete AI metrics.",
+        )
+        DashboardToolTip(
+            self.ai_backfill_btn,
+            "Analyze every incomplete lesson in this profile, including older gaps. Use this to repair historical dashboard data.",
+        )
+
     def run_ai_analysis(self):
-        """Recomputes LLM analysis for the newest unprocessed lessons only."""
+        """Recomputes LLM analysis for the newest incomplete lessons only."""
+        self._run_ai_analysis(select_pending_ai_lesson_dirs, "recent")
+
+    def run_ai_backfill(self):
+        """Recomputes LLM analysis for every incomplete lesson in the profile."""
+        self._run_ai_analysis(select_all_incomplete_ai_lesson_dirs, "all")
+
+    def _run_ai_analysis(self, selector, scope):
         if not self.pipeline:
             self.status_lbl.configure(text="Error: Pipeline not connected")
             return
-            
+
+        provider, model, api_key = self._dashboard_ai_settings()
+        if provider == "openai" and not api_key:
+            self.status_lbl.configure(text="OpenAI API key missing. Save it in the Analysis window first.")
+            return
+
         self.ai_btn.configure(state="disabled", text="Computing...")
+        self.ai_backfill_btn.configure(state="disabled", text="Backfilling...")
         
         def _thread_target():
             lessons_dir = os.path.join(self.profile_dir, "lessons")
             if not os.path.isdir(lessons_dir): return
 
-            to_process = select_pending_ai_lesson_dirs(lessons_dir)
+            to_process = selector(lessons_dir)
             
             total = len(to_process)
             if total == 0:
-                self.after(0, lambda: self._on_ai_finished(0, 0))
+                self.after(0, lambda: self._on_ai_finished(0, 0, scope))
                 return
 
             # Process loop
             processed = 0
             for i, path in enumerate(to_process):
-                msg = f"Analyzing {i+1}/{total}..."
+                msg = f"Analyzing {i+1}/{total}: {os.path.basename(path)}"
                 self.after(0, lambda m=msg: self.status_lbl.configure(text=m))
                 
-                success = self.pipeline.compute_ai_metrics(path, model=DEFAULT_OLLAMA_ANALYSIS_MODEL)
+                success = self.pipeline.compute_ai_metrics(path, model=model, mode=provider, api_key=api_key)
                 if success:
                     processed += 1
                 else:
                     print(f"Skipping lesson {path} due to AI error.")
             
-            self.after(0, lambda: self._on_ai_finished(processed, total))
+            self.after(0, lambda: self._on_ai_finished(processed, total, scope))
 
         threading.Thread(target=_thread_target, daemon=True).start()
 
-    def _on_ai_finished(self, count, total):
+    def _on_ai_finished(self, count, total, scope="recent"):
         self.ai_btn.configure(state="normal", text="✨ Compute Recent AI Metrics")
+        self.ai_backfill_btn.configure(state="normal", text="Backfill All AI Metrics")
         if total == 0:
-            self.status_lbl.configure(text="No analyzable lessons found.")
+            if scope == "all":
+                self.status_lbl.configure(text="All lessons already have complete AI metrics.")
+            else:
+                self.status_lbl.configure(text="No recent analyzable lessons found.")
         else:
             self.status_lbl.configure(text=f"Finished analyzing {count} lessons.")
             self.refresh_data()
+
+    def _dashboard_ai_settings(self):
+        cfg_path = os.path.join(self.profile_dir, "config.json")
+        cfg = {}
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f) or {}
+            except Exception:
+                cfg = {}
+
+        provider = cfg.get("llm_provider", "ollama")
+        if provider == "openai":
+            model = cfg.get("openai_model", "gpt-5.4")
+            api_key = deobfuscate_secret(cfg.get("openai_api_key", ""))
+            return provider, model, api_key
+
+        return "ollama", cfg.get("ollama_model", DEFAULT_OLLAMA_ANALYSIS_MODEL), None
+
+    def _parse_lesson_datetime(self, lesson_id, meta):
+        dt_obj = None
+        if "recorded_at" in meta and meta["recorded_at"]:
+            try: dt_obj = datetime.fromisoformat(meta["recorded_at"])
+            except: pass
+        if not dt_obj and "created_at" in meta:
+            try: dt_obj = datetime.fromisoformat(meta["created_at"])
+            except: pass
+        if not dt_obj:
+            try: dt_obj = datetime.strptime(lesson_id.split("_")[0], "%Y%m%d")
+            except: pass
+        return dt_obj
+
+    def _practice_hours_by_lesson(self, lessons_dir):
+        lesson_times = []
+        for lesson_id in os.listdir(lessons_dir):
+            path = os.path.join(lessons_dir, lesson_id)
+            meta_path = os.path.join(path, "meta.json")
+            if not (os.path.isdir(path) and os.path.isfile(meta_path)):
+                continue
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+                dt_obj = self._parse_lesson_datetime(lesson_id, meta)
+                duration_sec = float(meta.get("duration_sec", 0.0) or 0.0)
+                if dt_obj:
+                    lesson_times.append((lesson_id, dt_obj, max(0.0, duration_sec)))
+            except Exception:
+                continue
+
+        practice_hours = {}
+        for lesson_id, dt_obj, _duration_sec in lesson_times:
+            window_start = dt_obj - timedelta(days=7)
+            seconds = sum(
+                duration_sec
+                for other_id, other_dt, duration_sec in lesson_times
+                if other_id != lesson_id and window_start <= other_dt < dt_obj
+            )
+            practice_hours[lesson_id] = seconds / 3600.0
+        return practice_hours
 
     def refresh_data(self):
         if not self.profile_dir or not os.path.exists(self.profile_dir): return
 
         lessons_dir = os.path.join(self.profile_dir, "lessons")
         if not os.path.isdir(lessons_dir): return
+        practice_hours_by_lesson = self._practice_hours_by_lesson(lessons_dir)
 
         # Accumulators
         total_recording_sec = 0.0
@@ -295,6 +487,8 @@ class DashboardFrame(ctk.CTkFrame):
         # AI Accumulators
         all_grammar_scores = [] # list of (date, score)
         golden_words_all = []
+        context_sessions = []
+        context_trend = []
         
         student_words_by_month = defaultdict(int)
         fluency_trend = []
@@ -314,20 +508,12 @@ class DashboardFrame(ctk.CTkFrame):
                 with open(seg_path, 'r', encoding='utf-8') as f: segments = json.load(f)
                 
                 # --- Date Parsing (Reused Logic) ---
-                dt_obj = None
-                if "recorded_at" in meta and meta["recorded_at"]:
-                    try: dt_obj = datetime.fromisoformat(meta["recorded_at"])
-                    except: pass
-                if not dt_obj and "created_at" in meta:
-                    try: dt_obj = datetime.fromisoformat(meta["created_at"])
-                    except: pass
-                if not dt_obj:
-                    try: dt_obj = datetime.strptime(lesson_id.split("_")[0], "%Y%m%d")
-                    except: pass
+                dt_obj = self._parse_lesson_datetime(lesson_id, meta)
                 
                 month_key = dt_obj.strftime("%Y-%m") if dt_obj else "Unknown"
 
                 # --- AI Data Loading ---
+                ai_data = {}
                 if os.path.exists(ai_path):
                     try:
                         with open(ai_path, 'r', encoding='utf-8') as f: ai_data = json.load(f)
@@ -392,10 +578,46 @@ class DashboardFrame(ctk.CTkFrame):
                 total_latency_count += lesson_lat_cnt
                 student_speaking_sec += lesson_student_sec
                 
-                if lesson_student_sec > 10 and dt_obj:
-                    wpm = (lesson_student_words / (lesson_student_sec/60))
+                lesson_raw_wpm = (lesson_student_words / (lesson_student_sec/60)) if lesson_student_sec > 10 else None
+                if lesson_raw_wpm is not None and dt_obj:
                     lat = (lesson_lat_sum / lesson_lat_cnt) if lesson_lat_cnt else 0
-                    fluency_trend.append((dt_obj, wpm, lat))
+                    fluency_trend.append((dt_obj, lesson_raw_wpm, lat))
+
+                if dt_obj:
+                    context = ai_data.get("context_metrics") if isinstance(ai_data.get("context_metrics"), dict) else {}
+                    derived_practice_hours = practice_hours_by_lesson.get(lesson_id)
+                    context = build_context_metrics(
+                        raw_grammar_score=ai_data.get("grammar_score", context.get("raw_grammar_score")),
+                        raw_wpm=lesson_raw_wpm if lesson_raw_wpm is not None else context.get("raw_wpm"),
+                        practice_hours_last_7_days=(
+                            derived_practice_hours
+                            if derived_practice_hours is not None
+                            else context.get("practice_hours_last_7_days")
+                        ),
+                        topic_difficulty=ai_data.get("topic_difficulty", context.get("topic_difficulty")),
+                        idea_density=ai_data.get("idea_density", context.get("idea_density")),
+                        abstraction_level=ai_data.get("abstraction_level", context.get("abstraction_level")),
+                        cognitive_branching=ai_data.get("cognitive_branching", context.get("cognitive_branching")),
+                        technical_density=ai_data.get("technical_density", context.get("technical_density")),
+                        discourse_depth=ai_data.get("discourse_depth", context.get("discourse_depth")),
+                        lexical_retrieval_pressure=ai_data.get(
+                            "lexical_retrieval_pressure",
+                            context.get("lexical_retrieval_pressure"),
+                        ),
+                        fatigue_or_stress=context.get("fatigue_or_stress"),
+                        long_pauses_per_min=context.get("long_pauses_per_min"),
+                        self_repairs_per_min=context.get("self_repairs_per_min"),
+                        filled_pauses_per_min=context.get("filled_pauses_per_min"),
+                        notes=ai_data.get("context_notes", context.get("notes")),
+                    )
+                    context_sessions.append(
+                        {
+                            "date": dt_obj,
+                            "grammar_score": ai_data.get("grammar_score"),
+                            "context_metrics": context,
+                        }
+                    )
+                    context_trend.append((dt_obj, context))
 
             except Exception as e:
                 print(f"Skipping {lesson_id}: {e}")
@@ -426,6 +648,19 @@ class DashboardFrame(ctk.CTkFrame):
         else:
             self.card_grammar.value_label.configure(text="--")
 
+        auto_gap = compute_automaticity_gap(sorted(context_sessions, key=lambda x: x["date"]), window=10)
+        if auto_gap["automaticity_gap"] is not None:
+            self.card_auto_gap.value_label.configure(
+                text=(
+                    f"{auto_gap['automaticity_gap']:.1f} pts\n"
+                    f"W {auto_gap['warm_session_count']} / C {auto_gap['cold_session_count']}"
+                )
+            )
+        else:
+            self.card_auto_gap.value_label.configure(
+                text=f"--\nW {auto_gap['warm_session_count']} / C {auto_gap['cold_session_count']}"
+            )
+
         if golden_words_all:
             # Show last 3 unique words
             unique_gold = []
@@ -449,6 +684,7 @@ class DashboardFrame(ctk.CTkFrame):
         self._plot_activity(student_words_by_month, self.tab_activity)
         self._plot_fluency(fluency_trend, self.tab_fluency)
         self._plot_grammar(all_grammar_scores, self.tab_grammar)
+        self._plot_context_metrics(context_trend, self.tab_context)
 
     # --- PLOT FUNCTIONS ---
 
@@ -543,6 +779,143 @@ class DashboardFrame(ctk.CTkFrame):
         ax.spines['left'].set_color(self.text_color)
         
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+
+        canvas = FigureCanvasTkAgg(fig, master=parent_tab)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _plot_context_metrics(self, trend_data, parent_tab):
+        for widget in parent_tab.winfo_children(): widget.destroy()
+        if len(trend_data) < 2:
+            ctk.CTkLabel(parent_tab, text="Need more context metrics to show trend.").pack(expand=True)
+            return
+
+        trend_data.sort(key=lambda x: x[0])
+        score_series = {
+            "Raw Grammar": ("raw_grammar_score", self.color_ai, "o", "-", -0.30),
+            "Adj Grammar": ("adjusted_grammar_score", "#6EB5FF", "D", "--", -0.18),
+            "Raw WPM": ("raw_wpm", self.color_student, "o", "-", -0.06),
+            "Load WPM": ("cognitive_load_adjusted_wpm", "#E0B84D", "s", "--", 0.06),
+            "Fluency Load": ("fluency_under_load", "#64C2A6", "^", "-.", 0.18),
+            "Effective Fluency": ("effective_fluency_score", "#E58ACD", "P", ":", 0.30),
+            "Resilience": ("complexity_resilience_score", "#B6D957", "X", ":", 0.42),
+        }
+        advanced_series = {
+            "Concept Load": ("conceptual_load_score", "#E0B84D", "o", "-", -0.18),
+            "Abstraction": ("abstraction_level", "#6EB5FF", "D", "--", -0.10),
+            "Branching": ("cognitive_branching", "#E58ACD", "s", "-.", -0.02),
+            "Technical": ("technical_density", "#D76A5D", "^", "-", 0.06),
+            "Discourse": ("discourse_depth", "#64C2A6", "P", "--", 0.14),
+            "Lexical Pressure": ("lexical_retrieval_pressure", "#C98A1A", "x", ":", 0.22),
+        }
+        context_series = {
+            "Topic Diff": ("topic_difficulty", "#D76A5D", "v", "-", -0.10),
+            "Idea Density": ("idea_density", "#C98A1A", "P", "--", 0.00),
+            "Practice 7d hrs": ("practice_hours_last_7_days", "#AFAFAF", "x", ":", 0.10),
+        }
+
+        fig, (ax_scores, ax_advanced, ax_context) = plt.subplots(
+            3,
+            1,
+            figsize=(7.2, 5.6),
+            dpi=100,
+            sharex=True,
+            gridspec_kw={"height_ratios": [2.0, 1.2, 1]},
+        )
+        fig.patch.set_facecolor(self.bg_figure)
+
+        def style_axis(ax):
+            ax.set_facecolor(self.bg_figure)
+            ax.tick_params(colors=self.text_color, labelsize=8)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['bottom'].set_color(self.text_color)
+            ax.spines['left'].set_color(self.text_color)
+
+        def plot_group(ax, series, zbase=10):
+            plotted_any = False
+            values_all = []
+            for idx, (label, (key, color, marker, linestyle, day_offset)) in enumerate(series.items()):
+                points = [(dt, ctx.get(key)) for dt, ctx in trend_data if isinstance(ctx.get(key), (int, float))]
+                if len(points) < 2:
+                    continue
+                dates = [x[0] + timedelta(days=day_offset) for x in points]
+                values = [x[1] for x in points]
+                values_all.extend(values)
+                ax.plot(
+                    dates,
+                    values,
+                    marker=marker,
+                    linestyle=linestyle,
+                    linewidth=1.6,
+                    markersize=4.3,
+                    alpha=0.88,
+                    label=label,
+                    color=color,
+                    zorder=zbase - idx,
+                )
+                plotted_any = True
+            return plotted_any, values_all
+
+        plotted_scores, _score_values = plot_group(ax_scores, score_series)
+        plotted_advanced, advanced_values = plot_group(ax_advanced, advanced_series)
+        plotted_context, context_values = plot_group(ax_context, context_series)
+
+        if not (plotted_scores or plotted_advanced or plotted_context):
+            plt.close(fig)
+            ctk.CTkLabel(parent_tab, text="Context metrics are not available yet.").pack(expand=True)
+            return
+
+        for ax in (ax_scores, ax_advanced, ax_context):
+            style_axis(ax)
+
+        ax_scores.set_title("Scores and WPM", color=self.text_color, fontsize=10, pad=6)
+        ax_scores.set_ylabel("Score / WPM", color=self.text_color, fontsize=8)
+        if plotted_scores:
+            ax_scores.legend(
+                loc="upper left",
+                bbox_to_anchor=(1.01, 1.0),
+                borderaxespad=0,
+                fontsize=7,
+                framealpha=0.82,
+            )
+        else:
+            ax_scores.text(0.5, 0.5, "No score/WPM context metrics yet", transform=ax_scores.transAxes, ha="center", color=self.card_subtext)
+
+        ax_advanced.set_title("Advanced Conceptual Load", color=self.text_color, fontsize=10, pad=4)
+        ax_advanced.set_ylabel("1-10", color=self.text_color, fontsize=8)
+        if advanced_values:
+            ax_advanced.set_ylim(0.5, max(10.0, max(advanced_values) + 0.75))
+        if plotted_advanced:
+            ax_advanced.legend(
+                loc="upper left",
+                bbox_to_anchor=(1.01, 1.0),
+                borderaxespad=0,
+                fontsize=7,
+                framealpha=0.82,
+            )
+        else:
+            ax_advanced.text(0.5, 0.5, "No advanced load metrics yet", transform=ax_advanced.transAxes, ha="center", color=self.card_subtext)
+
+        ax_context.set_title("Context Inputs", color=self.text_color, fontsize=10, pad=4)
+        ax_context.set_ylabel("Rating / hrs", color=self.text_color, fontsize=8)
+        if context_values:
+            context_top = max(5.0, max(context_values) + 0.75)
+            ax_context.set_ylim(-0.25, context_top)
+        if plotted_context:
+            ax_context.legend(
+                loc="upper left",
+                bbox_to_anchor=(1.01, 1.0),
+                borderaxespad=0,
+                fontsize=7,
+                framealpha=0.82,
+            )
+        else:
+            ax_context.text(0.5, 0.5, "No context inputs yet", transform=ax_context.transAxes, ha="center", color=self.card_subtext)
+
+        ax_context.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+        fig.suptitle("Raw and Context-Adjusted Trends", color=self.text_color, fontsize=10)
+        fig.tight_layout(rect=[0, 0, 0.86, 0.96])
 
         canvas = FigureCanvasTkAgg(fig, master=parent_tab)
         canvas.draw()

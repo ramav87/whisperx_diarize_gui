@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 import json
@@ -17,12 +19,15 @@ from .processing_backends import (
     resolve_asr_backend,
     resolve_diarization_backend,
 )
+from .metrics.context_adjusted import build_context_metrics
 
 StatusCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
 TIME_PATTERN = re.compile(r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\.(?P<ms>\d{3})")
 DEFAULT_MAX_CHARS = 20000
 DEFAULT_OLLAMA_ANALYSIS_MODEL = "gemma4:e4b"
+DEFAULT_OLLAMA_AI_METRICS_MAX_CHARS = 8000
+DEFAULT_OPENAI_AI_METRICS_MAX_CHARS = 120000
 
 def parse_time_to_seconds(t: str) -> float:
     """
@@ -97,6 +102,11 @@ class DiarizationPipelineRunner:
         """
         if self.progress_callback:
             self.progress_callback(value)
+
+    def _set_step(self, step: int, total: int, text: str, progress: Optional[float] = None):
+        self._set_status(f"Step {step}/{total}: {text}")
+        if progress is not None:
+            self._set_progress(progress)
 
     def _build_transcript_text(self, include_speaker: bool = True) -> str:
         if not self.last_result or "segments" not in self.last_result:
@@ -176,8 +186,51 @@ class DiarizationPipelineRunner:
             print(f"Saved AI metrics to: {path}")
         except Exception as e:
             print(f"Error saving JSON to {path}: {e}")
+
+    @staticmethod
+    def _normalize_grammar_score(score):
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            return score
+
+        if 0 < value <= 10:
+            value *= 10
+
+        value = float(max(0, min(100, value)))
+        return int(value) if value.is_integer() else value
+
+    def _compute_lesson_raw_wpm(self, lesson_dir, segments=None):
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        try:
+            if segments is None:
+                with open(os.path.join(lesson_dir, "segments.json"), "r", encoding="utf-8") as f:
+                    segments = json.load(f) or []
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f) or {}
+        except Exception:
+            return None
+
+        student_ids = set(meta.get("student_speakers", []))
+        words = 0
+        seconds = 0.0
+        for seg in segments or []:
+            if not isinstance(seg, dict):
+                continue
+            spk = seg.get("speaker", "UNKNOWN")
+            is_student = (spk in student_ids) or (not student_ids and "01" in str(spk))
+            if not is_student:
+                continue
+            try:
+                start = float(seg.get("start", 0))
+                end = float(seg.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            seconds += max(0.0, end - start)
+            words += len(str(seg.get("text", "")).strip().split())
+        return (words / (seconds / 60.0)) if seconds > 10 else None
             
-    def compute_ai_metrics(self, lesson_dir, model=DEFAULT_OLLAMA_ANALYSIS_MODEL, mode="ollama"):
+    def compute_ai_metrics(self, lesson_dir, model=DEFAULT_OLLAMA_ANALYSIS_MODEL, mode="ollama", api_key=None):
         """
         Robustly computes metrics. 
         Attempts strict JSON parsing first, falls back to text scraping if model refuses JSON.
@@ -195,12 +248,14 @@ class DiarizationPipelineRunner:
         output_path = os.path.join(lesson_dir, "ai_stats.json")
         
         text_content = ""
+        raw_wpm = None
         if os.path.exists(seg_path):
             try:
                 with open(seg_path, 'r', encoding='utf-8') as f:
                     segs = json.load(f)
                 for s in segs:
                     text_content += f"{s.get('speaker', 'Unknown')}: {s.get('text', '')}\n"
+                raw_wpm = self._compute_lesson_raw_wpm(lesson_dir, segs)
             except: pass
         
         if not text_content and os.path.exists(transcript_path):
@@ -208,18 +263,41 @@ class DiarizationPipelineRunner:
                 text_content = f.read()
 
         if not text_content: return False
-        if len(text_content) > 8000: text_content = text_content[:8000]
+        analysis_max_chars = (
+            DEFAULT_OPENAI_AI_METRICS_MAX_CHARS
+            if mode == "openai"
+            else DEFAULT_OLLAMA_AI_METRICS_MAX_CHARS
+        )
 
         # 2. Strict Prompt
         prompt = (
             "Analyze this language lesson. Identify the Student's mistakes.\n"
             "Respond with a strict JSON object using these keys:\n"
-            "grammar_score (0-100), topics (list of 3 strings), golden_words (list of 3 complex words), corrections (int), feedback (string).\n\n"
+            "grammar_score (0-100), topics (list of 3 strings), golden_words (list of 3 complex words), corrections (int), feedback (string), "
+            "topic_difficulty (number 1-5), idea_density (number 1-5), abstraction_level (number 1-10), "
+            "cognitive_branching (number 1-10), technical_density (number 1-10), discourse_depth (number 1-10), "
+            "lexical_retrieval_pressure (number 1-10), topic_tags (list of short strings), context_notes (short string), "
+            "self_repair_observations (short string).\n\n"
+            "Context rubric:\n"
+            "topic_difficulty: 1=daily life/simple narration, 2=familiar concrete topic, 3=opinion or explanation, "
+            "4=abstract argument, 5=technical, political, scientific, financial, philosophical, or highly abstract argument.\n"
+            "idea_density: 1=simple narration with low conceptual density, 2=concrete personal topic, 3=opinion with reasons, "
+            "4=abstract argument with multiple clauses, 5=dense technical/political/scientific explanation.\n"
+            "abstraction_level: 1=concrete events, 5=generalized explanation, 10=epistemic/theoretical/speculative reasoning.\n"
+            "cognitive_branching: 1=linear narration, 5=causal chains or comparisons, 10=nested hypotheticals/counterarguments/hedging.\n"
+            "technical_density: 1=everyday vocabulary, 5=some domain vocabulary, 10=specialized technical/scientific/business terminology.\n"
+            "discourse_depth: 1=short answers, 5=sustained explanation, 10=multi-step argument with evidence, tradeoffs, and synthesis.\n"
+            "lexical_retrieval_pressure: 1=rehearsed familiar domain, 5=some on-the-fly searching, 10=frequent specialized concept construction.\n"
+            "Do not grade the learner's intelligence or opinions. Focus only on linguistic and cognitive load.\n\n"
             "IMPORTANT FORMATTING:\n"
             "- 'golden_words' must be in the format: \"SpanishWord (EnglishTranslation)\"\n"
             "- Example: [\"desafortunadamente (unfortunately)\", \"hipótesis (hypothesis)\"]\n\n"
             "Example JSON:\n"
-            "{\"grammar_score\": 75, \"topics\": [\"Food\", \"Travel\"], \"golden_words\": [\"exquisito (exquisite)\", \"viaje (journey)\"], \"corrections\": 4, \"feedback\": \"Watch your past tense.\"}\n\n"
+            "{\"grammar_score\": 75, \"topics\": [\"Food\", \"Travel\"], \"golden_words\": [\"exquisito (exquisite)\", \"viaje (journey)\"], "
+            "\"corrections\": 4, \"feedback\": \"Watch your past tense.\", \"topic_difficulty\": 3, \"idea_density\": 3, "
+            "\"abstraction_level\": 4, \"cognitive_branching\": 4, \"technical_density\": 2, \"discourse_depth\": 4, \"lexical_retrieval_pressure\": 3, "
+            "\"topic_tags\": [\"travel\", \"food\"], \"context_notes\": \"Familiar concrete topics with some explanation.\", "
+            "\"self_repair_observations\": \"Occasional restarts.\"}\n\n"
             "JSON ONLY. NO MARKDOWN."
         )
 
@@ -229,6 +307,8 @@ class DiarizationPipelineRunner:
                 user_prompt=prompt,
                 model=model,
                 provider=mode,
+                api_key=api_key,
+                max_chars=analysis_max_chars,
                 external_text=text_content 
             )
             
@@ -247,7 +327,23 @@ class DiarizationPipelineRunner:
                 if start != -1 and end != 0:
                     json_str = clean[start:end]
                     data = json.loads(json_str)
+                    if "grammar_score" in data:
+                        data["grammar_score"] = self._normalize_grammar_score(data.get("grammar_score"))
                     data["golden_words"] = self._normalize_golden_words(data.get("golden_words"))
+                    data["context_metrics"] = build_context_metrics(
+                        raw_grammar_score=data.get("grammar_score"),
+                        raw_wpm=raw_wpm,
+                        topic_difficulty=data.get("topic_difficulty"),
+                        idea_density=data.get("idea_density"),
+                        abstraction_level=data.get("abstraction_level"),
+                        cognitive_branching=data.get("cognitive_branching"),
+                        technical_density=data.get("technical_density"),
+                        discourse_depth=data.get("discourse_depth"),
+                        lexical_retrieval_pressure=data.get("lexical_retrieval_pressure"),
+                        notes=data.get("context_notes"),
+                    )
+                    data["llm_provider"] = mode
+                    data["llm_model"] = model
                     self._save_json(data, output_path)
                     return True
             except:
@@ -261,7 +357,10 @@ class DiarizationPipelineRunner:
                 "topics": ["General Conversation"],
                 "golden_words": [],
                 "corrections": 0,
-                "feedback": "Keep practicing!"
+                "feedback": "Keep practicing!",
+                "context_metrics": build_context_metrics(raw_grammar_score=70, raw_wpm=raw_wpm),
+                "llm_provider": mode,
+                "llm_model": model,
             }
             
             # ... (Regex matching code) ...
@@ -470,12 +569,14 @@ class DiarizationPipelineRunner:
         self.last_preprocessed_audio_path = None
         self.last_processing_meta = {}
 
-        self._set_status("Preparing audio...")
-        self._set_progress(5)
+        total_steps = 8
+
+        self._set_step(1, total_steps, "Preparing audio...", 5)
         cache_dir = os.path.join(output_dir, ".cache")
         preprocess = preprocess_audio_mono_16k(audio_path, cache_dir)
         self.last_preprocessed_audio_path = preprocess.normalized_path
 
+        self._set_step(2, total_steps, "Selecting ASR and diarization backends...", 12)
         asr_backend, asr_resolution = resolve_asr_backend(backend)
         diar_backend, diar_resolution = resolve_diarization_backend(diarization_backend)
 
@@ -489,13 +590,16 @@ class DiarizationPipelineRunner:
             "compute_type": "int8" if device_hint == "cpu" else "float16",
             "batch_size": batch_size,
             "apple_compute_preference": apple_compute_preference,
+            "status_callback": lambda text: self._set_step(3, total_steps, text),
+            "progress_callback": self._set_progress,
         }
 
-        self._set_status(f"Loading ASR backend ({asr_resolution['selected']})...")
-        self._set_progress(15)
+        self._set_step(3, total_steps, f"Preparing ASR backend ({asr_resolution['selected']})...", 15)
         if asr_resolution.get("fallback"):
-            self._set_status(
-                f"ASR fallback active: {asr_resolution['selected']} (requested {asr_resolution['requested']})"
+            self._set_step(
+                3,
+                total_steps,
+                f"ASR fallback active: {asr_resolution['selected']} (requested {asr_resolution['requested']})",
             )
 
         model_requested = model_size
@@ -512,7 +616,7 @@ class DiarizationPipelineRunner:
             if model_requested == "large-v3":
                 model_used = "turbo"
                 model_fallback = "turbo"
-                self._set_status("large-v3 failed; retrying with turbo...")
+                self._set_step(3, total_steps, "large-v3 failed; retrying with turbo...", 18)
                 try:
                     asr_result = asr_backend.transcribe(
                         preprocess.normalized_path,
@@ -525,8 +629,7 @@ class DiarizationPipelineRunner:
             else:
                 raise
 
-        self._set_status("Running diarization...")
-        self._set_progress(85)
+        self._set_step(4, total_steps, "ASR complete; starting diarization...", 84)
 
         diar_segments, diar_meta = diar_backend.diarize(
             preprocess.normalized_path,
@@ -537,8 +640,9 @@ class DiarizationPipelineRunner:
         )
         diarize_df = pd.DataFrame(diar_segments)
 
+        self._set_step(5, total_steps, "Cleaning transcript segments...", 88)
         cleaned_segments, raw_segments = prepare_transcript_segments(asr_result.segments)
-        self._set_status("Assigning speakers to cleaned transcript...")
+        self._set_step(6, total_steps, "Assigning speakers to transcript...", 91)
         result_segments = assign_speakers_by_overlap(cleaned_segments, diar_segments)
         raw_segments_with_speakers = assign_speakers_by_overlap(raw_segments, diar_segments)
 
@@ -609,8 +713,7 @@ class DiarizationPipelineRunner:
             "preprocess_already_normalized": preprocess.already_normalized,
         }
 
-        self._set_status("Saving output files...")
-        self._set_progress(95)
+        self._set_step(7, total_steps, "Saving output files...", 95)
         os.makedirs(output_dir, exist_ok=True)
         basename = os.path.splitext(os.path.basename(audio_path))[0]
         txt_path = os.path.join(output_dir, f"{basename}_diarized.txt")
@@ -655,8 +758,7 @@ class DiarizationPipelineRunner:
                 indent=2,
             )
 
-        self._set_status("Done")
-        self._set_progress(100)
+        self._set_step(8, total_steps, "Done", 100)
         return txt_path, json_path
 
     def get_transcript_text(
@@ -773,7 +875,7 @@ class DiarizationPipelineRunner:
 
         if provider == "openai":
             from .openai_provider import OpenAIProvider
-            client = OpenAIProvider(api_key=api_key, model=model or "gpt-5.2")
+            client = OpenAIProvider(api_key=api_key, model=model or "gpt-5.4")
             self._set_status(f"Calling OpenAI ({client.model})...")
             self._set_progress(50)
             return client.analyze(combined_prompt)
