@@ -14,6 +14,12 @@ from typing import Any, Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
+# WhisperX and Pyannote 3.x load trusted Lightning checkpoints during normal
+# ASR/diarization startup. PyTorch 2.6+ defaults torch.load to weights_only=True,
+# which rejects those checkpoints unless this compatibility flag is set before
+# either library imports.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
 from .pipeline import DiarizationPipelineRunner
 
 
