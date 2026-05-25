@@ -47,7 +47,14 @@ id -u diarize >/dev/null 2>&1 || useradd --system --create-home --home-dir "$INS
 mkdir -p "$INSTALL_DIR" "$DATA_DIR"
 chown -R diarize:diarize "$INSTALL_DIR" "$DATA_DIR"
 
-if [[ ! -d "$INSTALL_DIR/.git" ]]; then
+if [[ -d "$INSTALL_DIR/.git" ]]; then
+  echo "Using existing git checkout in $INSTALL_DIR"
+else
+  if [[ -n "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    echo "Install dir $INSTALL_DIR exists and is not empty, but is not a git checkout."
+    echo "Move it aside or point INSTALL_DIR at a clean directory, then rerun."
+    exit 1
+  fi
   "${AS_DIARIZE[@]}" git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
