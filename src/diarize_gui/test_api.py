@@ -82,6 +82,7 @@ class FailingPipelineRunner(FakePipelineRunner):
 class ApiTests(unittest.TestCase):
     def setUp(self):
         api._jobs.clear()
+        api._analysis_jobs.clear()
 
     def test_health_reports_storage_paths(self):
         with tempfile.TemporaryDirectory() as root:
@@ -246,6 +247,52 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()["detail"], "Error: model not found")
+
+    def test_create_analysis_job_runs_in_background_and_can_be_polled(self):
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root)
+            lesson_dir = data_dir / "lessons" / "lesson-1"
+            lesson_dir.mkdir(parents=True)
+            (lesson_dir / "meta.json").write_text(json.dumps({"profile": "test"}), encoding="utf-8")
+            (lesson_dir / "segments.json").write_text(
+                json.dumps([{"speaker": "SPEAKER_00", "text": "hola"}]),
+                encoding="utf-8",
+            )
+            (lesson_dir / "transcript.txt").write_text("SPEAKER_00: hola\n", encoding="utf-8")
+
+            with patch.object(api, "DATA_DIR", data_dir), patch.object(
+                api, "UPLOADS_DIR", data_dir / "uploads"
+            ), patch.object(api, "LESSONS_DIR", data_dir / "lessons"), patch.object(
+                api, "_executor", ImmediateExecutor()
+            ), patch.object(
+                api, "DiarizationPipelineRunner", FakePipelineRunner
+            ):
+                with TestClient(api.app) as client:
+                    created = client.post(
+                        "/api/lessons/lesson-1/analysis-jobs",
+                        json={"provider": "ollama", "model": "gemma4:e4b"},
+                    )
+                    job = created.json()
+                    polled = client.get(f"/api/analysis-jobs/{job['id']}").json()
+                    lesson = client.get("/api/lessons/lesson-1").json()
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(polled["status"], "succeeded")
+        self.assertEqual(polled["progress"], 100)
+        self.assertEqual(polled["lesson_id"], "lesson-1")
+        self.assertEqual(polled["result"]["ai_stats"]["grammar_score"], 88)
+        self.assertEqual(lesson["ai_stats"]["llm_model"], "gemma4:e4b")
+
+    def test_missing_analysis_job_returns_404(self):
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root)
+            with patch.object(api, "DATA_DIR", data_dir), patch.object(
+                api, "UPLOADS_DIR", data_dir / "uploads"
+            ), patch.object(api, "LESSONS_DIR", data_dir / "lessons"):
+                with TestClient(api.app) as client:
+                    response = client.get("/api/analysis-jobs/does-not-exist")
+
+        self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

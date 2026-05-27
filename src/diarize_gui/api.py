@@ -49,6 +49,7 @@ class JobState:
 
 
 _jobs: dict[str, JobState] = {}
+_analysis_jobs: dict[str, JobState] = {}
 _jobs_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=1)
 
@@ -202,35 +203,43 @@ def create_app() -> FastAPI:
         payload: Optional[dict[str, Any]] = Body(None),
     ) -> dict[str, Any]:
         lesson_dir = _lesson_dir_or_404(lesson_id)
-        payload = payload or {}
-        provider = str(payload.get("provider") or os.environ.get("DIARIZE_LLM_PROVIDER") or "ollama")
-        provider = provider.strip().lower()
-        model = payload.get("model") or os.environ.get("DIARIZE_LLM_MODEL") or DEFAULT_OLLAMA_ANALYSIS_MODEL
-        api_key = payload.get("api_key") or os.environ.get("OPENAI_API_KEY")
-        api_url = payload.get("api_url") or _default_ollama_api_url()
-
-        runner = DiarizationPipelineRunner()
-        runner.load_lesson_artifacts(str(lesson_dir))
-        success = runner.compute_ai_metrics(
-            str(lesson_dir),
-            model=model or None,
-            mode=provider,
-            api_key=api_key,
-            api_url=api_url if provider == "ollama" else None,
-        )
-        if not success:
-            raise HTTPException(
-                status_code=500,
-                detail=runner.last_ai_metrics_error or "AI analysis failed",
-            )
-
-        meta_path = lesson_dir / "meta.json"
-        meta = _read_json(meta_path) or {}
-        meta["llm_provider"] = provider
-        meta["llm_model"] = model
-        meta["analyzed_at"] = _now()
-        _write_json(meta_path, meta)
+        try:
+            _compute_lesson_analysis(lesson_dir, payload or {})
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         return _lesson_response(lesson_id, lesson_dir)
+
+    @app.post("/api/lessons/{lesson_id}/analysis-jobs")
+    def create_analysis_job(
+        lesson_id: str,
+        payload: Optional[dict[str, Any]] = Body(None),
+    ) -> dict[str, Any]:
+        lesson_dir = _lesson_dir_or_404(lesson_id)
+        job_id = uuid.uuid4().hex
+        now = _now()
+        state = JobState(
+            id=job_id,
+            status="queued",
+            created_at=now,
+            updated_at=now,
+            lesson_id=lesson_id,
+            message="Queued analysis",
+        )
+        with _jobs_lock:
+            _analysis_jobs[job_id] = state
+
+        _executor.submit(
+            _run_analysis_job,
+            job_id=job_id,
+            lesson_id=lesson_id,
+            lesson_dir=lesson_dir,
+            payload=payload or {},
+        )
+        return _job_response(state)
+
+    @app.get("/api/analysis-jobs/{job_id}")
+    def get_analysis_job(job_id: str) -> dict[str, Any]:
+        return _job_response(_get_analysis_job_or_404(job_id))
 
     return app
 
@@ -320,9 +329,61 @@ def _run_processing_job(
         )
 
 
+def _run_analysis_job(
+    *,
+    job_id: str,
+    lesson_id: str,
+    lesson_dir: Path,
+    payload: dict[str, Any],
+) -> None:
+    _update_analysis_job(
+        job_id,
+        status="running",
+        progress=1,
+        message="Starting AI analysis",
+    )
+
+    try:
+        result = _compute_lesson_analysis(
+            lesson_dir,
+            payload,
+            status_callback=lambda message: _update_analysis_job(job_id, message=message),
+            progress_callback=lambda progress: _update_analysis_job(
+                job_id,
+                progress=max(1.0, min(99.0, float(progress))),
+            ),
+        )
+        _update_analysis_job(
+            job_id,
+            status="succeeded",
+            progress=100,
+            message="Done",
+            result={
+                "lesson_id": lesson_id,
+                "ai_stats": result.get("ai_stats"),
+                "meta": result.get("meta"),
+            },
+        )
+    except Exception as exc:
+        _update_analysis_job(
+            job_id,
+            status="failed",
+            message="AI analysis failed",
+            error=str(exc),
+        )
+
+
 def _update_job(job_id: str, **updates: Any) -> None:
+    _update_job_map(_jobs, job_id, **updates)
+
+
+def _update_analysis_job(job_id: str, **updates: Any) -> None:
+    _update_job_map(_analysis_jobs, job_id, **updates)
+
+
+def _update_job_map(job_map: dict[str, JobState], job_id: str, **updates: Any) -> None:
     with _jobs_lock:
-        state = _jobs.get(job_id)
+        state = job_map.get(job_id)
         if not state:
             return
         for key, value in updates.items():
@@ -335,6 +396,14 @@ def _get_job_or_404(job_id: str) -> JobState:
         state = _jobs.get(job_id)
     if not state:
         raise HTTPException(status_code=404, detail="Job not found")
+    return state
+
+
+def _get_analysis_job_or_404(job_id: str) -> JobState:
+    with _jobs_lock:
+        state = _analysis_jobs.get(job_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Analysis job not found")
     return state
 
 
@@ -396,6 +465,43 @@ def _lesson_response(lesson_id: str, lesson_dir: Path) -> dict[str, Any]:
         "transcript": transcript,
         "ai_stats": ai_stats,
     }
+
+
+def _compute_lesson_analysis(
+    lesson_dir: Path,
+    payload: dict[str, Any],
+    *,
+    status_callback=None,
+    progress_callback=None,
+) -> dict[str, Any]:
+    provider = str(payload.get("provider") or os.environ.get("DIARIZE_LLM_PROVIDER") or "ollama")
+    provider = provider.strip().lower()
+    model = payload.get("model") or os.environ.get("DIARIZE_LLM_MODEL") or DEFAULT_OLLAMA_ANALYSIS_MODEL
+    api_key = payload.get("api_key") or os.environ.get("OPENAI_API_KEY")
+    api_url = payload.get("api_url") or _default_ollama_api_url()
+
+    runner = DiarizationPipelineRunner(
+        status_callback=status_callback,
+        progress_callback=progress_callback,
+    )
+    runner.load_lesson_artifacts(str(lesson_dir))
+    success = runner.compute_ai_metrics(
+        str(lesson_dir),
+        model=model or None,
+        mode=provider,
+        api_key=api_key,
+        api_url=api_url if provider == "ollama" else None,
+    )
+    if not success:
+        raise RuntimeError(runner.last_ai_metrics_error or "AI analysis failed")
+
+    meta_path = lesson_dir / "meta.json"
+    meta = _read_json(meta_path) or {}
+    meta["llm_provider"] = provider
+    meta["llm_model"] = model
+    meta["analyzed_at"] = _now()
+    _write_json(meta_path, meta)
+    return _lesson_response(lesson_dir.name, lesson_dir)
 
 
 def _default_ollama_api_url() -> str:
