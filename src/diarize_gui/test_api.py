@@ -54,6 +54,24 @@ class FakePipelineRunner:
         (out / "transcript.txt").write_text("SPEAKER_00: hola\n", encoding="utf-8")
         return meta
 
+    def load_lesson_artifacts(self, lesson_dir):
+        self.lesson_dir = Path(lesson_dir)
+        return json.loads((self.lesson_dir / "meta.json").read_text(encoding="utf-8"))
+
+    def compute_ai_metrics(self, lesson_dir, **kwargs):
+        out = Path(lesson_dir)
+        (out / "ai_stats.json").write_text(
+            json.dumps(
+                {
+                    "grammar_score": 88,
+                    "llm_provider": kwargs.get("mode"),
+                    "llm_model": kwargs.get("model"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return True
+
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
@@ -112,6 +130,93 @@ class ApiTests(unittest.TestCase):
                     response = client.get("/api/jobs/does-not-exist")
 
         self.assertEqual(response.status_code, 404)
+
+    def test_update_lesson_speakers_persists_labels_and_student_speakers(self):
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root)
+            lesson_dir = data_dir / "lessons" / "lesson-1"
+            lesson_dir.mkdir(parents=True)
+            (lesson_dir / "meta.json").write_text(json.dumps({"profile": "test"}), encoding="utf-8")
+            (lesson_dir / "segments.json").write_text(
+                json.dumps(
+                    [
+                        {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "text": "hola"},
+                        {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_01", "text": "bien"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (lesson_dir / "transcript.txt").write_text("SPEAKER_00: hola\n", encoding="utf-8")
+
+            with patch.object(api, "DATA_DIR", data_dir), patch.object(
+                api, "UPLOADS_DIR", data_dir / "uploads"
+            ), patch.object(api, "LESSONS_DIR", data_dir / "lessons"):
+                with TestClient(api.app) as client:
+                    response = client.patch(
+                        "/api/lessons/lesson-1/speakers",
+                        json={
+                            "speaker_labels": {"SPEAKER_00": "Tutor", "SPEAKER_01": "Student"},
+                            "student_speakers": ["SPEAKER_01"],
+                        },
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        meta = response.json()["meta"]
+        self.assertEqual(meta["speaker_labels"]["SPEAKER_00"], "Tutor")
+        self.assertEqual(meta["student_speakers"], ["SPEAKER_01"])
+        self.assertIn("speaker_reviewed_at", meta)
+
+    def test_update_lesson_speakers_rejects_unknown_speaker(self):
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root)
+            lesson_dir = data_dir / "lessons" / "lesson-1"
+            lesson_dir.mkdir(parents=True)
+            (lesson_dir / "meta.json").write_text(json.dumps({}), encoding="utf-8")
+            (lesson_dir / "segments.json").write_text(
+                json.dumps([{"speaker": "SPEAKER_00", "text": "hola"}]),
+                encoding="utf-8",
+            )
+
+            with patch.object(api, "DATA_DIR", data_dir), patch.object(
+                api, "UPLOADS_DIR", data_dir / "uploads"
+            ), patch.object(api, "LESSONS_DIR", data_dir / "lessons"):
+                with TestClient(api.app) as client:
+                    response = client.patch(
+                        "/api/lessons/lesson-1/speakers",
+                        json={"student_speakers": ["SPEAKER_99"]},
+                    )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_analyze_lesson_writes_ai_stats_and_updates_meta(self):
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root)
+            lesson_dir = data_dir / "lessons" / "lesson-1"
+            lesson_dir.mkdir(parents=True)
+            (lesson_dir / "meta.json").write_text(json.dumps({"profile": "test"}), encoding="utf-8")
+            (lesson_dir / "segments.json").write_text(
+                json.dumps([{"speaker": "SPEAKER_00", "text": "hola"}]),
+                encoding="utf-8",
+            )
+            (lesson_dir / "transcript.txt").write_text("SPEAKER_00: hola\n", encoding="utf-8")
+
+            with patch.object(api, "DATA_DIR", data_dir), patch.object(
+                api, "UPLOADS_DIR", data_dir / "uploads"
+            ), patch.object(api, "LESSONS_DIR", data_dir / "lessons"), patch.object(
+                api, "DiarizationPipelineRunner", FakePipelineRunner
+            ):
+                with TestClient(api.app) as client:
+                    response = client.post(
+                        "/api/lessons/lesson-1/analyze",
+                        json={"provider": "ollama", "model": "gemma4:e4b"},
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["ai_stats"]["grammar_score"], 88)
+        self.assertEqual(body["meta"]["llm_provider"], "ollama")
+        self.assertEqual(body["meta"]["llm_model"], "gemma4:e4b")
+        self.assertIn("analyzed_at", body["meta"])
 
 
 if __name__ == "__main__":

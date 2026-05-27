@@ -231,7 +231,14 @@ class DiarizationPipelineRunner:
             words += len(str(seg.get("text", "")).strip().split())
         return (words / (seconds / 60.0)) if seconds > 10 else None
             
-    def compute_ai_metrics(self, lesson_dir, model=DEFAULT_OLLAMA_ANALYSIS_MODEL, mode="ollama", api_key=None):
+    def compute_ai_metrics(
+        self,
+        lesson_dir,
+        model=DEFAULT_OLLAMA_ANALYSIS_MODEL,
+        mode="ollama",
+        api_key=None,
+        api_url=None,
+    ):
         """
         Robustly computes metrics. 
         Attempts strict JSON parsing first, falls back to text scraping if model refuses JSON.
@@ -309,6 +316,7 @@ class DiarizationPipelineRunner:
                 model=model,
                 provider=mode,
                 api_key=api_key,
+                api_url=api_url,
                 max_chars=analysis_max_chars,
                 external_text=text_content 
             )

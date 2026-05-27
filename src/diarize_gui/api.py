@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 # WhisperX and Pyannote 3.x load trusted Lightning checkpoints during normal
@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # either library imports.
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
-from .pipeline import DiarizationPipelineRunner
+from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL, DiarizationPipelineRunner
 
 
 def _server_data_dir() -> Path:
@@ -145,18 +145,89 @@ def create_app() -> FastAPI:
 
     @app.get("/api/lessons/{lesson_id}")
     def get_lesson(lesson_id: str) -> dict[str, Any]:
+        return _lesson_response(lesson_id, _lesson_dir_or_404(lesson_id))
+
+    @app.patch("/api/lessons/{lesson_id}/speakers")
+    def update_lesson_speakers(
+        lesson_id: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
         lesson_dir = _lesson_dir_or_404(lesson_id)
-        meta = _read_json(lesson_dir / "meta.json") or {}
+        meta_path = lesson_dir / "meta.json"
         segments = _read_json(lesson_dir / "segments.json") or []
-        ai_stats = _read_json(lesson_dir / "ai_stats.json")
-        transcript = _read_text(lesson_dir / "transcript.txt")
-        return {
-            "id": lesson_id,
-            "meta": meta,
-            "segments": segments,
-            "transcript": transcript,
-            "ai_stats": ai_stats,
+        known_speakers = {str(seg.get("speaker")) for seg in segments if seg.get("speaker")}
+
+        speaker_labels = payload.get("speaker_labels", {})
+        if speaker_labels is None:
+            speaker_labels = {}
+        if not isinstance(speaker_labels, dict):
+            raise HTTPException(status_code=400, detail="speaker_labels must be an object")
+
+        normalized_labels = {
+            str(speaker): str(label).strip()
+            for speaker, label in speaker_labels.items()
+            if str(speaker).strip() and str(label).strip()
         }
+        unknown_labels = sorted(set(normalized_labels) - known_speakers)
+        if unknown_labels:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown speaker id(s): {', '.join(unknown_labels)}",
+            )
+
+        student_speakers = payload.get("student_speakers", [])
+        if student_speakers is None:
+            student_speakers = []
+        if not isinstance(student_speakers, list):
+            raise HTTPException(status_code=400, detail="student_speakers must be a list")
+
+        normalized_students = [str(speaker) for speaker in student_speakers if str(speaker).strip()]
+        unknown_students = sorted(set(normalized_students) - known_speakers)
+        if unknown_students:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown student speaker id(s): {', '.join(unknown_students)}",
+            )
+
+        meta = _read_json(meta_path) or {}
+        meta["speaker_labels"] = normalized_labels
+        meta["student_speakers"] = normalized_students
+        meta["speaker_reviewed_at"] = _now()
+        _write_json(meta_path, meta)
+        return _lesson_response(lesson_id, lesson_dir)
+
+    @app.post("/api/lessons/{lesson_id}/analyze")
+    def analyze_lesson(
+        lesson_id: str,
+        payload: Optional[dict[str, Any]] = Body(None),
+    ) -> dict[str, Any]:
+        lesson_dir = _lesson_dir_or_404(lesson_id)
+        payload = payload or {}
+        provider = str(payload.get("provider") or os.environ.get("DIARIZE_LLM_PROVIDER") or "ollama")
+        provider = provider.strip().lower()
+        model = payload.get("model") or os.environ.get("DIARIZE_LLM_MODEL") or DEFAULT_OLLAMA_ANALYSIS_MODEL
+        api_key = payload.get("api_key") or os.environ.get("OPENAI_API_KEY")
+        api_url = payload.get("api_url") or _default_ollama_api_url()
+
+        runner = DiarizationPipelineRunner()
+        runner.load_lesson_artifacts(str(lesson_dir))
+        success = runner.compute_ai_metrics(
+            str(lesson_dir),
+            model=model or None,
+            mode=provider,
+            api_key=api_key,
+            api_url=api_url if provider == "ollama" else None,
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="AI analysis failed")
+
+        meta_path = lesson_dir / "meta.json"
+        meta = _read_json(meta_path) or {}
+        meta["llm_provider"] = provider
+        meta["llm_model"] = model
+        meta["analyzed_at"] = _now()
+        _write_json(meta_path, meta)
+        return _lesson_response(lesson_id, lesson_dir)
 
     return app
 
@@ -302,6 +373,39 @@ def _read_text(path: Path) -> Optional[str]:
         return None
     with path.open("r", encoding="utf-8") as f:
         return f.read()
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _lesson_response(lesson_id: str, lesson_dir: Path) -> dict[str, Any]:
+    meta = _read_json(lesson_dir / "meta.json") or {}
+    segments = _read_json(lesson_dir / "segments.json") or []
+    ai_stats = _read_json(lesson_dir / "ai_stats.json")
+    transcript = _read_text(lesson_dir / "transcript.txt")
+    return {
+        "id": lesson_id,
+        "meta": meta,
+        "segments": segments,
+        "transcript": transcript,
+        "ai_stats": ai_stats,
+    }
+
+
+def _default_ollama_api_url() -> str:
+    configured = os.environ.get("DIARIZE_OLLAMA_API_URL")
+    if configured:
+        return configured
+
+    host = os.environ.get("OLLAMA_HOST")
+    if host:
+        base = host if "://" in host else f"http://{host}"
+        return base.rstrip("/") + "/api/generate"
+
+    return "http://127.0.0.1:11434/api/generate"
 
 
 def _now() -> str:
