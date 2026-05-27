@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -21,6 +23,13 @@ from fastapi.middleware.cors import CORSMiddleware
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
 from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL, DiarizationPipelineRunner
+
+
+logging.basicConfig(
+    level=os.environ.get("DIARIZE_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("diarize_server")
 
 
 def _server_data_dir() -> Path:
@@ -68,6 +77,12 @@ def create_app() -> FastAPI:
     def _ensure_storage() -> None:
         UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
         LESSONS_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "server startup data_dir=%s uploads_dir=%s lessons_dir=%s",
+            DATA_DIR,
+            UPLOADS_DIR,
+            LESSONS_DIR,
+        )
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -98,6 +113,21 @@ def create_app() -> FastAPI:
         UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
         with upload_path.open("wb") as f:
             shutil.copyfileobj(audio.file, f)
+        try:
+            upload_size = upload_path.stat().st_size
+        except OSError:
+            upload_size = None
+        logger.info(
+            "processing job queued job_id=%s profile=%s filename=%s bytes=%s model=%s language=%s backend=%s diarization=%s",
+            job_id,
+            profile,
+            audio.filename,
+            upload_size,
+            model_size,
+            language,
+            backend,
+            diarization_backend,
+        )
 
         now = _now()
         state = JobState(id=job_id, status="queued", created_at=now, updated_at=now)
@@ -227,6 +257,15 @@ def create_app() -> FastAPI:
         )
         with _jobs_lock:
             _analysis_jobs[job_id] = state
+        provider = str((payload or {}).get("provider") or os.environ.get("DIARIZE_LLM_PROVIDER") or "ollama")
+        model = (payload or {}).get("model") or os.environ.get("DIARIZE_LLM_MODEL") or DEFAULT_OLLAMA_ANALYSIS_MODEL
+        logger.info(
+            "analysis job queued job_id=%s lesson_id=%s provider=%s model=%s",
+            job_id,
+            lesson_id,
+            provider,
+            model,
+        )
 
         _executor.submit(
             _run_analysis_job,
@@ -261,6 +300,7 @@ def _run_processing_job(
     diarization_backend: str,
     batch_size: Optional[int],
 ) -> None:
+    started = time.monotonic()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     lesson_id = f"{timestamp}_{job_id[:8]}"
     lesson_dir = LESSONS_DIR / lesson_id
@@ -277,6 +317,13 @@ def _run_processing_job(
         message="Starting transcription and diarization",
         lesson_id=lesson_id,
         progress=1,
+    )
+    logger.info(
+        "processing job started job_id=%s lesson_id=%s upload_path=%s output_dir=%s",
+        job_id,
+        lesson_id,
+        upload_path,
+        lesson_dir,
     )
 
     try:
@@ -320,7 +367,16 @@ def _run_processing_job(
                 "meta": meta,
             },
         )
+        logger.info(
+            "processing job succeeded job_id=%s lesson_id=%s elapsed_s=%.1f segments=%s speakers=%s",
+            job_id,
+            lesson_id,
+            time.monotonic() - started,
+            meta.get("num_segments"),
+            meta.get("num_speakers"),
+        )
     except Exception as exc:
+        logger.exception("processing job failed job_id=%s lesson_id=%s", job_id, lesson_id)
         _update_job(
             job_id,
             status="failed",
@@ -336,11 +392,21 @@ def _run_analysis_job(
     lesson_dir: Path,
     payload: dict[str, Any],
 ) -> None:
+    started = time.monotonic()
     _update_analysis_job(
         job_id,
         status="running",
         progress=1,
         message="Starting AI analysis",
+    )
+    provider = str(payload.get("provider") or os.environ.get("DIARIZE_LLM_PROVIDER") or "ollama")
+    model = payload.get("model") or os.environ.get("DIARIZE_LLM_MODEL") or DEFAULT_OLLAMA_ANALYSIS_MODEL
+    logger.info(
+        "analysis job started job_id=%s lesson_id=%s provider=%s model=%s",
+        job_id,
+        lesson_id,
+        provider,
+        model,
     )
 
     try:
@@ -364,7 +430,16 @@ def _run_analysis_job(
                 "meta": result.get("meta"),
             },
         )
+        logger.info(
+            "analysis job succeeded job_id=%s lesson_id=%s elapsed_s=%.1f provider=%s model=%s",
+            job_id,
+            lesson_id,
+            time.monotonic() - started,
+            provider,
+            model,
+        )
     except Exception as exc:
+        logger.exception("analysis job failed job_id=%s lesson_id=%s", job_id, lesson_id)
         _update_analysis_job(
             job_id,
             status="failed",
@@ -386,9 +461,25 @@ def _update_job_map(job_map: dict[str, JobState], job_id: str, **updates: Any) -
         state = job_map.get(job_id)
         if not state:
             return
+        old_status = state.status
+        old_message = state.message
+        old_progress = state.progress
         for key, value in updates.items():
             setattr(state, key, value)
         state.updated_at = _now()
+        if (
+            state.status != old_status
+            or state.message != old_message
+            or int(state.progress) != int(old_progress)
+        ):
+            logger.info(
+                "job update job_id=%s status=%s progress=%.1f lesson_id=%s message=%s",
+                job_id,
+                state.status,
+                state.progress,
+                state.lesson_id,
+                state.message,
+            )
 
 
 def _get_job_or_404(job_id: str) -> JobState:
@@ -479,6 +570,13 @@ def _compute_lesson_analysis(
     model = payload.get("model") or os.environ.get("DIARIZE_LLM_MODEL") or DEFAULT_OLLAMA_ANALYSIS_MODEL
     api_key = payload.get("api_key") or os.environ.get("OPENAI_API_KEY")
     api_url = payload.get("api_url") or _default_ollama_api_url()
+    logger.info(
+        "analysis compute started lesson_id=%s provider=%s model=%s api_url=%s",
+        lesson_dir.name,
+        provider,
+        model,
+        api_url if provider == "ollama" else None,
+    )
 
     runner = DiarizationPipelineRunner(
         status_callback=status_callback,
@@ -501,6 +599,7 @@ def _compute_lesson_analysis(
     meta["llm_model"] = model
     meta["analyzed_at"] = _now()
     _write_json(meta_path, meta)
+    logger.info("analysis compute saved lesson_id=%s ai_stats=%s", lesson_dir.name, lesson_dir / "ai_stats.json")
     return _lesson_response(lesson_dir.name, lesson_dir)
 
 
@@ -526,7 +625,9 @@ def main() -> None:
 
     host = os.environ.get("DIARIZE_SERVER_HOST", "0.0.0.0")
     port = int(os.environ.get("DIARIZE_SERVER_PORT", "8000"))
-    uvicorn.run("diarize_gui.api:app", host=host, port=port)
+    log_level = os.environ.get("DIARIZE_LOG_LEVEL", "info").lower()
+    logger.info("starting uvicorn host=%s port=%s log_level=%s", host, port, log_level)
+    uvicorn.run("diarize_gui.api:app", host=host, port=port, log_level=log_level)
 
 
 if __name__ == "__main__":
