@@ -219,7 +219,10 @@ def create_app() -> FastAPI:
             api_url=api_url if provider == "ollama" else None,
         )
         if not success:
-            raise HTTPException(status_code=500, detail="AI analysis failed")
+            raise HTTPException(
+                status_code=500,
+                detail=runner.last_ai_metrics_error or "AI analysis failed",
+            )
 
         meta_path = lesson_dir / "meta.json"
         meta = _read_json(meta_path) or {}

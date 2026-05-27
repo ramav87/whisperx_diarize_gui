@@ -73,6 +73,12 @@ class FakePipelineRunner:
         return True
 
 
+class FailingPipelineRunner(FakePipelineRunner):
+    def compute_ai_metrics(self, lesson_dir, **kwargs):
+        self.last_ai_metrics_error = "Error: model not found"
+        return False
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         api._jobs.clear()
@@ -217,6 +223,29 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(body["meta"]["llm_provider"], "ollama")
         self.assertEqual(body["meta"]["llm_model"], "gemma4:e4b")
         self.assertIn("analyzed_at", body["meta"])
+
+    def test_analyze_lesson_returns_pipeline_error_detail(self):
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = Path(root)
+            lesson_dir = data_dir / "lessons" / "lesson-1"
+            lesson_dir.mkdir(parents=True)
+            (lesson_dir / "meta.json").write_text(json.dumps({"profile": "test"}), encoding="utf-8")
+            (lesson_dir / "segments.json").write_text(
+                json.dumps([{"speaker": "SPEAKER_00", "text": "hola"}]),
+                encoding="utf-8",
+            )
+            (lesson_dir / "transcript.txt").write_text("SPEAKER_00: hola\n", encoding="utf-8")
+
+            with patch.object(api, "DATA_DIR", data_dir), patch.object(
+                api, "UPLOADS_DIR", data_dir / "uploads"
+            ), patch.object(api, "LESSONS_DIR", data_dir / "lessons"), patch.object(
+                api, "DiarizationPipelineRunner", FailingPipelineRunner
+            ):
+                with TestClient(api.app) as client:
+                    response = client.post("/api/lessons/lesson-1/analyze")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"], "Error: model not found")
 
 
 if __name__ == "__main__":

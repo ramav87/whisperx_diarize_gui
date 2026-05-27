@@ -65,6 +65,7 @@ class DiarizationPipelineRunner:
         self.last_output_dir = None
         self.last_diar_df: Optional[pd.DataFrame] = None
         self.last_processing_meta: dict[str, Any] = {}
+        self.last_ai_metrics_error: Optional[str] = None
 
     @staticmethod
     def _normalize_golden_words(value) -> List[str]:
@@ -243,6 +244,7 @@ class DiarizationPipelineRunner:
         Robustly computes metrics. 
         Attempts strict JSON parsing first, falls back to text scraping if model refuses JSON.
         """
+        self.last_ai_metrics_error = None
         # --- NEW: Ensure Model Exists before we start ---
         if mode == "ollama":
             self._ensure_model_exists(model)
@@ -270,7 +272,9 @@ class DiarizationPipelineRunner:
             with open(transcript_path, 'r', encoding='utf-8') as f:
                 text_content = f.read()
 
-        if not text_content: return False
+        if not text_content:
+            self.last_ai_metrics_error = "No transcript text found for AI analysis."
+            return False
         analysis_max_chars = (
             DEFAULT_OPENAI_AI_METRICS_MAX_CHARS
             if mode == "openai"
@@ -325,6 +329,7 @@ class DiarizationPipelineRunner:
             # Check if the LLM call actually failed before trying to parse
             if raw_response.startswith("Error:"):
                 print(f"LLM Analysis Failed for {lesson_dir}: {raw_response}")
+                self.last_ai_metrics_error = raw_response
                 return False  # Return False so we don't save a garbage file
             # --- CRITICAL FIX END ---
             
@@ -393,6 +398,7 @@ class DiarizationPipelineRunner:
 
         except Exception as e:
             print(f"Error computing AI metrics: {e}")
+            self.last_ai_metrics_error = str(e)
             return False
 
     def _ensure_model_exists(self, model_name: str):
