@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import subprocess
+import shutil
 import json
 import re
 from datetime import datetime
@@ -41,46 +42,36 @@ LANGUAGE_MAP = {
     "Ukrainian": "uk", "Vietnamese": "vi"
 }
 
-#Kill Ollama if it is already running to prevent errors from other ollama servers
-try:
-    os.system("pkill ollama") 
-except:
-    pass
+def find_ollama_binary() -> str | None:
+    if getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base_path = get_resource_base_path()
+
+    candidates = [
+        os.path.join(base_path, "deps", "ollama"),
+        os.path.join(base_path, "ollama"),
+        shutil.which("ollama"),
+    ]
+    return next((path for path in candidates if path and os.path.exists(path)), None)
+
 
 def start_bundled_ollama():
     """
-    Starts the bundled Ollama binary in 'serve' mode.
+    Starts the bundled or system Ollama binary in 'serve' mode.
     """
-    # 1. FIX: Reliable Path Logic (Remove _MEIPASS)
-    if getattr(sys, 'frozen', False):
-        # In the App Bundle, look relative to the actual executable
-        # Path: .../DiarizeApp.app/Contents/MacOS
-        base_path = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        # In Dev Mode
-        base_path = get_resource_base_path()
-
-    # 2. Locate Binary
-    # Look in 'deps' first (Standard for our build)
-    ollama_bin = os.path.join(base_path, "deps", "ollama")
-    
-    # Fallback for dev/legacy paths
-    if not os.path.exists(ollama_bin):
-        ollama_bin = os.path.join(base_path, "ollama")
-    
-    if not os.path.exists(ollama_bin):
-        print(f"CRITICAL ERROR: Bundled Ollama binary not found at: {ollama_bin}")
+    ollama_bin = find_ollama_binary()
+    if ollama_bin is None:
+        print("WARNING: Ollama binary not found. Install Ollama or use OpenAI analysis.")
         return None
 
-    # 3. Permissions Check
-    try:
-        os.chmod(ollama_bin, 0o755)
-    except Exception:
-        pass
+    if getattr(sys, 'frozen', False):
+        try:
+            os.chmod(ollama_bin, 0o755)
+        except Exception:
+            pass
 
-    # 4. Environment Setup
-    # Ensure we use the correct Application Support folder
-    models_dir = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+    models_dir = os.path.expanduser(os.environ.get("OLLAMA_MODELS", "~/.local/share/diarize-gui/ollama-models"))
     os.makedirs(models_dir, exist_ok=True)
     
     env = os.environ.copy()
@@ -88,7 +79,7 @@ def start_bundled_ollama():
     # Force the custom port to avoid conflicts with system Ollama
     env["OLLAMA_HOST"] = "127.0.0.1:11435"
     
-    print(f"Starting bundled Ollama from: {ollama_bin}")
+    print(f"Starting Ollama from: {ollama_bin}")
     print(f"Ollama Models Dir: {models_dir}")
 
     try:
@@ -131,7 +122,7 @@ def wait_for_ollama_server(timeout_s: int = 30) -> bool:
         
 def setup_ffmpeg_environment():
     """
-    Adds the bundled FFmpeg binary to the system PATH.
+    Adds bundled FFmpeg to PATH, or uses system FFmpeg in development.
     """
     base_path = get_resource_base_path()
     
@@ -156,8 +147,10 @@ def setup_ffmpeg_environment():
             print("FFmpeg verification successful.")
         except Exception as e:
             print(f"WARNING: Bundled FFmpeg found but not executable: {e}")
+    elif shutil.which("ffmpeg"):
+        print(f"Using system FFmpeg: {shutil.which('ffmpeg')}")
     else:
-        print(f"CRITICAL WARNING: Bundled FFmpeg not found at: {ffmpeg_dir}")
+        print("WARNING: FFmpeg not found. Install ffmpeg before transcription.")
 
 class ToolTip:
     def __init__(self, widget, text, delay=500):
@@ -2593,35 +2586,17 @@ class DiarizationApp:
         prog.start()
 
         def worker():
-            # --- FIX: Reliable Path Logic ---
-            if getattr(sys, 'frozen', False):
-                # In the .app bundle, resources are relative to the executable
-                # Path: .../DiarizeApp.app/Contents/MacOS/
-                base_path = os.path.dirname(os.path.abspath(sys.executable))
-            else:
-                # In Dev Mode, use the helper we defined
-                base_path = get_resource_base_path()
-            
-            # Look in the 'deps' folder first (Standard for our build)
-            ollama_bin = os.path.join(base_path, "deps", "ollama")
-            
-            # Fallback (Only needed for dev mode or old structures)
-            if not os.path.exists(ollama_bin):
-                print(f"DEBUG: deps/ollama not found at {ollama_bin}, trying fallback...")
-                ollama_bin = os.path.join(base_path, "ollama")
-            
+            ollama_bin = find_ollama_binary()
             print(f"DEBUG: Using ollama binary at: {ollama_bin}")
-            # --------------------------------
 
             env = os.environ.copy()
-            # Ensure models are saved in Application Support, not the temp bundle
-            env["OLLAMA_MODELS"] = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+            env["OLLAMA_MODELS"] = os.path.expanduser(os.environ.get("OLLAMA_MODELS", "~/.local/share/diarize-gui/ollama-models"))
             env["OLLAMA_HOST"] = "127.0.0.1:11435"
 
             try:
                 # Check if binary exists before running to avoid obscure error codes
-                if not os.path.exists(ollama_bin):
-                    raise FileNotFoundError(f"Ollama binary not found at: {ollama_bin}")
+                if not ollama_bin:
+                    raise FileNotFoundError("Ollama binary not found. Install Ollama or use OpenAI analysis.")
 
                 if not wait_for_ollama_server(timeout_s=30):
                     raise RuntimeError("Ollama server did not become ready in time.")

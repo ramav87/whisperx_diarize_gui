@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#0f766e">
+    <title>Diarize Mobile</title>
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Diarize Server</p>
+          <h1>Lessons</h1>
+        </div>
+        <button id="refreshLessonsBtn" class="icon-button" type="button" aria-label="Refresh lessons" title="Refresh lessons">
+          <span aria-hidden="true">R</span>
+        </button>
+      </header>
+
+      <main>
+        <section class="panel connection-panel" aria-labelledby="connection-title">
+          <div class="section-head">
+            <div>
+              <h2 id="connection-title">Connection</h2>
+              <p id="connectionStatus" class="muted">Not checked</p>
+            </div>
+            <span id="connectionBadge" class="status-badge neutral">Offline</span>
+          </div>
+          <form id="serverForm" class="server-form">
+            <label for="serverUrl">Server URL</label>
+            <div class="input-action">
+              <input id="serverUrl" name="serverUrl" type="url" inputmode="url" placeholder="http://192.168.1.20:8000" autocomplete="url" required>
+              <button type="submit">Connect</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel" aria-labelledby="capture-title">
+          <div class="section-head">
+            <div>
+              <h2 id="capture-title">New Lesson</h2>
+              <p class="muted">Record or upload audio for server processing.</p>
+            </div>
+          </div>
+
+          <div class="field-grid">
+            <label>
+              Profile
+              <input id="profileInput" type="text" value="default" autocomplete="off">
+            </label>
+            <label>
+              Language
+              <select id="languageSelect">
+                <option value="">Auto</option>
+                <option value="es">Spanish</option>
+                <option value="en">English</option>
+                <option value="fr">French</option>
+                <option value="de">German</option>
+                <option value="it">Italian</option>
+                <option value="pt">Portuguese</option>
+              </select>
+            </label>
+            <label>
+              Model
+              <select id="modelSelect">
+                <option value="large-v3">large-v3</option>
+                <option value="turbo">turbo</option>
+                <option value="medium">medium</option>
+                <option value="small">small</option>
+              </select>
+            </label>
+            <label>
+              Speakers
+              <select id="speakerCountSelect">
+                <option value="">Auto</option>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+              </select>
+            </label>
+            <label>
+              Diarization
+              <select id="diarizationSelect">
+                <option value="pyannote">Pyannote</option>
+                <option value="single_speaker">Single speaker</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="recording-controls">
+            <button id="recordBtn" class="secondary" type="button">Record</button>
+            <button id="stopBtn" class="danger" type="button" disabled>Stop</button>
+            <span id="recordingTimer" class="timer">00:00</span>
+          </div>
+
+          <label class="file-picker">
+            <span>Audio file</span>
+            <input id="audioInput" type="file" accept="audio/*">
+          </label>
+
+          <button id="submitJobBtn" class="primary full-width" type="button" disabled>Upload and Process</button>
+          <div id="selectedAudio" class="selected-audio muted">No audio selected</div>
+        </section>
+
+        <section id="jobPanel" class="panel hidden" aria-labelledby="job-title">
+          <div class="section-head">
+            <div>
+              <h2 id="job-title">Processing</h2>
+              <p id="jobMessage" class="muted">Queued</p>
+            </div>
+            <span id="jobStatus" class="status-badge neutral">Queued</span>
+          </div>
+          <div class="progress-track" aria-label="Processing progress">
+            <div id="jobProgress" class="progress-fill"></div>
+          </div>
+          <button id="openLessonBtn" class="secondary full-width hidden" type="button">Open Lesson</button>
+        </section>
+
+        <section class="content-grid">
+          <section class="panel lessons-panel" aria-labelledby="lessons-title">
+            <div class="section-head">
+              <div>
+                <h2 id="lessons-title">History</h2>
+                <p id="lessonCount" class="muted">No lessons loaded</p>
+              </div>
+            </div>
+            <div id="lessonsList" class="lessons-list"></div>
+          </section>
+
+          <section id="lessonDetail" class="panel lesson-detail" aria-labelledby="detail-title">
+            <div class="empty-state">
+              <h2 id="detail-title">Select a lesson</h2>
+              <p class="muted">Transcript, speaker review, and AI analysis will appear here.</p>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <template id="lessonDetailTemplate">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow lesson-date"></p>
+          <h2 class="lesson-title"></h2>
+          <p class="muted lesson-meta"></p>
+        </div>
+        <button class="secondary export-transcript-button" type="button">Export .txt</button>
+      </div>
+
+      <div class="tabs" role="tablist" aria-label="Lesson views">
+        <button class="tab active" type="button" data-view="transcript">Transcript</button>
+        <button class="tab" type="button" data-view="speakers">Speakers</button>
+        <button class="tab" type="button" data-view="analysis">Analysis</button>
+      </div>
+
+      <div class="tab-view" data-view-panel="transcript">
+        <div class="transcript"></div>
+      </div>
+
+      <div class="tab-view hidden" data-view-panel="speakers">
+        <form class="speaker-form"></form>
+      </div>
+
+      <div class="tab-view hidden" data-view-panel="analysis">
+        <div class="analysis-controls">
+          <label>
+            Provider
+            <select class="analysis-provider">
+              <option value="ollama">Ollama</option>
+              <option value="openai">OpenAI</option>
+            </select>
+          </label>
+          <label>
+            Model
+            <input class="analysis-model" type="text" value="gemma4:e4b" autocomplete="off">
+          </label>
+          <button class="primary analyze-button" type="button">Analyze Lesson</button>
+        </div>
+        <pre class="analysis-output"></pre>
+      </div>
+    </template>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

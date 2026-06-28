@@ -389,9 +389,13 @@ class WhisperXBackend(ASRBackendBase):
         device = (config or {}).get("device") or detect_device()
         compute_type = (config or {}).get("compute_type") or ("int8" if device == "cpu" else "float16")
         batch_size = (config or {}).get("batch_size")
+        vad_method = (config or {}).get("vad_method") or os.environ.get("DIARIZE_WHISPERX_VAD_METHOD")
 
         _backend_status(config, f"Loading WhisperX model ({model_size}, {device}/{compute_type})...", 20)
-        model = whisperx.load_model(model_size, device=device, compute_type=compute_type)
+        load_kwargs = {"compute_type": compute_type}
+        if vad_method:
+            load_kwargs["vad_method"] = vad_method
+        model = whisperx.load_model(model_size, device=device, **load_kwargs)
         _backend_status(config, "Loading normalized audio for ASR...", 28)
         audio = whisperx.load_audio(audio_path)
         transcribe_kwargs = {"language": language, "task": "transcribe"}
@@ -679,6 +683,28 @@ class SpeakerKitFutureBackend(DiarizationBackendBase):
         )
 
 
+class SingleSpeakerDiarizationBackend(DiarizationBackendBase):
+    name = "single_speaker"
+
+    def diarize(
+        self,
+        audio_path: str,
+        *,
+        num_speakers: Optional[int] = None,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+        config: Optional[dict] = None,
+    ) -> Tuple[List[dict], Dict[str, Any]]:
+        segments = config.get("asr_segments", []) if config else []
+        return single_speaker_diarization_from_segments(segments), {
+            "backend": self.name,
+            "device": "none",
+            "notes": [
+                "Diarization was skipped; all transcript segments were labeled as SPEAKER_00.",
+            ],
+        }
+
+
 def resolve_diarization_backend(preferred: str) -> Tuple[DiarizationBackendBase, Dict[str, Any]]:
     preferred = (preferred or "pyannote").strip().lower()
     meta = {"requested": preferred, "selected": None, "fallback": None, "notes": []}
@@ -690,6 +716,7 @@ def resolve_diarization_backend(preferred: str) -> Tuple[DiarizationBackendBase,
 
     backend_map = {
         "pyannote": PyannoteDiarizationBackend(),
+        "single_speaker": SingleSpeakerDiarizationBackend(),
         "speakerkit_future": SpeakerKitFutureBackend(),
     }
 

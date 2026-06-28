@@ -1,7 +1,18 @@
 whisperx
-torch
-torchaudio
+torch<2.7
+torchaudio<2.7
+torchvision<0.22
 sounddevice
 soundfile
-pyannote.audio
+customtkinter
+pillow
+pyannote.audio<4
+huggingface-hub<1.0,>=0.34.0
 pyperclip
+fastapi
+uvicorn[standard]
+python-multipart
+
+[:platform_system == "Darwin" and platform_machine == "arm64"]
+openai-whisper
+mlx-whisper

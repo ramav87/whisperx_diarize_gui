@@ -47,6 +47,57 @@ Initial API endpoints:
 - `GET /api/lessons`
 - `GET /api/lessons/{lesson_id}`
 
+## Mobile web frontend
+
+This repo includes an initial mobile-first web frontend in `frontend/`. It is a
+static app, so it does not need a JavaScript build step.
+
+Start the processing server:
+
+```bash
+diarize-server
+```
+
+In another terminal, serve the frontend:
+
+```bash
+python3 -m http.server 5173 --directory frontend
+```
+
+Open `http://127.0.0.1:5173/` on the server machine, or open
+`http://SERVER_IP:5173/` from a phone or tablet on the same network. The UI can
+connect to `http://SERVER_IP:8000`, record or upload audio, track processing
+jobs, browse lessons, review speaker labels, and trigger AI analysis.
+
+## Native Android app
+
+The `android-app/` directory contains an initial native Android client. It uses
+Android's microphone APIs to record M4A audio directly on the tablet, uploads the
+recording to the existing `diarize-server` API, polls processing progress, and
+can browse lessons, review speaker labels, and trigger AI analysis.
+
+To run it:
+
+1. Start the processing server on this machine:
+
+   ```bash
+   diarize-server
+   ```
+
+2. Open `android-app/` in Android Studio.
+3. Let Android Studio sync Gradle.
+4. Run the app on the tablet.
+5. In the app, set the server URL to the server machine's LAN address, for
+   example:
+
+   ```text
+   http://192.168.1.160:8000
+   ```
+
+The app intentionally permits cleartext HTTP for LAN development through
+`network_security_config.xml`. Replace that with HTTPS before exposing the
+server outside a trusted local network.
+
 ## Linux server install
 
 For a permanent Linux host, install the app under `/opt/diarize-server` and run

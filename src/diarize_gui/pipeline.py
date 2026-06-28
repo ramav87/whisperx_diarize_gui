@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import shutil
 import json
 import re
 import time
@@ -406,7 +407,7 @@ class DiarizationPipelineRunner:
         Checks if the Ollama model exists. If not, downloads it automatically.
         """
         import subprocess
-        
+
         # 1. Setup Paths & Env (Same as your GUI logic)
         if getattr(sys, 'frozen', False):
             base_path = os.path.dirname(os.path.abspath(sys.executable))
@@ -421,14 +422,17 @@ class DiarizationPipelineRunner:
         ollama_bin = os.path.join(base_path, "deps", "ollama")
         if not os.path.exists(ollama_bin):
             ollama_bin = os.path.join(base_path, "ollama")
-            
+
         if not os.path.exists(ollama_bin):
-            print(f"WARNING: Could not find Ollama binary at {ollama_bin} to check for model.")
+            ollama_bin = shutil.which("ollama")
+
+        if not ollama_bin:
+            print("WARNING: Could not find Ollama binary to check for model.")
             return
 
         # Setup Env
         env = os.environ.copy()
-        env["OLLAMA_MODELS"] = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+        env["OLLAMA_MODELS"] = os.path.expanduser(os.environ.get("OLLAMA_MODELS", "~/.local/share/diarize-gui/ollama-models"))
         env["OLLAMA_HOST"] = "127.0.0.1:11435"
 
         if not self._wait_for_ollama_ready(ollama_bin, env):
@@ -652,7 +656,10 @@ class DiarizationPipelineRunner:
                 num_speakers=num_speakers,
                 min_speakers=min_speakers,
                 max_speakers=max_speakers,
-                config={"device": "cpu" if is_apple_silicon() else device_hint},
+                config={
+                    "device": "cpu" if is_apple_silicon() else device_hint,
+                    "asr_segments": asr_result.segments,
+                },
             )
         except Exception as diar_error:
             diar_segments = single_speaker_diarization_from_segments(asr_result.segments)
