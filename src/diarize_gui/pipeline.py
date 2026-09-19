@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 import requests
-from .utils import detect_device, format_timestamp, is_apple_silicon
+from .utils import detect_device, format_timestamp, is_apple_silicon, ollama_models_dir
 from .audio_tools import preprocess_audio_mono_16k
 from .processing_backends import (
     assign_speakers_by_overlap,
@@ -26,10 +26,94 @@ from .metrics.context_adjusted import build_context_metrics
 StatusCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
 TIME_PATTERN = re.compile(r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\.(?P<ms>\d{3})")
-DEFAULT_MAX_CHARS = 20000
+DEFAULT_MAX_CHARS = 120000
 DEFAULT_OLLAMA_ANALYSIS_MODEL = "gemma4:e4b"
-DEFAULT_OLLAMA_AI_METRICS_MAX_CHARS = 8000
+DEFAULT_OLLAMA_AI_METRICS_MAX_CHARS = 120000
 DEFAULT_OPENAI_AI_METRICS_MAX_CHARS = 120000
+DEFAULT_OLLAMA_CONTEXT_TOKENS = 49152
+AI_METRICS_SCHEMA_VERSION = 2
+AI_METRICS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "grammar_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "topics": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5},
+        "golden_words": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        "corrections": {"type": "integer", "minimum": 0},
+        "feedback": {"type": "string"},
+        "topic_difficulty": {"type": "number", "minimum": 1, "maximum": 5},
+        "idea_density": {"type": "number", "minimum": 1, "maximum": 5},
+        "abstraction_level": {"type": "number", "minimum": 1, "maximum": 10},
+        "cognitive_branching": {"type": "number", "minimum": 1, "maximum": 10},
+        "technical_density": {"type": "number", "minimum": 1, "maximum": 10},
+        "discourse_depth": {"type": "number", "minimum": 1, "maximum": 10},
+        "lexical_retrieval_pressure": {"type": "number", "minimum": 1, "maximum": 10},
+        "topic_tags": {"type": "array", "items": {"type": "string"}},
+        "context_notes": {"type": "string"},
+        "self_repair_observations": {"type": "string"},
+        "cefr_estimate": {"type": "string"},
+        "cefr_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "error_counts": {
+            "type": "object",
+            "additionalProperties": {"type": "integer", "minimum": 0},
+        },
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "original": {"type": "string"},
+                    "correction": {"type": "string"},
+                    "explanation": {"type": "string"},
+                },
+                "required": ["category", "original", "correction"],
+            },
+            "maxItems": 12,
+        },
+        "strengths": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        "priority_goals": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        "communicative_effectiveness": {"type": "number", "minimum": 0, "maximum": 100},
+        "accuracy_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "complexity_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "lexical_range_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "recurring_patterns": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "estimated_count": {"type": "integer", "minimum": 1},
+                    "learner_example": {"type": "string"},
+                    "better_form": {"type": "string"},
+                    "practice_rule": {"type": "string"},
+                },
+                "required": ["category", "pattern", "learner_example", "better_form"],
+            },
+            "maxItems": 6,
+        },
+        "successful_self_repairs": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        "next_session_plan": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string"},
+                    "exercise": {"type": "string"},
+                    "success_criterion": {"type": "string"},
+                },
+                "required": ["goal", "exercise", "success_criterion"],
+            },
+            "maxItems": 3,
+        },
+        "analysis_limitations": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+    },
+    "required": [
+        "grammar_score", "topics", "golden_words", "corrections", "feedback",
+        "topic_difficulty", "idea_density", "abstraction_level", "cognitive_branching",
+        "technical_density", "discourse_depth", "lexical_retrieval_pressure",
+    ],
+}
 
 def parse_time_to_seconds(t: str) -> float:
     """
@@ -203,6 +287,40 @@ class DiarizationPipelineRunner:
         value = float(max(0, min(100, value)))
         return int(value) if value.is_integer() else value
 
+    @staticmethod
+    def _validate_ai_metrics(data):
+        if not isinstance(data, dict):
+            raise ValueError("AI metrics response is not a JSON object.")
+
+        for key in AI_METRICS_SCHEMA["required"]:
+            if key not in data:
+                raise ValueError(f"AI metrics response is missing required field: {key}")
+
+        ranges = {
+            "grammar_score": (0, 100),
+            "topic_difficulty": (1, 5),
+            "idea_density": (1, 5),
+            "abstraction_level": (1, 10),
+            "cognitive_branching": (1, 10),
+            "technical_density": (1, 10),
+            "discourse_depth": (1, 10),
+            "lexical_retrieval_pressure": (1, 10),
+        }
+        for key, (low, high) in ranges.items():
+            value = data.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"AI metrics field {key} must be numeric.")
+            if not low <= float(value) <= high:
+                raise ValueError(f"AI metrics field {key} must be between {low} and {high}.")
+
+        if not isinstance(data.get("topics"), list):
+            raise ValueError("AI metrics field topics must be a list.")
+        if not isinstance(data.get("golden_words"), list):
+            raise ValueError("AI metrics field golden_words must be a list.")
+        if isinstance(data.get("corrections"), bool) or not isinstance(data.get("corrections"), int):
+            raise ValueError("AI metrics field corrections must be an integer.")
+        return data
+
     def _compute_lesson_raw_wpm(self, lesson_dir, segments=None):
         meta_path = os.path.join(lesson_dir, "meta.json")
         try:
@@ -241,14 +359,11 @@ class DiarizationPipelineRunner:
         api_key=None,
         api_url=None,
     ):
-        """
-        Robustly computes metrics. 
-        Attempts strict JSON parsing first, falls back to text scraping if model refuses JSON.
-        """
+        """Compute validated, versioned learner metrics without fabricated fallbacks."""
         self.last_ai_metrics_error = None
         # --- NEW: Ensure Model Exists before we start ---
         if mode == "ollama":
-            self._ensure_model_exists(model)
+            self._ensure_model_exists(model, api_url=api_url)
         # ------------------------------------------------
         import json
         import re
@@ -274,10 +389,22 @@ class DiarizationPipelineRunner:
             for speaker in (meta.get("student_speakers") or [])
             if str(speaker).strip()
         ]
+        speaker_scope = "explicit" if student_speakers else "unresolved"
         if os.path.exists(seg_path):
             try:
                 with open(seg_path, 'r', encoding='utf-8') as f:
                     segs = json.load(f)
+                if not student_speakers:
+                    inferred = sorted(
+                        {
+                            str(segment.get("speaker"))
+                            for segment in segs
+                            if isinstance(segment, dict) and "01" in str(segment.get("speaker", ""))
+                        }
+                    )
+                    if inferred:
+                        student_speakers = inferred
+                        speaker_scope = "inferred_speaker_01"
                 for s in segs:
                     speaker = str(s.get("speaker", "Unknown"))
                     label = str(speaker_labels.get(speaker) or speaker)
@@ -308,7 +435,8 @@ class DiarizationPipelineRunner:
                 "Use tutor/teacher lines only as conversation context, not as learner errors.\n\n"
             )
         prompt = (
-            "Analyze this language lesson. Identify the Student's mistakes.\n"
+            "Analyze this language lesson for longitudinal language-learning progress. "
+            "Identify recurring patterns and support claims with transcript evidence.\n"
             f"{scope_line}"
             "Respond with a strict JSON object using these keys:\n"
             "grammar_score (0-100), topics (list of 3 strings), golden_words (list of 3 complex words), corrections (int), feedback (string), "
@@ -316,6 +444,20 @@ class DiarizationPipelineRunner:
             "cognitive_branching (number 1-10), technical_density (number 1-10), discourse_depth (number 1-10), "
             "lexical_retrieval_pressure (number 1-10), topic_tags (list of short strings), context_notes (short string), "
             "self_repair_observations (short string).\n\n"
+            "Treat CEFR as a secondary, approximate summary rather than the main result. Also return: "
+            "cefr_estimate and cefr_confidence (0-1); communicative_effectiveness, accuracy_score, "
+            "complexity_score, and lexical_range_score (all 0-100); error_counts grouped by linguistic category; "
+            "evidence examples with exact learner quotes; strengths; priority_goals; recurring_patterns with category, "
+            "pattern, estimated_count, learner_example, better_form, and practice_rule; successful_self_repairs; "
+            "and a next_session_plan containing up to three goal/exercise/success_criterion objects. "
+            "Use analysis_limitations to flag uncertain speaker attribution, likely transcription errors, or evidence that "
+            "is too sparse to support a claim. Never assess pronunciation or prosody from transcript text.\n\n"
+            "Coaching rules:\n"
+            "- Prefer two or three high-impact repeated patterns over a long list of isolated mistakes.\n"
+            "- Separate communication success from grammatical accuracy; a learner may communicate effectively with errors.\n"
+            "- Count a pattern only when the transcript supports it, and copy learner evidence exactly.\n"
+            "- Do not treat tutor wording as a learner error. Reward successful self-correction and sustained explanation.\n"
+            "- Make each next-session exercise concrete enough for a tutor to use immediately.\n\n"
             "Context rubric:\n"
             "topic_difficulty: 1=daily life/simple narration, 2=familiar concrete topic, 3=opinion or explanation, "
             "4=abstract argument, 5=technical, political, scientific, financial, philosophical, or highly abstract argument.\n"
@@ -348,11 +490,17 @@ class DiarizationPipelineRunner:
                 api_key=api_key,
                 api_url=api_url,
                 max_chars=analysis_max_chars,
-                external_text=text_content 
+                external_text=text_content,
+                response_format=AI_METRICS_SCHEMA if mode == "ollama" else None,
+                context_tokens=DEFAULT_OLLAMA_CONTEXT_TOKENS if mode == "ollama" else None,
             )
             
             # --- CRITICAL FIX START ---
             # Check if the LLM call actually failed before trying to parse
+            if not isinstance(raw_response, str) or not raw_response.strip():
+                self.last_ai_metrics_error = "Invalid structured AI metrics: empty model response"
+                print(self.last_ai_metrics_error)
+                return False
             if raw_response.startswith("Error:"):
                 print(f"LLM Analysis Failed for {lesson_dir}: {raw_response}")
                 self.last_ai_metrics_error = raw_response
@@ -369,6 +517,7 @@ class DiarizationPipelineRunner:
                     data = json.loads(json_str)
                     if "grammar_score" in data:
                         data["grammar_score"] = self._normalize_grammar_score(data.get("grammar_score"))
+                    self._validate_ai_metrics(data)
                     data["golden_words"] = self._normalize_golden_words(data.get("golden_words"))
                     data["context_metrics"] = build_context_metrics(
                         raw_grammar_score=data.get("grammar_score"),
@@ -387,55 +536,34 @@ class DiarizationPipelineRunner:
                     data["analysis_scope"] = {
                         "student_speakers": student_speakers,
                         "speaker_labels": speaker_labels,
+                        "speaker_scope": speaker_scope,
+                    }
+                    transcript_chars = len(text_content)
+                    chars_used = min(transcript_chars, analysis_max_chars)
+                    data["analysis_schema_version"] = AI_METRICS_SCHEMA_VERSION
+                    data["analysis_provenance"] = {
+                        "provider": mode,
+                        "model": model,
+                        "transcript_chars": transcript_chars,
+                        "transcript_chars_used": chars_used,
+                        "transcript_coverage": chars_used / transcript_chars if transcript_chars else 0,
+                        "student_scope": speaker_scope,
+                        "structured_output": mode == "ollama",
                     }
                     self._save_json(data, output_path)
                     return True
-            except (TypeError, ValueError, json.JSONDecodeError):
-                print("JSON parsing failed, attempting text scrape...")
-
-            # --- STRATEGY B: Scrape Text (Fallback) ---
-            # ... (Rest of your fallback logic remains the same) ...
-            
-            fallback_data = {
-                "grammar_score": 70,
-                "topics": ["General Conversation"],
-                "golden_words": [],
-                "corrections": 0,
-                "feedback": "Keep practicing!",
-                "context_metrics": build_context_metrics(raw_grammar_score=70, raw_wpm=raw_wpm),
-                "llm_provider": mode,
-                "llm_model": model,
-                "analysis_scope": {
-                    "student_speakers": student_speakers,
-                    "speaker_labels": speaker_labels,
-                },
-            }
-            
-            # ... (Regex matching code) ...
-            
-            score_match = re.search(r"Score:?\**\s*(\d+)", raw_response, re.IGNORECASE)
-            if score_match: fallback_data["grammar_score"] = int(score_match.group(1))
-
-            words_section = re.search(r"Golden Words:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
-            if words_section:
-                words = re.findall(r"-\s*\*?([^\n]+)", words_section.group(1))
-                if words: 
-                    fallback_data["golden_words"] = self._normalize_golden_words(words)
-
-            corr_section = re.search(r"Corrections:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
-            if corr_section:
-                count = corr_section.group(1).count("\n-")
-                if count > 0: fallback_data["corrections"] = count
-
-            self._save_json(fallback_data, output_path)
-            return True
+                raise ValueError("model response did not contain a JSON object")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self.last_ai_metrics_error = f"Invalid structured AI metrics: {exc}"
+                print(self.last_ai_metrics_error)
+                return False
 
         except Exception as e:
             print(f"Error computing AI metrics: {e}")
             self.last_ai_metrics_error = str(e)
             return False
 
-    def _ensure_model_exists(self, model_name: str):
+    def _ensure_model_exists(self, model_name: str, api_url: Optional[str] = None):
         """
         Checks if the Ollama model exists. If not, downloads it automatically.
         """
@@ -465,8 +593,14 @@ class DiarizationPipelineRunner:
 
         # Setup Env
         env = os.environ.copy()
-        env["OLLAMA_MODELS"] = os.path.expanduser(os.environ.get("OLLAMA_MODELS", "~/.local/share/diarize-gui/ollama-models"))
-        env["OLLAMA_HOST"] = "127.0.0.1:11435"
+        env["OLLAMA_MODELS"] = ollama_models_dir()
+        if api_url:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(api_url)
+            env["OLLAMA_HOST"] = parsed.netloc or "127.0.0.1:11435"
+        else:
+            env["OLLAMA_HOST"] = "127.0.0.1:11435"
 
         if not self._wait_for_ollama_ready(ollama_bin, env):
             print("WARNING: Ollama server is not ready yet; skipping auto-download.")
@@ -919,8 +1053,10 @@ class DiarizationPipelineRunner:
         api_key: Optional[str] = None,
         provider: str = "ollama",
         speakers: Optional[List[str]] = None,
-        max_chars: int = 25000,
+        max_chars: int = DEFAULT_MAX_CHARS,
         external_text: Optional[str] = None,
+        response_format: Optional[dict] = None,
+        context_tokens: Optional[int] = None,
     ) -> str:
         if not user_prompt.strip():
             raise ValueError("Prompt is empty.")
@@ -961,7 +1097,14 @@ class DiarizationPipelineRunner:
                 "model": target_model,
                 "prompt": combined_prompt,
                 "stream": False,
+                "options": {
+                    "temperature": 0,
+                    "seed": 42,
+                    "num_ctx": int(context_tokens or DEFAULT_OLLAMA_CONTEXT_TOKENS),
+                },
             }
+            if response_format:
+                payload["format"] = response_format
 
             self._set_status(f"Calling Ollama ({target_model})...")
             

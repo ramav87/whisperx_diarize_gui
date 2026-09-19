@@ -16,6 +16,13 @@ def ai_stats_complete(ai_path: str) -> bool:
 
     if not isinstance(stats.get("grammar_score"), (int, float)):
         return False
+    if stats.get("analysis_schema_version") != 2:
+        return False
+
+    provenance = stats.get("analysis_provenance") if isinstance(stats.get("analysis_provenance"), dict) else {}
+    coverage = provenance.get("transcript_coverage")
+    if not isinstance(coverage, (int, float)) or coverage < 0.95:
+        return False
 
     context = stats.get("context_metrics") if isinstance(stats.get("context_metrics"), dict) else {}
     required_context_keys = (

@@ -76,8 +76,34 @@ class PipelineAnalysisTests(unittest.TestCase):
         self.assertIn("Tutor (SPEAKER_00): Como se dice glow in the dark?", runner.captured_text)
         self.assertIn("Student (SPEAKER_01): Tiene un poder de lucifera.", runner.captured_text)
         self.assertEqual(stats["grammar_score"], 80)
+        self.assertEqual(stats["analysis_schema_version"], 2)
+        self.assertEqual(stats["analysis_provenance"]["transcript_coverage"], 1.0)
         self.assertEqual(stats["analysis_scope"]["student_speakers"], ["SPEAKER_01"])
         self.assertEqual(stats["analysis_scope"]["speaker_labels"]["SPEAKER_01"], "Student")
+
+    def test_invalid_model_output_is_not_saved_as_a_default_score(self):
+        class InvalidRunner(DiarizationPipelineRunner):
+            def analyze_with_llm(self, **kwargs):
+                return "not valid JSON"
+
+        with tempfile.TemporaryDirectory() as root:
+            lesson_dir = Path(root)
+            (lesson_dir / "meta.json").write_text(
+                json.dumps({"student_speakers": ["SPEAKER_01"]}),
+                encoding="utf-8",
+            )
+            (lesson_dir / "segments.json").write_text(
+                json.dumps([
+                    {"start": 0, "end": 12, "speaker": "SPEAKER_01", "text": "Hablo durante una lección."}
+                ]),
+                encoding="utf-8",
+            )
+            runner = InvalidRunner()
+            success = runner.compute_ai_metrics(str(lesson_dir), mode="openai", model="test-model")
+
+            self.assertFalse(success)
+            self.assertFalse((lesson_dir / "ai_stats.json").exists())
+            self.assertIn("Invalid structured AI metrics", runner.last_ai_metrics_error)
 
 
 if __name__ == "__main__":

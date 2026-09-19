@@ -31,7 +31,7 @@ from .metrics.context_adjusted import (
 from .local_server import default_local_server_url, start_local_server_if_enabled
 
 # Import backend logic
-from .utils import obfuscate_secret, deobfuscate_secret, estimate_openai_cost
+from .utils import obfuscate_secret, deobfuscate_secret, estimate_openai_cost, ollama_models_dir
 from .recorder import AudioRecorder
 from .pipeline import DiarizationPipelineRunner
 from .pyannote_offline_loader import get_resource_base_path
@@ -79,7 +79,7 @@ def start_bundled_ollama():
         except Exception:
             pass
 
-    models_dir = os.path.expanduser(os.environ.get("OLLAMA_MODELS", "~/.local/share/diarize-gui/ollama-models"))
+    models_dir = ollama_models_dir()
     os.makedirs(models_dir, exist_ok=True)
     
     env = os.environ.copy()
@@ -168,8 +168,9 @@ class ToolTip:
         self.tipwindow = None
         self.after_id = None
 
-        widget.bind("<Enter>", self._schedule)
-        widget.bind("<Leave>", self._hide)
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
 
     def _schedule(self, _=None):
         self.after_id = self.widget.after(self.delay, self._show)
@@ -216,8 +217,8 @@ class DiarizationApp:
         self.current_lesson_dir = None
         self._assign_window_open = False
 
-        master.title("Lesson Recording and Analysis App")
-        master.geometry("750x900")
+        master.title("Diarize — Lesson Intelligence")
+        self._configure_main_window()
       
         # --- LOGIC INIT ---
         self.audio_path = None
@@ -240,7 +241,7 @@ class DiarizationApp:
         self.master.configure(fg_color=AppTheme.BG_MAIN)
 
         self.tab_view = ctk.CTkTabview(self.master, fg_color=AppTheme.BG_MAIN)
-        self.tab_view.pack(fill="both", expand=True, padx=10, pady=10)
+        self.tab_view.pack(fill="both", expand=True, padx=12, pady=(8, 12))
 
         self.tab_dash = self.tab_view.add("Dashboard")
         self.tab_dash.configure(fg_color=AppTheme.BG_MAIN)
@@ -248,9 +249,11 @@ class DiarizationApp:
         self.tab_studio = self.tab_view.add("Studio")
         self.tab_studio.configure(fg_color=AppTheme.BG_MAIN)
 
-        self.dashboard_scroll = ctk.CTkScrollableFrame(self.tab_dash, fg_color=AppTheme.BG_MAIN)
-        self.dashboard_scroll.pack(fill="both", expand=True, padx=0, pady=0)
-        
+        # The dashboard must size to its viewport. A scrollable parent makes the
+        # charts request their full natural height and forces needless scrolling.
+        self.tab_dash.grid_rowconfigure(0, weight=1)
+        self.tab_dash.grid_columnconfigure(0, weight=1)
+
         self.studio_scroll = ctk.CTkScrollableFrame(self.tab_studio, fg_color=AppTheme.BG_MAIN)
         self.studio_scroll.pack(fill="both", expand=True, padx=0, pady=0)
 
@@ -269,8 +272,19 @@ class DiarizationApp:
         atexit.register(self._cleanup_ollama)
         os.environ["LLM_ANALYSIS_URL"] = "http://127.0.0.1:11435/api/generate"
 
+    def _configure_main_window(self):
+        """Choose a spacious desktop size while respecting smaller displays."""
+        screen_width = self.master.winfo_screenwidth()
+        screen_height = self.master.winfo_screenheight()
+        width = min(1280, max(960, screen_width - 160))
+        height = min(860, max(700, screen_height - 140))
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        self.master.geometry(f"{width}x{height}+{x}+{y}")
+        self.master.minsize(900, 650)
+
     def _load_icons(self):
-        def load_icon(name):
+        def load_icon(name, size=(20, 20)):
             if getattr(sys, 'frozen', False):
                 base_path = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(os.path.abspath(sys.executable))
                 possible = [
@@ -285,22 +299,23 @@ class DiarizationApp:
 
             for p in possible:
                 if os.path.exists(p):
-                    return ctk.CTkImage(light_image=Image.open(p), dark_image=Image.open(p), size=(20, 20))
+                    return ctk.CTkImage(light_image=Image.open(p), dark_image=Image.open(p), size=size)
             return None
 
         self.icon_user = load_icon("user.png")
         self.icon_mic = load_icon("mic.png")
         self.icon_folder = load_icon("folder.png")
+        self.logo_mark = load_icon("diarize_logo.png", size=(150, 150))
 
     def _build_ui(self, parent):
         def add_section_header(container, title, subtitle=None):
             header = ctk.CTkFrame(container, fg_color="transparent")
-            header.pack(fill="x", padx=15, pady=(10, 6))
+            header.pack(fill="x", padx=12, pady=(8, 4))
 
             ctk.CTkLabel(
                 header,
                 text=title,
-                font=("Roboto", 14, "bold"),
+                font=("Roboto", 13, "bold"),
                 text_color=AppTheme.TEXT_PRIMARY,
             ).pack(anchor="w")
 
@@ -308,19 +323,19 @@ class DiarizationApp:
                 ctk.CTkLabel(
                     header,
                     text=subtitle,
-                    font=("Roboto", 11),
+                    font=("Roboto", 10),
                     text_color=AppTheme.TEXT_MUTED,
                     justify="left",
-                ).pack(anchor="w", pady=(2, 0))
+                ).pack(anchor="w", pady=(1, 0))
 
             return header
 
         # 1. PROFILE HEADER
         self.profile_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color=AppTheme.BG_CARD)
-        self.profile_frame.pack(padx=15, pady=(15, 5), fill="x")
+        self.profile_frame.pack(padx=15, pady=(10, 5), fill="x")
 
         profile_top = ctk.CTkFrame(self.profile_frame, fg_color="transparent")
-        profile_top.pack(fill="x", padx=10, pady=(10, 4))
+        profile_top.pack(fill="x", padx=10, pady=8)
         profile_top.grid_columnconfigure(0, weight=1)
 
         profile_left = ctk.CTkFrame(profile_top, fg_color="transparent")
@@ -329,7 +344,7 @@ class DiarizationApp:
         self.profile_title = ctk.CTkLabel(
             profile_left,
             text="Studio Workspace",
-            font=("Roboto", 22, "bold"),
+            font=("Roboto", 18, "bold"),
             text_color=AppTheme.BTN_PRIMARY,
             anchor="w",
         )
@@ -338,7 +353,7 @@ class DiarizationApp:
         self.profile_subtitle = ctk.CTkLabel(
             profile_left,
             text="Capture, diarization, and AI feedback in one place.",
-            font=("Roboto", 12),
+            font=("Roboto", 11),
             text_color=AppTheme.TEXT_MUTED,
             anchor="w",
         )
@@ -363,13 +378,10 @@ class DiarizationApp:
             padx=10,
             pady=4,
         )
-        self.profile_pill.grid(row=0, column=1, sticky="e")
+        self.profile_pill.grid(row=0, column=1, sticky="e", padx=(8, 12))
 
-        profile_actions = ctk.CTkFrame(self.profile_frame, fg_color="transparent")
-        profile_actions.pack(fill="x", padx=10, pady=(0, 10))
-
-        actions_right = ctk.CTkFrame(profile_actions, fg_color="transparent")
-        actions_right.pack(side="right")
+        actions_right = ctk.CTkFrame(profile_top, fg_color="transparent")
+        actions_right.grid(row=0, column=2, sticky="e")
 
         self.history_btn = ctk.CTkButton(
             actions_right,
@@ -396,9 +408,22 @@ class DiarizationApp:
         )
         self.profile_btn.pack(side="left")
 
+        # Wide screens use a true desktop workspace: capture and configuration
+        # on the left, then processing and results on the right. The outer
+        # scroll view remains only as a safety net for compact displays.
+        self.studio_columns = ctk.CTkFrame(parent, fg_color="transparent")
+        self.studio_columns.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        self.studio_columns.grid_columnconfigure(0, weight=3, uniform="studio_column")
+        self.studio_columns.grid_columnconfigure(1, weight=2, uniform="studio_column")
+
+        self.studio_left = ctk.CTkFrame(self.studio_columns, fg_color="transparent")
+        self.studio_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.studio_right = ctk.CTkFrame(self.studio_columns, fg_color="transparent")
+        self.studio_right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
         # 2. INPUT CARD
-        self.input_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
-        self.input_card.pack(padx=15, pady=5, fill="x")
+        self.input_card = ctk.CTkFrame(self.studio_left, fg_color=AppTheme.BG_CARD)
+        self.input_card.pack(pady=(0, 6), fill="x")
 
         add_section_header(
             self.input_card,
@@ -533,8 +558,8 @@ class DiarizationApp:
         self.mic_level_db.pack(side="left", padx=(0, 0))
 
         # 3. SETTINGS CARD
-        self.settings_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
-        self.settings_card.pack(padx=15, pady=10, fill="x")
+        self.settings_card = ctk.CTkFrame(self.studio_left, fg_color=AppTheme.BG_CARD)
+        self.settings_card.pack(pady=(6, 0), fill="x")
         
         add_section_header(
             self.settings_card,
@@ -756,8 +781,8 @@ class DiarizationApp:
         self.server_url_entry.pack(side="left", fill="x", expand=True)
 
         # 4. ACTION CARD (Run + Progress + Status)
-        self.action_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
-        self.action_card.pack(padx=15, pady=8, fill="x")
+        self.action_card = ctk.CTkFrame(self.studio_right, fg_color=AppTheme.BG_CARD)
+        self.action_card.pack(pady=(0, 6), fill="x")
 
         add_section_header(
             self.action_card,
@@ -818,8 +843,8 @@ class DiarizationApp:
         self.status_label.pack(padx=12, pady=(0, 12), anchor="w")
 
         # Analyze card
-        self.analyze_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
-        self.analyze_card.pack(padx=15, pady=(6, 10), fill="x")
+        self.analyze_card = ctk.CTkFrame(self.studio_right, fg_color=AppTheme.BG_CARD)
+        self.analyze_card.pack(pady=(6, 0), fill="x")
 
         add_section_header(
             self.analyze_card,
@@ -898,7 +923,44 @@ class DiarizationApp:
             justify="left"
         )
         self.export_help.pack(padx=12, pady=(0, 10), anchor="w")
+
+        # Use the flexible lower-right area as a calm brand anchor. Keeping the
+        # panel expandable prevents it from making the Studio taller.
+        self.brand_panel = ctk.CTkFrame(
+            self.studio_right,
+            fg_color="transparent",
+        )
+        self.brand_panel.pack(fill="both", expand=True, pady=(8, 0))
+        if self.logo_mark:
+            ctk.CTkLabel(
+                self.brand_panel,
+                text="",
+                image=self.logo_mark,
+            ).place(relx=0.92, rely=0.92, anchor="se")
+
+        self._install_studio_button_tooltips()
         self._update_analyze_ui_state()
+
+    def _install_studio_button_tooltips(self):
+        """Attach concise hover help to every persistent Studio action."""
+        descriptions = (
+            (self.history_btn, "Open completed lessons and their saved transcripts, exports, and analysis."),
+            (self.profile_btn, "Choose or create the learner profile used for lessons and dashboard history."),
+            (self.audio_btn, "Select an audio recording to transcribe and diarize."),
+            (self.load_txt_btn, "Load an existing diarized transcript without running transcription again."),
+            (self.batch_btn, "Import and process several recordings with the same settings."),
+            (self.start_rec_btn, "Start recording a live lesson from the selected input device."),
+            (self.stop_rec_btn, "Stop the current recording and prepare it for processing."),
+            (self.out_btn, "Choose where lesson files and exports are saved."),
+            (self.run_btn, "Transcribe the loaded audio and identify its speakers."),
+            (self.assign_btn, "Name speakers and identify which voice belongs to the learner."),
+            (self.analyze_btn, "Generate evidence-based learner feedback with the configured local or cloud model."),
+            (self.export_srt_btn, "Export a timestamped subtitle file."),
+            (self.export_txt_btn, "Export the readable speaker-labelled transcript."),
+            (self.export_wav_btn, "Export separate audio files for the identified speakers."),
+        )
+        for widget, description in descriptions:
+            ToolTip(widget, description)
 
     def open_assign_speakers(self):
         if not getattr(self, "current_lesson_dir", None):
@@ -1221,13 +1283,13 @@ class DiarizationApp:
         if self.dashboard:
             self.dashboard.destroy()
         self.dashboard = DashboardFrame(
-            self.dashboard_scroll,
+            self.tab_dash,
             profile_name=self.profile_name,
             profile_dir=self._profile_dir(),
             pipeline=self.pipeline,
             server_url=self._server_base_url(),
         )
-        self.dashboard.pack(fill="both", expand=True)
+        self.dashboard.grid(row=0, column=0, sticky="nsew")
 
     def _apply_profile_config_to_controls(self):
         cfg = self.profile_config or {}
@@ -1289,16 +1351,58 @@ class DiarizationApp:
         """
         Ask the model to append a machine-readable summary block we can save to ai_stats.json.
         """
+        example = {
+            "grammar_score": 75,
+            "communicative_effectiveness": 82,
+            "accuracy_score": 75,
+            "complexity_score": 70,
+            "lexical_range_score": 72,
+            "topics": ["topic 1", "topic 2", "topic 3"],
+            "golden_words": ["word 1 (translation)"],
+            "corrections": 2,
+            "feedback": "short summary",
+            "strengths": ["evidence-based strength"],
+            "priority_goals": ["high-impact goal"],
+            "recurring_patterns": [{
+                "category": "articles",
+                "pattern": "short description",
+                "estimated_count": 2,
+                "learner_example": "exact learner quote",
+                "better_form": "corrected form",
+                "practice_rule": "short reusable rule",
+            }],
+            "successful_self_repairs": ["exact learner example"],
+            "next_session_plan": [{
+                "goal": "specific goal",
+                "exercise": "tutor-ready activity",
+                "success_criterion": "observable target",
+            }],
+            "analysis_limitations": ["transcript-only limitation"],
+            "cefr_estimate": "B2",
+            "cefr_confidence": 0.7,
+            "topic_difficulty": 3,
+            "idea_density": 3,
+            "abstraction_level": 4,
+            "cognitive_branching": 4,
+            "technical_density": 2,
+            "discourse_depth": 4,
+            "lexical_retrieval_pressure": 3,
+            "topic_tags": ["tag 1", "tag 2"],
+            "context_notes": "short session-load rationale",
+            "self_repair_observations": "short observation",
+        }
         return (
             "\n\nAt the very end of your response, append this exact machine-readable block and nothing else inside it:\n"
             "AI_STATS_JSON_START\n"
-            '{"grammar_score": 75, "topics": ["topic 1", "topic 2", "topic 3"], "golden_words": ["word 1 (translation)", "word 2 (translation)", "word 3 (translation)"], "corrections": 0, "feedback": "short summary", "topic_difficulty": 3, "idea_density": 3, "abstraction_level": 4, "cognitive_branching": 4, "technical_density": 2, "discourse_depth": 4, "lexical_retrieval_pressure": 3, "topic_tags": ["tag 1", "tag 2"], "context_notes": "short rationale focused on linguistic and cognitive load", "self_repair_observations": "short observation"}\n'
+            f"{json.dumps(example, ensure_ascii=False)}\n"
             "AI_STATS_JSON_END\n"
             "Use valid JSON only between the markers. Do not wrap it in markdown fences. "
             "grammar_score must be an integer from 0 to 100, where 100 means near-native accuracy and 70 means understandable speech with recurring errors. Do not use a 1-10 scale. "
             "For topic_difficulty use 1=daily life/simple narration, 2=familiar concrete topic, 3=opinion/explanation, 4=abstract argument, 5=technical/political/scientific/financial/philosophical or highly abstract. "
             "For idea_density use 1=simple narration, 2=concrete personal topic, 3=opinion with reasons, 4=abstract argument with multiple clauses, 5=dense technical/political/scientific explanation. "
             "For abstraction_level, cognitive_branching, technical_density, discourse_depth, and lexical_retrieval_pressure use 1-10 where 10 means very high conceptual or retrieval load. "
+            "Treat CEFR as an approximate secondary summary, not the main result. Copy learner evidence exactly, "
+            "separate communication success from accuracy, and prioritize repeated patterns over isolated slips. "
             "Do not grade intelligence or opinions; estimate only session load."
         )
 
@@ -1351,7 +1455,7 @@ class DiarizationApp:
 
         return analysis_text.strip(), stats
 
-    def _write_ai_stats(self, lesson_dir: str, stats: dict, provider: str, model: str):
+    def _write_ai_stats(self, lesson_dir: str, stats: dict, provider: str, model: str, speakers=None):
         if not lesson_dir or not stats:
             return
 
@@ -1385,6 +1489,37 @@ class DiarizationApp:
         payload["llm_model"] = model
         payload["analysis_updated_at"] = datetime.now().isoformat(timespec="seconds")
         payload["source"] = "studio_analysis"
+        try:
+            from .pipeline import (
+                AI_METRICS_SCHEMA_VERSION,
+                DEFAULT_MAX_CHARS,
+                DiarizationPipelineRunner,
+            )
+
+            DiarizationPipelineRunner._validate_ai_metrics(payload)
+            full_text = self.pipeline.get_transcript_text(
+                include_speaker=True,
+                speaker_filters=speakers,
+                max_chars=10_000_000,
+            )
+            transcript_chars = len(full_text)
+            chars_used = min(transcript_chars, DEFAULT_MAX_CHARS)
+            payload["analysis_schema_version"] = AI_METRICS_SCHEMA_VERSION
+            payload["analysis_scope"] = {
+                "student_speakers": list(speakers or []),
+                "speaker_scope": "explicit" if speakers else "unresolved",
+            }
+            payload["analysis_provenance"] = {
+                "provider": provider,
+                "model": model,
+                "transcript_chars": transcript_chars,
+                "transcript_chars_used": chars_used,
+                "transcript_coverage": chars_used / transcript_chars if transcript_chars else 0,
+                "student_scope": "explicit" if speakers else "unresolved",
+                "structured_output": False,
+            }
+        except (TypeError, ValueError):
+            payload["analysis_schema_version"] = 1
 
         ai_stats_path = os.path.join(lesson_dir, "ai_stats.json")
         with open(ai_stats_path, "w", encoding="utf-8") as f:
@@ -2608,7 +2743,14 @@ class DiarizationApp:
 
         ctk.CTkLabel(model_row, text="Model:", width=60).pack(side="left")
 
-        self.ollama_models = ["mistral", "mixtral", "gemma:2b", DEFAULT_OLLAMA_ANALYSIS_MODEL, "qwen2.5"]
+        self.ollama_models = [
+            "gemma4:12b-mlx",
+            DEFAULT_OLLAMA_ANALYSIS_MODEL,
+            "mistral",
+            "mixtral",
+            "gemma:2b",
+            "qwen2.5",
+        ]
         self.openai_models = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.2", "gpt-5.1", "gpt-4o", "gpt-4o-mini"]
         
         # Pick model default from profile depending on provider
@@ -2689,7 +2831,7 @@ class DiarizationApp:
         prompt_box.bind("<FocusOut>", update_cost_estimate)
 
         default_prompt = (
-            "You are an expert Spanish language teacher and pronunciation coach. \
+            "You are an expert Spanish language teacher. \
             You will analyze ONLY the student’s speech from a lesson transcript. \
             Do not analyze or comment on the tutor’s speech. \
  \
@@ -2708,32 +2850,25 @@ class DiarizationApp:
             - Provide 2–4 representative examples with corrections. \
             - Briefly explain why the correction is needed (no long grammar lessons). \
  \
-            3. Fluency \
-            - Evaluate flow, hesitation patterns, false starts, and sentence completion. \
-            - Comment on whether pauses interfere with meaning or are natural at this level. \
+            3. Complexity and Range \
+            - Describe sentence complexity, connector use, and vocabulary range using exact examples. \
+            - Reward sustained explanation and successful self-correction. \
 \
-            4. Pronunciation & Prosody \
-            - Assess rhythm, syllable timing, stress, and intonation. \
-            - Note any features that sound non-native (e.g., English stress patterns, vowel reduction). \
-            - Also identify any aspects that already sound natural. \
+            4. Transcript Limitations \
+            - Do not assess pronunciation, rhythm, stress, intonation, or audio quality from transcript text. \
+            - State briefly which observations would require listening to the audio. \
 \
             5. Positive Observations \
             - Highlight specific strengths demonstrated in this lesson \
             (e.g., verb tense control, use of connectors, conversational strategies). \
 \
-            6. CEFR Profile (Estimated) \
-            Provide an estimated CEFR level for each dimension: \
-            - Grammar accuracy \
-            - Fluency \
-            - Pronunciation & prosody \
-            - Vocabulary range \
-            Use labels such as: A2 / B1 / B2 / C1. \
-            Briefly justify each estimate (1 sentence each). \
+            6. Approximate CEFR Context \
+            - Give one tentative overall range, a confidence level, and a one-sentence caveat. \
+            - Do not infer listening ability, pronunciation, or spontaneous fluency from transcript text. \
 \
-            7. Priority Practice Goals (Next 2–3 Weeks) \
-            - List 3–5 concrete, actionable goals. \
-            - Focus on the highest-impact improvements for the student. \
-            - Phrase goals in practical terms (e.g., “practice linking clauses with…”, not “improve grammar”). \
+            7. Next-Session Coaching Plan \
+            - Select no more than 3 high-impact recurring patterns. \
+            - For each, give a tutor-ready exercise and an observable success criterion. \
 \
             Guidelines: \
             - Do not rewrite the entire transcript. \
@@ -2939,7 +3074,7 @@ class DiarizationApp:
             print(f"DEBUG: Using ollama binary at: {ollama_bin}")
 
             env = os.environ.copy()
-            env["OLLAMA_MODELS"] = os.path.expanduser(os.environ.get("OLLAMA_MODELS", "~/.local/share/diarize-gui/ollama-models"))
+            env["OLLAMA_MODELS"] = ollama_models_dir()
             env["OLLAMA_HOST"] = "127.0.0.1:11435"
 
             try:
@@ -3048,7 +3183,7 @@ class DiarizationApp:
                     f.write(analysis_text)
 
                 if ai_stats:
-                    self._write_ai_stats(self.current_lesson_dir, ai_stats, provider, model)
+                    self._write_ai_stats(self.current_lesson_dir, ai_stats, provider, model, speakers)
 
                 meta_path = os.path.join(self.current_lesson_dir, "meta.json")
                 meta = {}

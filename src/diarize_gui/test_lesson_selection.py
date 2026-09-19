@@ -13,6 +13,8 @@ from diarize_gui.lesson_selection import (
 def complete_ai_stats(grammar_score: int = 90) -> dict:
     return {
         "grammar_score": grammar_score,
+        "analysis_schema_version": 2,
+        "analysis_provenance": {"transcript_coverage": 1.0},
         "context_metrics": {
             "raw_grammar_score": grammar_score,
             "adjusted_grammar_score": grammar_score,

@@ -1,0 +1,40 @@
+{
+  "date": "2026-09-19",
+  "hardware": "Apple M4 Pro, 24 GB unified memory",
+  "runtime": "Ollama 0.34.0, Metal/MLX",
+  "workload": {
+    "source": "first five minutes of lesson 20260824_212928",
+    "transcript_characters": 4380,
+    "prompt_tokens": 1202,
+    "context_tokens": 32768,
+    "temperature": 0,
+    "structured_json_schema": true,
+    "runs_per_model": 2
+  },
+  "results": {
+    "gemma4:e4b": {
+      "model_size_gb": 9.6,
+      "cold_wall_seconds": 17.163,
+      "warm_wall_seconds": 10.83,
+      "warm_output_tokens_per_second": 52.63,
+      "valid_json_runs": 2,
+      "schema_valid_runs": 2,
+      "verbatim_evidence_items_per_run": [2, 2],
+      "raw_grammar_score": 3.5,
+      "notes": "Fast and repeatable, but the raw grammar score required legacy 1-10 normalization and feedback found fewer specific learner errors."
+    },
+    "gemma4:12b-mlx": {
+      "model_size_gb": 7.7,
+      "cold_wall_seconds": 24.177,
+      "warm_wall_seconds": 14.462,
+      "warm_output_tokens_per_second": 39.53,
+      "peak_memory_gb": 8.59,
+      "valid_json_runs": 2,
+      "schema_valid_runs": 2,
+      "verbatim_evidence_items_per_run": [4, 3],
+      "raw_grammar_score": 75,
+      "notes": "Slower, but better calibrated and more specific: it identified tense choice, asistir a, bailes, and educación errors with transcript evidence."
+    }
+  },
+  "recommendation": "Use gemma4:12b-mlx for lesson analysis and gemma4:e4b as the speed fallback."
+}

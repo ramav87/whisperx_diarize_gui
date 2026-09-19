@@ -3,7 +3,7 @@ import json
 import re
 import threading
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import Counter, defaultdict
 from urllib.parse import quote
 import customtkinter as ctk
 import matplotlib.pyplot as plt
@@ -15,6 +15,7 @@ from .theme import AppTheme
 from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL
 from .lesson_selection import select_all_incomplete_ai_lesson_dirs, select_pending_ai_lesson_dirs
 from .metrics.context_adjusted import build_context_metrics, compute_automaticity_gap
+from .metrics.language_growth import compute_language_growth_metrics
 from .utils import deobfuscate_secret
 
 # Use a safe backend for macOS/Windows
@@ -80,7 +81,6 @@ class DashboardFrame(ctk.CTkFrame):
         self.color_tutor = "#C98A1A"
         self.color_bad    = "#D76A5D"
         self.color_ai     = "#9A4BCF"
-        self.bg_figure = "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#ffffff"
         self.text_color = AppTheme.TEXT_PRIMARY
         self.card_bg = AppTheme.BG_CARD
         self.card_border = AppTheme.BORDER_DIVIDER
@@ -91,7 +91,8 @@ class DashboardFrame(ctk.CTkFrame):
         # --- UI LAYOUT ---
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.configure(fg_color="transparent")
+        self.grid_rowconfigure(3, weight=1)
 
         # Header
         self.header_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -128,33 +129,33 @@ class DashboardFrame(ctk.CTkFrame):
         )
         self.profile_pill.grid(row=0, column=1, rowspan=2, sticky="e")
 
-        # 1. Standard KPI Row
-        self.row1 = ctk.CTkFrame(self, fg_color="transparent")
-        self.row1.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(10, 6))
-        
-        self.card_total_time = self._create_kpi_card(self.row1, "Total Hours", "0.0")
-        self.card_student_pct = self._create_kpi_card(self.row1, "You Spoke", "0%")
-        self.card_wpm = self._create_kpi_card(self.row1, "Your WPM", "0")
-        self.card_words = self._create_kpi_card(self.row1, "Total Words", "0")
+        # Keep the complete snapshot in one horizontal strip on desktop. The old
+        # two-row layout spent nearly 200 vertical pixels before reaching a chart.
+        self.metrics_row = ctk.CTkFrame(self, fg_color="transparent")
+        self.metrics_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(8, 6))
 
-        self.card_total_time.pack(side="left", expand=True, fill="x", padx=5)
-        self.card_student_pct.pack(side="left", expand=True, fill="x", padx=5)
-        self.card_wpm.pack(side="left", expand=True, fill="x", padx=5)
-        self.card_words.pack(side="left", expand=True, fill="x", padx=5)
+        self.card_total_time = self._create_kpi_card(self.metrics_row, "Total Hours", "0.0")
+        self.card_student_pct = self._create_kpi_card(self.metrics_row, "You Spoke", "0%")
+        self.card_wpm = self._create_kpi_card(self.metrics_row, "Your WPM", "0")
+        self.card_words = self._create_kpi_card(self.metrics_row, "Total Words", "0")
+        self.card_grammar = self._create_kpi_card(self.metrics_row, "Avg Grammar", "--", color=self.color_ai)
+        self.card_auto_gap = self._create_kpi_card(self.metrics_row, "Auto. Gap", "--", color=self.color_ai)
+        self.card_latency = self._create_kpi_card(self.metrics_row, "Avg Latency", "0.0s")
+        self.card_max_turn = self._create_kpi_card(self.metrics_row, "Longest Turn", "0s")
 
-        # 2. Advanced / AI KPI Row
-        self.row2 = ctk.CTkFrame(self, fg_color="transparent")
-        self.row2.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
-        
-        self.card_grammar = self._create_kpi_card(self.row2, "Avg Grammar", "--", color=self.color_ai)
-        self.card_auto_gap = self._create_kpi_card(self.row2, "Automaticity Gap", "--", color=self.color_ai)
-        self.card_latency = self._create_kpi_card(self.row2, "Avg Latency", "0.0s")
-        self.card_max_turn = self._create_kpi_card(self.row2, "Longest Turn", "0s")
-
-        self.card_grammar.pack(side="left", expand=True, fill="x", padx=5)
-        self.card_auto_gap.pack(side="left", expand=True, fill="x", padx=5)
-        self.card_latency.pack(side="left", expand=True, fill="x", padx=5)
-        self.card_max_turn.pack(side="left", expand=True, fill="x", padx=5)
+        metric_cards = (
+            self.card_total_time,
+            self.card_student_pct,
+            self.card_wpm,
+            self.card_words,
+            self.card_grammar,
+            self.card_auto_gap,
+            self.card_latency,
+            self.card_max_turn,
+        )
+        for column, card in enumerate(metric_cards):
+            self.metrics_row.grid_columnconfigure(column, weight=1, uniform="dashboard_metric")
+            card.grid(row=0, column=column, sticky="ew", padx=4)
 
         # Golden words panel
         self.golden_panel = ctk.CTkFrame(
@@ -164,8 +165,8 @@ class DashboardFrame(ctk.CTkFrame):
             border_width=1,
             border_color=self.card_border,
         )
-        self.golden_panel.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
-        self.golden_panel.grid_columnconfigure(0, weight=1)
+        self.golden_panel.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 6))
+        self.golden_panel.grid_columnconfigure(1, weight=1)
 
         self.golden_header = ctk.CTkLabel(
             self.golden_panel,
@@ -174,7 +175,7 @@ class DashboardFrame(ctk.CTkFrame):
             text_color=self.color_ai,
             anchor="w",
         )
-        self.golden_header.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+        self.golden_header.grid(row=0, column=0, sticky="w", padx=(14, 8), pady=(9, 1))
 
         self.golden_hint = ctk.CTkLabel(
             self.golden_panel,
@@ -183,10 +184,10 @@ class DashboardFrame(ctk.CTkFrame):
             text_color=self.card_subtext,
             anchor="w",
         )
-        self.golden_hint.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 8))
+        self.golden_hint.grid(row=1, column=0, sticky="w", padx=(14, 8), pady=(0, 9))
 
         self.golden_words_container = ctk.CTkFrame(self.golden_panel, fg_color="transparent")
-        self.golden_words_container.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 14))
+        self.golden_words_container.grid(row=0, column=1, rowspan=2, sticky="ew", padx=(8, 14), pady=8)
         self.golden_words_container.grid_columnconfigure(0, weight=1)
         self.golden_words_container.grid_columnconfigure(1, weight=1)
         self.golden_words_container.grid_columnconfigure(2, weight=1)
@@ -200,7 +201,7 @@ class DashboardFrame(ctk.CTkFrame):
                 text_color=self.text_color,
                 corner_radius=10,
                 padx=12,
-                pady=8,
+                pady=6,
                 justify="center",
                 anchor="center",
                 wraplength=220,
@@ -210,46 +211,48 @@ class DashboardFrame(ctk.CTkFrame):
 
         # 3. Charts Area (Now Tabbed!)
         self.chart_tabs = ctk.CTkTabview(self)
-        self.chart_tabs.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=12, pady=6)
+        self.chart_tabs.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=12, pady=(0, 4))
         
         self.tab_activity = self.chart_tabs.add("Activity")
         self.tab_fluency = self.chart_tabs.add("Fluency")
         self.tab_grammar = self.chart_tabs.add("Grammar AI")
-        self.tab_context = self.chart_tabs.add("Context")
+        self.tab_growth = self.chart_tabs.add("Language Growth")
+        self.tab_vocabulary = self.chart_tabs.add("Vocabulary")
+        self.tab_context = self.chart_tabs.add("Context (Experimental)")
         
         # 4. Controls Row
         self.controls_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.controls_frame.grid(row=5, column=0, columnspan=2, pady=(8, 12))
+        self.controls_frame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=(2, 8))
 
         self.refresh_btn = ctk.CTkButton(
             self.controls_frame,
-            text="Refresh Dashboard",
+            text="Refresh",
             command=self.refresh_data,
             fg_color=self.color_primary,
             hover_color=AppTheme.BTN_PRIMARY_HOVER,
         )
-        self.refresh_btn.pack(side="left", padx=10)
+        self.refresh_btn.pack(side="left", padx=(0, 6))
 
         self.ai_btn = ctk.CTkButton(
             self.controls_frame,
-            text="Compute Recent AI Metrics",
+            text="Analyze Latest",
             fg_color=self.color_ai,
             hover_color="#7B1FA2",
             command=self.run_ai_analysis,
         )
-        self.ai_btn.pack(side="left", padx=10)
+        self.ai_btn.pack(side="left", padx=6)
 
         self.ai_backfill_btn = ctk.CTkButton(
             self.controls_frame,
-            text="Backfill All AI Metrics",
+            text="Backfill AI History",
             fg_color="#7B1FA2",
             hover_color="#5E167A",
             command=self.run_ai_backfill,
         )
-        self.ai_backfill_btn.pack(side="left", padx=10)
+        self.ai_backfill_btn.pack(side="left", padx=6)
         
         self.status_lbl = ctk.CTkLabel(self.controls_frame, text="", text_color=self.card_subtext)
-        self.status_lbl.pack(side="left", padx=10)
+        self.status_lbl.pack(side="left", padx=10, fill="x", expand=True)
 
         self._install_tooltips()
 
@@ -279,12 +282,12 @@ class DashboardFrame(ctk.CTkFrame):
             corner_radius=14,
             border_width=1,
             border_color=self.card_border,
-            height=92,
+            height=76,
         )
         frame.grid_propagate(False)
         t_color = color if color else "gray"
-        lbl_title = ctk.CTkLabel(frame, text=title.upper(), font=("Roboto", 11, "bold"), text_color=t_color)
-        lbl_title.pack(pady=(10,0))
+        lbl_title = ctk.CTkLabel(frame, text=title.upper(), font=("Roboto", 10, "bold"), text_color=t_color)
+        lbl_title.pack(pady=(7, 0))
         
         # Use a smaller font if value is long
         font_size = 20
@@ -294,11 +297,11 @@ class DashboardFrame(ctk.CTkFrame):
         lbl_val = ctk.CTkLabel(
             frame,
             text=value,
-            font=("Roboto", font_size, "bold"),
+            font=("Roboto", min(font_size, 18), "bold"),
             wraplength=220,
             justify="center",
         )
-        lbl_val.pack(pady=(2,10), padx=10, fill="both", expand=True)
+        lbl_val.pack(pady=(1, 7), padx=6, fill="both", expand=True)
         frame.value_label = lbl_val
         frame.title_label = lbl_title
         return frame
@@ -346,6 +349,10 @@ class DashboardFrame(ctk.CTkFrame):
         self._add_tooltip(
             self.golden_panel,
             "Recent target vocabulary from completed AI analyses, deduplicated from newest lessons backward.",
+        )
+        DashboardToolTip(
+            self.refresh_btn,
+            "Reload lesson files and redraw every dashboard metric and chart.",
         )
         DashboardToolTip(
             self.ai_btn,
@@ -497,6 +504,8 @@ class DashboardFrame(ctk.CTkFrame):
         golden_words_all = []
         context_sessions = []
         context_trend = []
+        language_growth_trend = []
+        vocabulary_by_month = defaultdict(Counter)
         
         student_words_by_month = defaultdict(int)
         fluency_trend = []
@@ -591,6 +600,16 @@ class DashboardFrame(ctk.CTkFrame):
                     lat = (lesson_lat_sum / lesson_lat_cnt) if lesson_lat_cnt else 0
                     fluency_trend.append((dt_obj, lesson_raw_wpm, lat))
 
+                language_metrics = compute_language_growth_metrics(
+                    segments,
+                    meta.get("student_speakers") or [],
+                )
+                if dt_obj and language_metrics.get("token_count"):
+                    language_growth_trend.append((dt_obj, language_metrics))
+                    for item in language_metrics.get("top_content_words", []):
+                        if isinstance(item, dict) and item.get("word"):
+                            vocabulary_by_month[month_key][str(item["word"])] += int(item.get("count") or 0)
+
                 if dt_obj:
                     context = ai_data.get("context_metrics") if isinstance(ai_data.get("context_metrics"), dict) else {}
                     derived_practice_hours = practice_hours_by_lesson.get(lesson_id)
@@ -636,7 +655,7 @@ class DashboardFrame(ctk.CTkFrame):
             "student_speaking_pct": (student_speaking_sec / total_recording_sec * 100) if total_recording_sec else 0,
             "global_wpm": (student_total_words / (student_speaking_sec / 60)) if student_speaking_sec > 30 else 0,
             "student_total_words": student_total_words,
-            "avg_latency_sec": (total_latency_sum / total_latency_count) if total_latency_count else 0.0,
+            "avg_latency_sec": (total_latency_sum / total_latency_count) if total_latency_count else None,
             "max_turn_duration_sec": max_turn_duration,
             "average_grammar_score": None,
             "automaticity_gap": compute_automaticity_gap(sorted(context_sessions, key=lambda x: x["date"]), window=10),
@@ -675,6 +694,27 @@ class DashboardFrame(ctk.CTkFrame):
                     {"date": dt_obj.isoformat(), "context_metrics": context}
                     for dt_obj, context in context_trend
                 ],
+                "language_growth": [
+                    {
+                        "date": dt_obj.isoformat(),
+                        **{
+                            key: value
+                            for key, value in metrics.items()
+                            if key not in {"top_content_words", "limitations"}
+                        },
+                    }
+                    for dt_obj, metrics in language_growth_trend
+                ],
+                "vocabulary": [
+                    {
+                        "month": month,
+                        "words": [
+                            {"word": word, "count": count}
+                            for word, count in counts.most_common(40)
+                        ],
+                    }
+                    for month, counts in sorted(vocabulary_by_month.items())
+                ],
             },
         }
         self._render_dashboard_payload(payload)
@@ -706,14 +746,14 @@ class DashboardFrame(ctk.CTkFrame):
         pct = self._number_or_zero(summary.get("student_speaking_pct"))
         wpm_global = self._number_or_zero(summary.get("global_wpm"))
         student_total_words = int(self._number_or_zero(summary.get("student_total_words")))
-        avg_latency = self._number_or_zero(summary.get("avg_latency_sec"))
+        avg_latency = self._number_or_none(summary.get("avg_latency_sec"))
         max_turn_duration = self._number_or_zero(summary.get("max_turn_duration_sec"))
 
         self.card_total_time.value_label.configure(text=f"{total_hours:.1f}")
         self.card_student_pct.value_label.configure(text=f"{pct:.1f}%")
         self.card_wpm.value_label.configure(text=f"{wpm_global:.0f}")
         self.card_words.value_label.configure(text=f"{student_total_words:,}")
-        self.card_latency.value_label.configure(text=f"{avg_latency:.2f}s")
+        self.card_latency.value_label.configure(text=f"{avg_latency:.2f}s" if avg_latency is not None else "--")
         self.card_max_turn.value_label.configure(text=f"{max_turn_duration:.1f}s")
 
         avg_grammar = self._number_or_none(summary.get("average_grammar_score"))
@@ -747,7 +787,7 @@ class DashboardFrame(ctk.CTkFrame):
             dt_obj = self._parse_iso_datetime(item.get("date"))
             raw_wpm = self._number_or_none(item.get("raw_wpm"))
             if dt_obj and raw_wpm is not None:
-                fluency_trend.append((dt_obj, raw_wpm, self._number_or_zero(item.get("avg_latency_sec"))))
+                fluency_trend.append((dt_obj, raw_wpm, self._number_or_none(item.get("avg_latency_sec"))))
         grammar_scores = []
         for item in (trends.get("grammar") or []):
             if not isinstance(item, dict):
@@ -764,10 +804,47 @@ class DashboardFrame(ctk.CTkFrame):
             context = item.get("context_metrics")
             if dt_obj and isinstance(context, dict):
                 context_trend.append((dt_obj, context))
+        language_growth_trend = []
+        for item in (trends.get("language_growth") or []):
+            if not isinstance(item, dict):
+                continue
+            dt_obj = self._parse_iso_datetime(item.get("date"))
+            if dt_obj:
+                language_growth_trend.append((dt_obj, item))
+        vocabulary_by_month = {
+            str(item.get("month")): item.get("words") or []
+            for item in (trends.get("vocabulary") or [])
+            if isinstance(item, dict) and item.get("month")
+        }
+
+        legacy_count = int(self._number_or_zero(summary.get("legacy_ai_metrics_count")))
+        if legacy_count:
+            self.status_lbl.configure(
+                text=f"{legacy_count} legacy AI analyses need Backfill for full-transcript metrics."
+            )
+
+        month_dates = []
+        for month in student_words_by_month:
+            try:
+                month_dates.append(datetime.strptime(month, "%Y-%m"))
+            except (TypeError, ValueError):
+                continue
+        all_chart_dates = (
+            month_dates
+            + [item[0] for item in fluency_trend]
+            + [item[0] for item in grammar_scores]
+            + [item[0] for item in context_trend]
+            + [item[0] for item in language_growth_trend]
+        )
+        self._chart_date_bounds = (
+            (min(all_chart_dates), max(all_chart_dates)) if all_chart_dates else None
+        )
 
         self._plot_activity(student_words_by_month, self.tab_activity)
         self._plot_fluency(fluency_trend, self.tab_fluency)
         self._plot_grammar(grammar_scores, self.tab_grammar)
+        self._plot_language_growth(language_growth_trend, self.tab_growth)
+        self._plot_vocabulary(vocabulary_by_month, self.tab_vocabulary)
         self._plot_context_metrics(context_trend, self.tab_context)
 
     def _parse_iso_datetime(self, value):
@@ -790,235 +867,575 @@ class DashboardFrame(ctk.CTkFrame):
 
     # --- PLOT FUNCTIONS ---
 
-    def _plot_activity(self, data, parent_tab):
-        for widget in parent_tab.winfo_children(): widget.destroy()
-        if not data: return
+    def _clear_chart(self, parent_tab):
+        previous_figure = getattr(parent_tab, "_dashboard_figure", None)
+        if previous_figure is not None:
+            plt.close(previous_figure)
+        for widget in parent_tab.winfo_children():
+            widget.destroy()
 
-        sorted_keys = sorted(data.keys())
-        values = [data[k] for k in sorted_keys]
-        labels = []
-        for k in sorted_keys:
-            try: labels.append(datetime.strptime(k, "%Y-%m").strftime("%b"))
-            except (TypeError, ValueError): labels.append(str(k))
+    def _empty_chart(self, parent_tab, message):
+        self._clear_chart(parent_tab)
+        ctk.CTkLabel(
+            parent_tab,
+            text=message,
+            text_color=self.card_subtext,
+            font=("Roboto", 13),
+        ).pack(expand=True)
 
-        fig, ax = plt.subplots(figsize=(5, 3.5), dpi=100)
-        fig.patch.set_facecolor(self.bg_figure)
-        ax.set_facecolor(self.bg_figure)
-        
-        ax.bar(labels, values, color=self.color_student)
-        ax.set_title("Total Words Spoken (Monthly)", color=self.text_color, fontsize=10)
-        ax.tick_params(colors=self.text_color, labelsize=9)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        ax.spines['bottom'].set_color(self.text_color)
-        ax.spines['left'].set_color(self.text_color)
+    def _new_chart(self, *, rows=1, height=3.6, sharex=False, height_ratios=None):
+        figure, axes = plt.subplots(
+            rows,
+            1,
+            figsize=(9.5, height),
+            dpi=100,
+            sharex=sharex,
+            gridspec_kw={"height_ratios": height_ratios} if height_ratios else None,
+        )
+        figure.patch.set_facecolor(self.card_bg)
+        return figure, axes
 
-        canvas = FigureCanvasTkAgg(fig, master=parent_tab)
+    def _style_axis(self, axis, *, title=None, ylabel=None, show_x=True, title_pad=12):
+        axis.set_facecolor(self.card_bg)
+        axis.set_axisbelow(True)
+        axis.grid(axis="y", color=self.card_border, linewidth=0.8, alpha=0.72)
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+        axis.tick_params(
+            axis="both",
+            colors=self.card_subtext,
+            labelsize=9,
+            length=0,
+            pad=7,
+        )
+        if not show_x:
+            axis.tick_params(axis="x", labelbottom=False)
+        if title:
+            axis.set_title(
+                title,
+                loc="left",
+                color=self.text_color,
+                fontsize=12,
+                fontweight="bold",
+                pad=title_pad,
+            )
+        if ylabel:
+            axis.set_ylabel(ylabel, color=self.card_subtext, fontsize=9, labelpad=8)
+
+    def _style_date_axis(self, axis, dates):
+        dates = sorted(date for date in dates if isinstance(date, datetime))
+        bounds = getattr(self, "_chart_date_bounds", None)
+        if bounds:
+            start, end = bounds
+        elif dates:
+            start, end = dates[0], dates[-1]
+        else:
+            return
+
+        if start == end:
+            start -= timedelta(days=16)
+            end += timedelta(days=16)
+        else:
+            padding = max(timedelta(days=8), (end - start) * 0.04)
+            start -= padding
+            end += padding
+
+        axis.set_xlim(start, end)
+        axis.xaxis.set_major_locator(
+            mdates.AutoDateLocator(minticks=2, maxticks=7, interval_multiples=True)
+        )
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    def _style_legend(self, axis, **kwargs):
+        legend = axis.legend(
+            frameon=False,
+            fontsize=8,
+            labelcolor=self.text_color,
+            **kwargs,
+        )
+        return legend
+
+    def _register_legend_toggles(self, figure, legend, lines_by_label):
+        """Make legend entries act as visibility switches for dense charts."""
+        pick_map = getattr(figure, "_dashboard_legend_pick_map", {})
+        for legend_line, legend_text in zip(legend.get_lines(), legend.get_texts()):
+            data_line = lines_by_label.get(legend_text.get_text())
+            if data_line is None:
+                continue
+            legend_line.set_picker(7)
+            legend_text.set_picker(True)
+            target = (data_line, legend_line, legend_text)
+            pick_map[legend_line] = target
+            pick_map[legend_text] = target
+        figure._dashboard_legend_pick_map = pick_map
+
+    def _embed_chart(
+        self,
+        figure,
+        parent_tab,
+        *,
+        right=0.97,
+        top=0.88,
+        bottom=0.18,
+        hspace=0.34,
+    ):
+        # Keep titles, legends, tick labels, and figure captions inside the
+        # Tk canvas at every window size. Matplotlib's default margins assume
+        # a standalone window and are too tight inside a CTkTabview.
+        figure.subplots_adjust(
+            left=0.10,
+            right=right,
+            bottom=bottom,
+            top=top,
+            hspace=hspace,
+        )
+        parent_tab._dashboard_figure = figure
+        canvas = FigureCanvasTkAgg(figure, master=parent_tab)
+
+        pick_map = getattr(figure, "_dashboard_legend_pick_map", {})
+        if pick_map:
+            def toggle_series(event):
+                target = pick_map.get(event.artist)
+                if target is None:
+                    return
+                data_line, legend_line, legend_text = target
+                visible = not data_line.get_visible()
+                data_line.set_visible(visible)
+                alpha = 1.0 if visible else 0.28
+                legend_line.set_alpha(alpha)
+                legend_text.set_alpha(alpha)
+                canvas.draw_idle()
+
+            canvas.mpl_connect("pick_event", toggle_series)
+
         canvas.draw()
+        canvas.get_tk_widget().configure(highlightthickness=0, background=self.card_bg)
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
+    def _plot_activity(self, data, parent_tab):
+        self._clear_chart(parent_tab)
+        points = []
+        for month, value in data.items():
+            try:
+                points.append((datetime.strptime(month, "%Y-%m"), value))
+            except (TypeError, ValueError):
+                continue
+        if not points:
+            self._empty_chart(parent_tab, "Process a lesson to begin the activity timeline.")
+            return
+
+        points.sort(key=lambda item: item[0])
+        dates = [item[0] for item in points]
+        values = [item[1] for item in points]
+        figure, axis = self._new_chart()
+        axis.bar(
+            dates,
+            values,
+            width=20,
+            color=self.color_student,
+            alpha=0.88,
+            edgecolor="none",
+        )
+        self._style_axis(axis, title="Monthly speaking volume", ylabel="Student words")
+        self._style_date_axis(axis, dates)
+        self._embed_chart(figure, parent_tab)
+
     def _plot_fluency(self, trend_data, parent_tab):
-        for widget in parent_tab.winfo_children(): widget.destroy()
+        self._clear_chart(parent_tab)
         if len(trend_data) < 2:
-            ctk.CTkLabel(parent_tab, text="Need more lessons to show trend").pack(expand=True)
+            self._empty_chart(parent_tab, "At least two lessons are needed for a fluency trend.")
             return
 
         trend_data.sort(key=lambda x: x[0])
         dates = [x[0] for x in trend_data]
         wpms = [x[1] for x in trend_data]
-        lats = [x[2] for x in trend_data]
+        latency_points = [(x[0], x[2]) for x in trend_data if x[2] is not None]
 
-        fig, ax1 = plt.subplots(figsize=(5, 3.5), dpi=100)
-        fig.patch.set_facecolor(self.bg_figure)
-        ax1.set_facecolor(self.bg_figure)
+        figure, wpm_axis = self._new_chart()
+        wpm_axis.plot(
+            dates,
+            wpms,
+            color=self.color_student,
+            marker="o",
+            markersize=5,
+            linewidth=2.4,
+            label="Speaking pace",
+        )
+        wpm_axis.fill_between(dates, wpms, alpha=0.08, color=self.color_student)
+        self._style_axis(wpm_axis, title="Fluency over time", ylabel="Words / min")
 
-        color = self.color_student
-        ax1.plot(dates, wpms, color=color, marker='o', label="WPM")
-        ax1.set_ylabel("WPM", color=color, fontsize=9)
-        ax1.tick_params(axis='y', labelcolor=color, labelsize=9)
-        ax1.tick_params(axis='x', colors=self.text_color, labelsize=9)
-        ax1.spines['top'].set_visible(False)
-        ax1.spines['bottom'].set_color(self.text_color)
-        ax1.spines['left'].set_color(self.text_color)
-        
-        ax2 = ax1.twinx() 
-        color2 = self.color_bad 
-        ax2.plot(dates, lats, color=color2, marker='x', linestyle='--', label="Lat")
-        ax2.set_ylabel("Latency (s)", color=color2, fontsize=9)
-        ax2.tick_params(axis='y', labelcolor=color2, labelsize=9)
-        ax2.spines['top'].set_visible(False)
-        ax2.spines['right'].set_color(self.text_color)
-        ax2.spines['bottom'].set_visible(False)
-
-        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-        
-        canvas = FigureCanvasTkAgg(fig, master=parent_tab)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
+        latency_axis = None
+        if latency_points:
+            latency_axis = wpm_axis.twinx()
+            latency_axis.plot(
+                [point[0] for point in latency_points],
+                [point[1] for point in latency_points],
+                color=self.color_bad,
+                marker="o",
+                markersize=4,
+                linewidth=1.8,
+                linestyle="--",
+                label="Response latency",
+            )
+            for spine in latency_axis.spines.values():
+                spine.set_visible(False)
+            latency_axis.tick_params(
+                axis="y", colors=self.color_bad, labelsize=9, length=0, pad=7
+            )
+            latency_axis.set_ylabel("Latency (sec)", color=self.color_bad, fontsize=9, labelpad=8)
+        self._style_date_axis(wpm_axis, dates)
+        handles1, labels1 = wpm_axis.get_legend_handles_labels()
+        handles2, labels2 = latency_axis.get_legend_handles_labels() if latency_axis else ([], [])
+        wpm_axis.legend(
+            handles1 + handles2,
+            labels1 + labels2,
+            loc="lower right",
+            bbox_to_anchor=(1.0, 1.02),
+            borderaxespad=0,
+            ncol=2,
+            frameon=False,
+            fontsize=8,
+            labelcolor=self.text_color,
+        )
+        self._embed_chart(figure, parent_tab, right=0.92, top=0.82)
 
     def _plot_grammar(self, scores_data, parent_tab):
-        for widget in parent_tab.winfo_children(): widget.destroy()
+        self._clear_chart(parent_tab)
         if len(scores_data) < 2:
-            ctk.CTkLabel(parent_tab, text="Compute AI metrics for more lessons to see trend.").pack(expand=True)
+            self._empty_chart(parent_tab, "Analyze at least two lessons to show a grammar trend.")
             return
 
         scores_data.sort(key=lambda x: x[0])
         dates = [x[0] for x in scores_data]
         scores = [x[1] for x in scores_data]
 
-        fig, ax = plt.subplots(figsize=(5, 3.5), dpi=100)
-        fig.patch.set_facecolor(self.bg_figure)
-        ax.set_facecolor(self.bg_figure)
-        
-        ax.plot(dates, scores, color=self.color_ai, marker='D', linewidth=2)
-        ax.set_title("Grammar Accuracy Score (0-100)", color=self.text_color, fontsize=10)
-        ax.set_ylim(0, 105) # Keep scale consistent
-        
-        ax.tick_params(colors=self.text_color, labelsize=9)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        ax.spines['bottom'].set_color(self.text_color)
-        ax.spines['left'].set_color(self.text_color)
-        
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+        figure, axis = self._new_chart()
+        axis.plot(
+            dates,
+            scores,
+            color=self.color_ai,
+            marker="o",
+            markersize=5,
+            linewidth=2.4,
+        )
+        axis.fill_between(dates, scores, alpha=0.09, color=self.color_ai)
+        axis.set_ylim(0, 105)
+        self._style_axis(axis, title="Grammar accuracy", ylabel="Score / 100")
+        self._style_date_axis(axis, dates)
+        self._embed_chart(figure, parent_tab)
 
-        canvas = FigureCanvasTkAgg(fig, master=parent_tab)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
+    def _plot_language_growth(self, trend_data, parent_tab):
+        self._clear_chart(parent_tab)
+        if len(trend_data) < 2:
+            self._empty_chart(parent_tab, "At least two learner-scoped lessons are needed for growth trends.")
+            return
+
+        trend_data = sorted(trend_data, key=lambda item: item[0])
+        figure, (lexical_axis, structure_axis) = self._new_chart(
+            rows=2,
+            height=4.8,
+            sharex=True,
+            height_ratios=[1, 1],
+        )
+
+        def plot_metric(axis, key, label, color, linestyle="-"):
+            points = [
+                (date, metrics.get(key))
+                for date, metrics in trend_data
+                if isinstance(metrics.get(key), (int, float))
+            ]
+            if len(points) < 2:
+                return None
+            line, = axis.plot(
+                [item[0] for item in points],
+                [item[1] for item in points],
+                color=color,
+                linewidth=2.0,
+                marker="o",
+                markersize=3.8,
+                linestyle=linestyle,
+                label=label,
+            )
+            return line
+
+        lexical_line = plot_metric(
+            lexical_axis, "mattr_50", "Lexical diversity (MATTR-50)", self.color_ai
+        )
+        lexical_axis.set_ylim(0, 1)
+        self._style_axis(
+            lexical_axis,
+            title="Lexical range",
+            ylabel="Diversity (0–1)",
+            show_x=False,
+        )
+        # The single-series label belongs in the heading, not over the data.
+        if lexical_line:
+            lexical_axis.set_title(
+                "Lexical range  ·  MATTR-50",
+                loc="left",
+                color=self.text_color,
+                fontsize=12,
+                fontweight="bold",
+                pad=12,
+            )
+
+        structure_lines = {}
+        for key, label, color, linestyle in (
+            ("mean_utterance_words", "Mean utterance length", self.color_student, "-"),
+            ("connectors_per_100_words", "Connectors / 100 words", "#6EB5FF", "--"),
+            ("subordinators_per_100_words", "Subordinators / 100 words", "#E0B84D", ":"),
+        ):
+            line = plot_metric(structure_axis, key, label, color, linestyle)
+            if line:
+                structure_lines[label] = line
+        self._style_axis(
+            structure_axis,
+            title="Utterance and clause complexity",
+            ylabel="Words / rate",
+            title_pad=36,
+        )
+        self._style_date_axis(structure_axis, [item[0] for item in trend_data])
+        if structure_lines:
+            legend = self._style_legend(
+                structure_axis,
+                loc="lower left",
+                bbox_to_anchor=(0.0, 1.02),
+                borderaxespad=0,
+                ncol=3,
+            )
+            self._register_legend_toggles(figure, legend, structure_lines)
+
+        figure.text(
+            0.99,
+            0.025,
+            "Descriptive transcript measures; click a legend item to toggle",
+            ha="right",
+            color=self.card_subtext,
+            fontsize=8,
+        )
+        self._embed_chart(
+            figure,
+            parent_tab,
+            top=0.88,
+            bottom=0.20,
+            hspace=0.70,
+        )
+
+    def _plot_vocabulary(self, vocabulary_by_month, parent_tab):
+        self._clear_chart(parent_tab)
+        if not vocabulary_by_month:
+            self._empty_chart(parent_tab, "No learner vocabulary is available yet.")
+            return
+
+        months = sorted(vocabulary_by_month)
+        labels = {
+            datetime.strptime(month, "%Y-%m").strftime("%b '%y"): month
+            for month in months
+        }
+        controls = ctk.CTkFrame(parent_tab, fg_color="transparent")
+        controls.pack(fill="x", padx=12, pady=(8, 0))
+        ctk.CTkLabel(
+            controls,
+            text="Month",
+            text_color=self.card_subtext,
+        ).pack(side="left", padx=(0, 8))
+        selected = ctk.StringVar(value=list(labels)[-1])
+        plot_host = ctk.CTkFrame(parent_tab, fg_color="transparent")
+        plot_host.pack(fill="both", expand=True)
+
+        def render_month(label):
+            self._render_vocabulary_month(
+                plot_host,
+                labels[label],
+                vocabulary_by_month.get(labels[label], []),
+            )
+
+        menu = ctk.CTkOptionMenu(
+            controls,
+            variable=selected,
+            values=list(labels),
+            command=render_month,
+            width=130,
+        )
+        menu.pack(side="left")
+        ctk.CTkLabel(
+            controls,
+            text="Frequent learner word forms; stopwords and fillers excluded",
+            text_color=self.card_subtext,
+        ).pack(side="left", padx=12)
+        render_month(selected.get())
+
+    def _render_vocabulary_month(self, parent, month, words):
+        self._clear_chart(parent)
+        cleaned = [
+            (str(item.get("word")), int(item.get("count") or 0))
+            for item in words
+            if isinstance(item, dict) and item.get("word") and int(item.get("count") or 0) > 0
+        ][:30]
+        if not cleaned:
+            self._empty_chart(parent, "No vocabulary terms were found for this month.")
+            return
+
+        figure, axis = self._new_chart(height=3.7)
+        axis.set_facecolor(self.card_bg)
+        axis.set_xlim(0, 1)
+        axis.set_ylim(0, 1)
+        axis.axis("off")
+        maximum = max(count for _, count in cleaned)
+        minimum = min(count for _, count in cleaned)
+        colors = [self.color_ai, self.color_student, "#6EB5FF", "#E0B84D", "#E58ACD"]
+        columns = 6
+        rows = 5
+        for index, (word, count) in enumerate(cleaned[: columns * rows]):
+            row, column = divmod(index, columns)
+            x = (column + 0.5) / columns
+            y = 0.88 - row * (0.75 / max(1, rows - 1))
+            weight = (count - minimum) / max(1, maximum - minimum)
+            axis.text(
+                x,
+                y,
+                word,
+                ha="center",
+                va="center",
+                fontsize=10 + weight * 17,
+                fontweight="bold" if weight > 0.65 else "normal",
+                color=colors[index % len(colors)],
+                alpha=0.78 + weight * 0.22,
+                transform=axis.transAxes,
+            )
+        title = datetime.strptime(month, "%Y-%m").strftime("Vocabulary used in %b '%y")
+        axis.set_title(title, loc="left", color=self.text_color, fontsize=12, fontweight="bold")
+        self._embed_chart(figure, parent, top=0.90)
 
     def _plot_context_metrics(self, trend_data, parent_tab):
-        for widget in parent_tab.winfo_children(): widget.destroy()
+        self._clear_chart(parent_tab)
         if len(trend_data) < 2:
-            ctk.CTkLabel(parent_tab, text="Need more context metrics to show trend.").pack(expand=True)
+            self._empty_chart(parent_tab, "At least two analyzed lessons are needed for context trends.")
             return
 
         trend_data.sort(key=lambda x: x[0])
         score_series = {
-            "Raw Grammar": ("raw_grammar_score", self.color_ai, "o", "-", -0.30),
-            "Adj Grammar": ("adjusted_grammar_score", "#6EB5FF", "D", "--", -0.18),
-            "Raw WPM": ("raw_wpm", self.color_student, "o", "-", -0.06),
-            "Load WPM": ("cognitive_load_adjusted_wpm", "#E0B84D", "s", "--", 0.06),
-            "Fluency Load": ("fluency_under_load", "#64C2A6", "^", "-.", 0.18),
-            "Effective Fluency": ("effective_fluency_score", "#E58ACD", "P", ":", 0.30),
-            "Resilience": ("complexity_resilience_score", "#B6D957", "X", ":", 0.42),
+            "Raw Grammar": ("raw_grammar_score", self.color_ai, "o", "-"),
+            "Adj Grammar": ("adjusted_grammar_score", "#6EB5FF", "o", "--"),
+            "Raw WPM": ("raw_wpm", self.color_student, "o", "-"),
+            "Load WPM": ("cognitive_load_adjusted_wpm", "#E0B84D", "o", "--"),
+            "Fluency Load": ("fluency_under_load", "#64C2A6", "o", "-."),
+            "Effective Fluency": ("effective_fluency_score", "#E58ACD", "o", ":"),
+            "Resilience": ("complexity_resilience_score", "#B6D957", "o", ":"),
         }
         advanced_series = {
-            "Concept Load": ("conceptual_load_score", "#E0B84D", "o", "-", -0.18),
-            "Abstraction": ("abstraction_level", "#6EB5FF", "D", "--", -0.10),
-            "Branching": ("cognitive_branching", "#E58ACD", "s", "-.", -0.02),
-            "Technical": ("technical_density", "#D76A5D", "^", "-", 0.06),
-            "Discourse": ("discourse_depth", "#64C2A6", "P", "--", 0.14),
-            "Lexical Pressure": ("lexical_retrieval_pressure", "#C98A1A", "x", ":", 0.22),
+            "Concept Load": ("conceptual_load_score", "#E0B84D", "o", "-"),
+            "Abstraction": ("abstraction_level", "#6EB5FF", "o", "--"),
+            "Branching": ("cognitive_branching", "#E58ACD", "o", "-."),
+            "Technical": ("technical_density", "#D76A5D", "o", "-"),
+            "Discourse": ("discourse_depth", "#64C2A6", "o", "--"),
+            "Lexical Pressure": ("lexical_retrieval_pressure", "#C98A1A", "o", ":"),
         }
         context_series = {
-            "Topic Diff": ("topic_difficulty", "#D76A5D", "v", "-", -0.10),
-            "Idea Density": ("idea_density", "#C98A1A", "P", "--", 0.00),
-            "Practice 7d hrs": ("practice_hours_last_7_days", "#AFAFAF", "x", ":", 0.10),
+            "Topic Diff": ("topic_difficulty", "#D76A5D", "o", "-"),
+            "Idea Density": ("idea_density", "#C98A1A", "o", "--"),
+            "Practice 7d hrs": ("practice_hours_last_7_days", "#AFAFAF", "o", ":"),
         }
 
-        fig, (ax_scores, ax_advanced, ax_context) = plt.subplots(
-            3,
-            1,
-            figsize=(7.2, 5.6),
-            dpi=100,
+        fig, (ax_scores, ax_advanced, ax_context) = self._new_chart(
+            rows=3,
+            height=5.2,
             sharex=True,
-            gridspec_kw={"height_ratios": [2.0, 1.2, 1]},
+            height_ratios=[1.25, 1.0, 1.0],
         )
-        fig.patch.set_facecolor(self.bg_figure)
-
-        def style_axis(ax):
-            ax.set_facecolor(self.bg_figure)
-            ax.tick_params(colors=self.text_color, labelsize=8)
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-            ax.spines['bottom'].set_color(self.text_color)
-            ax.spines['left'].set_color(self.text_color)
 
         def plot_group(ax, series, zbase=10):
             plotted_any = False
             values_all = []
-            for idx, (label, (key, color, marker, linestyle, day_offset)) in enumerate(series.items()):
+            lines_by_label = {}
+            for idx, (label, (key, color, marker, linestyle)) in enumerate(series.items()):
                 points = [(dt, ctx.get(key)) for dt, ctx in trend_data if isinstance(ctx.get(key), (int, float))]
                 if len(points) < 2:
                     continue
-                dates = [x[0] + timedelta(days=day_offset) for x in points]
+                dates = [x[0] for x in points]
                 values = [x[1] for x in points]
                 values_all.extend(values)
-                ax.plot(
+                line, = ax.plot(
                     dates,
                     values,
                     marker=marker,
                     linestyle=linestyle,
-                    linewidth=1.6,
-                    markersize=4.3,
-                    alpha=0.88,
+                    linewidth=1.8,
+                    markersize=3.8,
+                    alpha=0.9,
                     label=label,
                     color=color,
                     zorder=zbase - idx,
                 )
+                lines_by_label[label] = line
                 plotted_any = True
-            return plotted_any, values_all
+            return plotted_any, values_all, lines_by_label
 
-        plotted_scores, _score_values = plot_group(ax_scores, score_series)
-        plotted_advanced, advanced_values = plot_group(ax_advanced, advanced_series)
-        plotted_context, context_values = plot_group(ax_context, context_series)
+        plotted_scores, _score_values, score_lines = plot_group(ax_scores, score_series)
+        plotted_advanced, advanced_values, advanced_lines = plot_group(ax_advanced, advanced_series)
+        plotted_context, context_values, context_lines = plot_group(ax_context, context_series)
 
         if not (plotted_scores or plotted_advanced or plotted_context):
             plt.close(fig)
             ctk.CTkLabel(parent_tab, text="Context metrics are not available yet.").pack(expand=True)
             return
 
-        for ax in (ax_scores, ax_advanced, ax_context):
-            style_axis(ax)
+        self._style_axis(ax_scores, title="Experimental performance indices", ylabel="Score / WPM", show_x=False)
+        self._style_axis(ax_advanced, title="Conceptual load", ylabel="Level", show_x=False)
+        self._style_axis(ax_context, title="Lesson context", ylabel="Rating / hrs")
+        self._style_date_axis(ax_context, [item[0] for item in trend_data])
 
-        ax_scores.set_title("Scores and WPM", color=self.text_color, fontsize=10, pad=6)
-        ax_scores.set_ylabel("Score / WPM", color=self.text_color, fontsize=8)
         if plotted_scores:
-            ax_scores.legend(
+            legend = self._style_legend(
+                ax_scores,
                 loc="upper left",
                 bbox_to_anchor=(1.01, 1.0),
                 borderaxespad=0,
-                fontsize=7,
-                framealpha=0.82,
             )
+            self._register_legend_toggles(fig, legend, score_lines)
         else:
             ax_scores.text(0.5, 0.5, "No score/WPM context metrics yet", transform=ax_scores.transAxes, ha="center", color=self.card_subtext)
 
-        ax_advanced.set_title("Advanced Conceptual Load", color=self.text_color, fontsize=10, pad=4)
-        ax_advanced.set_ylabel("1-10", color=self.text_color, fontsize=8)
         if advanced_values:
             ax_advanced.set_ylim(0.5, max(10.0, max(advanced_values) + 0.75))
         if plotted_advanced:
-            ax_advanced.legend(
+            legend = self._style_legend(
+                ax_advanced,
                 loc="upper left",
                 bbox_to_anchor=(1.01, 1.0),
                 borderaxespad=0,
-                fontsize=7,
-                framealpha=0.82,
             )
+            self._register_legend_toggles(fig, legend, advanced_lines)
         else:
             ax_advanced.text(0.5, 0.5, "No advanced load metrics yet", transform=ax_advanced.transAxes, ha="center", color=self.card_subtext)
 
-        ax_context.set_title("Context Inputs", color=self.text_color, fontsize=10, pad=4)
-        ax_context.set_ylabel("Rating / hrs", color=self.text_color, fontsize=8)
         if context_values:
             context_top = max(5.0, max(context_values) + 0.75)
             ax_context.set_ylim(-0.25, context_top)
         if plotted_context:
-            ax_context.legend(
+            legend = self._style_legend(
+                ax_context,
                 loc="upper left",
                 bbox_to_anchor=(1.01, 1.0),
                 borderaxespad=0,
-                fontsize=7,
-                framealpha=0.82,
             )
+            self._register_legend_toggles(fig, legend, context_lines)
         else:
             ax_context.text(0.5, 0.5, "No context inputs yet", transform=ax_context.transAxes, ha="center", color=self.card_subtext)
 
-        ax_context.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-        fig.suptitle("Raw and Context-Adjusted Trends", color=self.text_color, fontsize=10)
-        fig.tight_layout(rect=[0, 0, 0.86, 0.96])
-
-        canvas = FigureCanvasTkAgg(fig, master=parent_tab)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
+        fig.text(
+            0.99,
+            0.025,
+            "Click a legend item to show or hide its line",
+            ha="right",
+            color=self.card_subtext,
+            fontsize=8,
+        )
+        self._embed_chart(
+            fig,
+            parent_tab,
+            right=0.76,
+            top=0.88,
+            bottom=0.18,
+            hspace=0.48,
+        )

@@ -1,21 +1,137 @@
-# WhisperX Diarization & Analysis GUI - User Guide
+# Diarize — Lesson Intelligence
 
-This application allows you to record or load audio, transcribe it using a hardware-aware backend, identify speakers (diarization), and analyze the conversation using local LLMs via Ollama.
+Diarize records or imports language lessons, transcribes them, separates speakers,
+and builds a longitudinal learning dashboard. Local AI analysis runs through
+Ollama; an OpenAI provider is optional.
 
-## Prerequisites
-(The following only applies if you are not installing via the pre-built binaries)
+## Supported installations
 
-1. **Ollama:** Must be installed and running. [Download here](https://ollama.com).
-2. **HuggingFace Token:** Required for the Pyannote diarization model when you use the standard diarization path.
-   - Go to [HuggingFace Settings](https://huggingface.co/settings/tokens).
-   - Create a 'Read' token.
-   - You must verify you have accepted the user agreement for `pyannote/speaker-diarization-3.0`.
+- **macOS 13+ on Apple Silicon:** recommended. `auto` uses MLX Whisper and the
+  bundled FluidAudio helper when available, with WhisperX and pyannote fallbacks.
+- **Windows 10/11, 64-bit:** supported from source. MLX and FluidAudio are
+  macOS-only, so Windows uses WhisperX and pyannote. An NVIDIA GPU is strongly
+  recommended for long recordings, but CPU processing works more slowly.
+- **Linux:** supported from source, or as the processing server described below.
 
-## Setup (First Run)
-1. **Set the Token:**
-   Open your terminal (or add to your `.zshrc`):
-   ```bash
-   export HUGGINGFACE_TOKEN="your_hf_token_here"
+Python 3.10 or 3.11 is recommended. The package requires Python 3.10 or newer.
+
+## Install the macOS app
+
+For a pre-built release:
+
+1. Open `DiarizeApp-macOS.dmg`.
+2. Drag `DiarizeApp.app` to Applications.
+3. Open Diarize and grant microphone access if you intend to record live audio.
+4. If macOS blocks an ad-hoc or locally built copy, Control-click the app, choose
+   **Open**, and confirm. Public releases should be Developer ID signed and notarized.
+
+The app bundle includes Ollama, FFmpeg, the offline pyannote bundle, UI assets,
+and FluidAudio when it was present at build time. AI model weights are deliberately
+not embedded because they are several gigabytes. By default the app stores them
+on `/Volumes/XTRM-P/AI-models/DiarizeApp/models` when that drive is mounted, and
+otherwise under `~/.local/share/diarize-gui/ollama-models`. Set `OLLAMA_MODELS`
+before launching to choose another location.
+
+## Run from source on macOS
+
+Install Git, Python 3.10 or 3.11, and [FFmpeg](https://ffmpeg.org/download.html).
+[Ollama](https://ollama.com/download) is optional because the app
+can start a bundled binary when one is available; installing the official Ollama
+app is the simplest source-development setup.
+
+```bash
+brew install git python@3.11 ffmpeg
+git clone https://github.com/ramav87/whisperx_diarize_gui.git
+cd whisperx_diarize_gui
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+diarize-gui
+```
+
+For Hugging Face pyannote models that are not already bundled, accept the model
+terms on Hugging Face, create a read token, and export it before starting Diarize:
+
+```bash
+export HUGGINGFACE_TOKEN="your_hf_token_here"
+```
+
+## Build the macOS installation package
+
+The build is platform-specific: create the macOS package on macOS using the same
+CPU architecture you intend to distribute. Before building, provide the ignored
+runtime resources `resources/ollama`, `resources/pyannote/`, and optionally
+`resources/fluidaudiocli`. A native FFmpeg must exist either at
+`resources/ffmpeg/ffmpeg` or on `PATH`.
+
+```bash
+source .venv/bin/activate
+python -m pip install pyinstaller
+bash build_app.sh
+```
+
+The script validates its resources, builds with `diarize.spec`, applies an ad-hoc
+signature for local testing, and creates:
+
+- `dist/DiarizeApp.app`
+- `dist/DiarizeApp-macOS.dmg`
+
+For external distribution, replace the ad-hoc signature with a Developer ID
+Application signature and notarize the app and disk image.
+
+## Install from source on Windows
+
+Install 64-bit Python 3.10 or 3.11, Git,
+[FFmpeg](https://ffmpeg.org/download.html), and
+[Ollama](https://ollama.com/download/windows). Ensure `ffmpeg`,
+`git`, and `ollama` are available in a new PowerShell window. Ollama officially
+supports Windows 10 and later.
+
+```powershell
+git clone https://github.com/ramav87/whisperx_diarize_gui.git
+Set-Location whisperx_diarize_gui
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e .
+ollama pull gemma4:e4b
+diarize-gui
+```
+
+If PowerShell prevents virtual-environment activation, run this once for the
+current shell and activate again:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+For an NVIDIA GPU, install the build recommended by the official
+[PyTorch installation selector](https://pytorch.org/get-started/locally/)
+before `pip install -e .`, then verify that
+`python -c "import torch; print(torch.cuda.is_available())"` prints `True`.
+Windows does not use MLX Whisper or FluidAudio; leave both backend selectors on
+`auto` to use WhisperX and pyannote. Set `HUGGINGFACE_TOKEN` in PowerShell when
+the pyannote model is not locally bundled:
+
+```powershell
+$env:HUGGINGFACE_TOKEN = "your_hf_token_here"
+```
+
+There is currently no maintained Windows installer in this repository; Windows
+users should use the source installation above. A Windows package must be built
+on Windows because PyInstaller does not cross-compile application bundles.
+
+## Verify an installation
+
+```bash
+ffmpeg -version
+ollama --version
+python -c "import torch; print(torch.__version__)"
+```
+
+Then launch Diarize, create a profile, load a short audio file, and confirm that
+the Processing status reports the selected ASR and diarization backends.
 
 ## Server mode for tablet clients
 
@@ -228,14 +344,18 @@ Once transcription is done, the Analyze transcript with LLM button becomes activ
 Click the button.
 
 Select Student Speakers: Check the boxes for the speakers that represent YOU (the student).
-Choose Model: Select a model from the dropdown (e.g., mistral, gemma:7b).
+Choose Model: Select a model from the dropdown. `gemma4:12b-mlx` is recommended on Apple Silicon with 24 GB of unified memory; `gemma4:e4b` remains the faster fallback.
 If the model is not installed, the app will ask you to run ollama pull [model] in your terminal.
+
+Local Ollama analysis uses a 48K-token context and accepts up to 120,000 transcript characters. Each saved `ai_stats.json` records the provider, model, transcript coverage, learner-speaker scope, and metric schema version. Older analyses remain readable, but the Dashboard identifies them as legacy; use Backfill to regenerate comparable full-transcript metrics.
 
 Edit Prompt: You can customize the instructions sent to the AI.
 Click OK (Analyze). The result will appear in a new window and be saved to your history.
 
 5. **Review History**
 Click View lesson history at the top to see past transcripts and AI feedback.
+
+The Dashboard's Language Growth view uses deterministic transcript measures such as MATTR lexical diversity, utterance length, and connector/subordinator density. The Vocabulary view groups frequently used content words by month. Context-adjusted values are explicitly labeled experimental and should not be read as standardized proficiency scores.
 
 ## Spanish transcript quality
 

@@ -3,9 +3,24 @@ Utility functions for hardware detection, timestamp formatting, and config helpe
 """
 
 import base64
+import os
 import platform
 import sys
 from typing import Dict, Optional
+
+
+EXTERNAL_OLLAMA_MODELS_DIR = "/Volumes/XTRM-P/AI-models/DiarizeApp/models"
+
+
+def ollama_models_dir() -> str:
+    """Return the configured model store, preferring the mounted XTRM drive."""
+    configured = os.environ.get("OLLAMA_MODELS")
+    if configured:
+        return os.path.expanduser(configured)
+    external_parent = os.path.dirname(EXTERNAL_OLLAMA_MODELS_DIR)
+    if os.path.isdir(external_parent):
+        return EXTERNAL_OLLAMA_MODELS_DIR
+    return os.path.expanduser("~/.local/share/diarize-gui/ollama-models")
 
 
 def detect_device() -> str:

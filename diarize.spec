@@ -97,10 +97,12 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='DiarizeApp.app',
-    icon=None,
+    icon='resources/icons/diarize.icns',
     bundle_identifier='com.rama.diarizegui',
+    version='0.1.0',
     info_plist={
         'NSMicrophoneUsageDescription': 'This app needs access to the microphone to record audio for transcription.',
-        'NSHighResolutionCapable': 'True'
+        'NSHighResolutionCapable': True,
+        'NSPrincipalClass': 'NSApplication',
     },
 )

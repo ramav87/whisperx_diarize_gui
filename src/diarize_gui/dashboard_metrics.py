@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .metrics.context_adjusted import build_context_metrics, compute_automaticity_gap
+from .metrics.language_growth import compute_language_growth_metrics
 
 
 def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[str, Any]:
@@ -21,6 +22,8 @@ def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[s
     total_latency_count = 0
     max_turn_duration = 0.0
     analyzed_count = 0
+    ai_v2_count = 0
+    explicit_ai_scope_count = 0
 
     all_grammar_scores: list[tuple[datetime, float, str]] = []
     golden_words_all: list[str] = []
@@ -28,6 +31,8 @@ def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[s
     context_trend: list[dict[str, Any]] = []
     student_words_by_month: dict[str, int] = defaultdict(int)
     fluency_trend: list[dict[str, Any]] = []
+    language_growth_trend: list[dict[str, Any]] = []
+    vocabulary_by_month: dict[str, Counter[str]] = defaultdict(Counter)
     lessons: list[dict[str, Any]] = []
 
     for lesson_dir in lesson_dirs:
@@ -45,6 +50,12 @@ def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[s
             ai_data = {}
         if ai_data:
             analyzed_count += 1
+            if ai_data.get("analysis_schema_version") == 2:
+                ai_v2_count += 1
+            provenance = ai_data.get("analysis_provenance") if isinstance(ai_data.get("analysis_provenance"), dict) else {}
+            scope = ai_data.get("analysis_scope") if isinstance(ai_data.get("analysis_scope"), dict) else {}
+            if provenance.get("student_scope") == "explicit" or scope.get("speaker_scope") == "explicit":
+                explicit_ai_scope_count += 1
 
         grammar_score = _number_or_none(ai_data.get("grammar_score"))
         if grammar_score is not None and dt_obj:
@@ -101,7 +112,7 @@ def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[s
         student_speaking_sec += lesson_student_sec
 
         lesson_raw_wpm = (lesson_student_words / (lesson_student_sec / 60.0)) if lesson_student_sec > 10 else None
-        lesson_avg_latency = (lesson_lat_sum / lesson_lat_cnt) if lesson_lat_cnt else 0.0
+        lesson_avg_latency = (lesson_lat_sum / lesson_lat_cnt) if lesson_lat_cnt else None
         if lesson_raw_wpm is not None and dt_obj:
             fluency_trend.append(
                 {
@@ -111,6 +122,26 @@ def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[s
                     "avg_latency_sec": lesson_avg_latency,
                 }
             )
+
+        language_metrics = compute_language_growth_metrics(
+            segments,
+            meta.get("student_speakers") or [],
+        )
+        if dt_obj and language_metrics.get("token_count"):
+            language_growth_trend.append(
+                {
+                    "lesson_id": lesson_id,
+                    "date": date_value,
+                    **{
+                        key: value
+                        for key, value in language_metrics.items()
+                        if key not in {"top_content_words", "limitations"}
+                    },
+                }
+            )
+            for item in language_metrics.get("top_content_words", []):
+                if isinstance(item, dict) and item.get("word"):
+                    vocabulary_by_month[month_key][str(item["word"])] += int(item.get("count") or 0)
 
         context_metrics = None
         if dt_obj:
@@ -156,6 +187,7 @@ def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[s
                 "max_turn_duration_sec": lesson_max_turn,
                 "grammar_score": grammar_score,
                 "context_metrics": context_metrics,
+                "language_metrics": language_metrics,
                 "analyzed": bool(ai_data),
             }
         )
@@ -176,6 +208,9 @@ def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[s
         "summary": {
             "lesson_count": len(lesson_dirs),
             "analyzed_lesson_count": analyzed_count,
+            "ai_metrics_v2_count": ai_v2_count,
+            "legacy_ai_metrics_count": max(0, analyzed_count - ai_v2_count),
+            "explicit_ai_scope_count": explicit_ai_scope_count,
             "total_recording_sec": total_recording_sec,
             "total_hours": total_hours,
             "student_speaking_sec": student_speaking_sec,
@@ -199,6 +234,17 @@ def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[s
                 for dt_obj, score, lesson_id in sorted(all_grammar_scores, key=lambda item: item[0])
             ],
             "context": sorted(context_trend, key=lambda item: item["date"] or ""),
+            "language_growth": sorted(language_growth_trend, key=lambda item: item["date"] or ""),
+            "vocabulary": [
+                {
+                    "month": month,
+                    "words": [
+                        {"word": word, "count": count}
+                        for word, count in counts.most_common(40)
+                    ],
+                }
+                for month, counts in sorted(vocabulary_by_month.items())
+            ],
         },
         "lessons": sorted(lessons, key=lambda item: item["date"] or item["id"], reverse=True),
     }
