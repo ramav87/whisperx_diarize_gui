@@ -1,20 +1,37 @@
 import os
+
+# Some macOS conda/PyPI mixes load more than one OpenMP runtime through the
+# audio/ML stack. Set this before importing torch/whisper/pyannote paths so the
+# GUI keeps running instead of aborting during model startup.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import sys
 import threading
 import subprocess
+import shutil
 import json
+import re
 from datetime import datetime
-import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
 import stat
 import math
+import time
+from urllib.request import urlopen
+from urllib.parse import quote
+import requests
 from .dashboard import DashboardFrame
 from .theme import AppTheme
+from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL
+from .metrics.context_adjusted import (
+    build_context_metrics,
+    interpretation_for_context_metrics,
+)
+from .local_server import default_local_server_url, start_local_server_if_enabled
 
 # Import backend logic
-from .utils import obfuscate_secret, deobfuscate_secret, estimate_openai_cost
+from .utils import obfuscate_secret, deobfuscate_secret, estimate_openai_cost, ollama_models_dir
 from .recorder import AudioRecorder
 from .pipeline import DiarizationPipelineRunner
 from .pyannote_offline_loader import get_resource_base_path
@@ -33,46 +50,36 @@ LANGUAGE_MAP = {
     "Ukrainian": "uk", "Vietnamese": "vi"
 }
 
-#Kill Ollama if it is already running to prevent errors from other ollama servers
-try:
-    os.system("pkill ollama") 
-except:
-    pass
+def find_ollama_binary() -> str | None:
+    if getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base_path = get_resource_base_path()
+
+    candidates = [
+        os.path.join(base_path, "deps", "ollama"),
+        os.path.join(base_path, "ollama"),
+        shutil.which("ollama"),
+    ]
+    return next((path for path in candidates if path and os.path.exists(path)), None)
+
 
 def start_bundled_ollama():
     """
-    Starts the bundled Ollama binary in 'serve' mode.
+    Starts the bundled or system Ollama binary in 'serve' mode.
     """
-    # 1. FIX: Reliable Path Logic (Remove _MEIPASS)
-    if getattr(sys, 'frozen', False):
-        # In the App Bundle, look relative to the actual executable
-        # Path: .../DiarizeApp.app/Contents/MacOS
-        base_path = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        # In Dev Mode
-        base_path = get_resource_base_path()
-
-    # 2. Locate Binary
-    # Look in 'deps' first (Standard for our build)
-    ollama_bin = os.path.join(base_path, "deps", "ollama")
-    
-    # Fallback for dev/legacy paths
-    if not os.path.exists(ollama_bin):
-        ollama_bin = os.path.join(base_path, "ollama")
-    
-    if not os.path.exists(ollama_bin):
-        print(f"CRITICAL ERROR: Bundled Ollama binary not found at: {ollama_bin}")
+    ollama_bin = find_ollama_binary()
+    if ollama_bin is None:
+        print("WARNING: Ollama binary not found. Install Ollama or use OpenAI analysis.")
         return None
 
-    # 3. Permissions Check
-    try:
-        os.chmod(ollama_bin, 0o755)
-    except Exception:
-        pass
+    if getattr(sys, 'frozen', False):
+        try:
+            os.chmod(ollama_bin, 0o755)
+        except Exception:
+            pass
 
-    # 4. Environment Setup
-    # Ensure we use the correct Application Support folder
-    models_dir = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+    models_dir = ollama_models_dir()
     os.makedirs(models_dir, exist_ok=True)
     
     env = os.environ.copy()
@@ -80,7 +87,7 @@ def start_bundled_ollama():
     # Force the custom port to avoid conflicts with system Ollama
     env["OLLAMA_HOST"] = "127.0.0.1:11435"
     
-    print(f"Starting bundled Ollama from: {ollama_bin}")
+    print(f"Starting Ollama from: {ollama_bin}")
     print(f"Ollama Models Dir: {models_dir}")
 
     try:
@@ -98,10 +105,32 @@ def start_bundled_ollama():
     except Exception as e:
         print(f"Failed to start bundled Ollama: {e}")
         return None
+
+
+def wait_for_ollama_server(timeout_s: int = 30) -> bool:
+    """
+    Wait for the bundled Ollama server to start responding.
+    """
+    url = "http://127.0.0.1:11435/api/tags"
+    deadline = time.time() + timeout_s
+    last_error = None
+
+    while time.time() < deadline:
+        try:
+            with urlopen(url, timeout=3) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception as e:
+            last_error = str(e)
+
+        time.sleep(0.5)
+
+    print(f"WARNING: Ollama server was not ready after {timeout_s}s: {last_error}")
+    return False
         
 def setup_ffmpeg_environment():
     """
-    Adds the bundled FFmpeg binary to the system PATH.
+    Adds bundled FFmpeg to PATH, or uses system FFmpeg in development.
     """
     base_path = get_resource_base_path()
     
@@ -126,8 +155,10 @@ def setup_ffmpeg_environment():
             print("FFmpeg verification successful.")
         except Exception as e:
             print(f"WARNING: Bundled FFmpeg found but not executable: {e}")
+    elif shutil.which("ffmpeg"):
+        print(f"Using system FFmpeg: {shutil.which('ffmpeg')}")
     else:
-        print(f"CRITICAL WARNING: Bundled FFmpeg not found at: {ffmpeg_dir}")
+        print("WARNING: FFmpeg not found. Install ffmpeg before transcription.")
 
 class ToolTip:
     def __init__(self, widget, text, delay=500):
@@ -137,8 +168,9 @@ class ToolTip:
         self.tipwindow = None
         self.after_id = None
 
-        widget.bind("<Enter>", self._schedule)
-        widget.bind("<Leave>", self._hide)
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
 
     def _schedule(self, _=None):
         self.after_id = self.widget.after(self.delay, self._show)
@@ -185,8 +217,8 @@ class DiarizationApp:
         self.current_lesson_dir = None
         self._assign_window_open = False
 
-        master.title("Lesson Recording and Analysis App")
-        master.geometry("750x900")
+        master.title("Diarize — Lesson Intelligence")
+        self._configure_main_window()
       
         # --- LOGIC INIT ---
         self.audio_path = None
@@ -209,16 +241,24 @@ class DiarizationApp:
         self.master.configure(fg_color=AppTheme.BG_MAIN)
 
         self.tab_view = ctk.CTkTabview(self.master, fg_color=AppTheme.BG_MAIN)
-        self.tab_view.pack(fill="both", expand=True, padx=10, pady=10)
+        self.tab_view.pack(fill="both", expand=True, padx=12, pady=(8, 12))
 
         self.tab_dash = self.tab_view.add("Dashboard")
         self.tab_dash.configure(fg_color=AppTheme.BG_MAIN)
 
         self.tab_studio = self.tab_view.add("Studio")
         self.tab_studio.configure(fg_color=AppTheme.BG_MAIN)
-        
+
+        # The dashboard must size to its viewport. A scrollable parent makes the
+        # charts request their full natural height and forces needless scrolling.
+        self.tab_dash.grid_rowconfigure(0, weight=1)
+        self.tab_dash.grid_columnconfigure(0, weight=1)
+
+        self.studio_scroll = ctk.CTkScrollableFrame(self.tab_studio, fg_color=AppTheme.BG_MAIN)
+        self.studio_scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
         # Set "Studio" as the parent for all existing UI elements
-        self._build_ui(parent=self.tab_studio)
+        self._build_ui(parent=self.studio_scroll)
         
         # Initialize Dashboard (empty until profile loads)
         self.dashboard = None
@@ -232,8 +272,19 @@ class DiarizationApp:
         atexit.register(self._cleanup_ollama)
         os.environ["LLM_ANALYSIS_URL"] = "http://127.0.0.1:11435/api/generate"
 
+    def _configure_main_window(self):
+        """Choose a spacious desktop size while respecting smaller displays."""
+        screen_width = self.master.winfo_screenwidth()
+        screen_height = self.master.winfo_screenheight()
+        width = min(1280, max(960, screen_width - 160))
+        height = min(860, max(700, screen_height - 140))
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        self.master.geometry(f"{width}x{height}+{x}+{y}")
+        self.master.minsize(900, 650)
+
     def _load_icons(self):
-        def load_icon(name):
+        def load_icon(name, size=(20, 20)):
             if getattr(sys, 'frozen', False):
                 base_path = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(os.path.abspath(sys.executable))
                 possible = [
@@ -248,72 +299,147 @@ class DiarizationApp:
 
             for p in possible:
                 if os.path.exists(p):
-                    return ctk.CTkImage(light_image=Image.open(p), dark_image=Image.open(p), size=(20, 20))
+                    return ctk.CTkImage(light_image=Image.open(p), dark_image=Image.open(p), size=size)
             return None
 
         self.icon_user = load_icon("user.png")
         self.icon_mic = load_icon("mic.png")
         self.icon_folder = load_icon("folder.png")
+        self.logo_mark = load_icon("diarize_logo.png", size=(150, 150))
 
     def _build_ui(self, parent):
+        def add_section_header(container, title, subtitle=None):
+            header = ctk.CTkFrame(container, fg_color="transparent")
+            header.pack(fill="x", padx=12, pady=(8, 4))
+
+            ctk.CTkLabel(
+                header,
+                text=title,
+                font=("Roboto", 13, "bold"),
+                text_color=AppTheme.TEXT_PRIMARY,
+            ).pack(anchor="w")
+
+            if subtitle:
+                ctk.CTkLabel(
+                    header,
+                    text=subtitle,
+                    font=("Roboto", 10),
+                    text_color=AppTheme.TEXT_MUTED,
+                    justify="left",
+                ).pack(anchor="w", pady=(1, 0))
+
+            return header
+
         # 1. PROFILE HEADER
         self.profile_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color=AppTheme.BG_CARD)
-        self.profile_frame.pack(padx=15, pady=(15, 5), fill="x")
+        self.profile_frame.pack(padx=15, pady=(10, 5), fill="x")
+
+        profile_top = ctk.CTkFrame(self.profile_frame, fg_color="transparent")
+        profile_top.pack(fill="x", padx=10, pady=8)
+        profile_top.grid_columnconfigure(0, weight=1)
+
+        profile_left = ctk.CTkFrame(profile_top, fg_color="transparent")
+        profile_left.grid(row=0, column=0, sticky="w")
+
+        self.profile_title = ctk.CTkLabel(
+            profile_left,
+            text="Studio Workspace",
+            font=("Roboto", 18, "bold"),
+            text_color=AppTheme.BTN_PRIMARY,
+            anchor="w",
+        )
+        self.profile_title.pack(anchor="w")
+
+        self.profile_subtitle = ctk.CTkLabel(
+            profile_left,
+            text="Capture, diarization, and AI feedback in one place.",
+            font=("Roboto", 11),
+            text_color=AppTheme.TEXT_MUTED,
+            anchor="w",
+        )
+        self.profile_subtitle.pack(anchor="w", pady=(2, 0))
 
         self.profile_label = ctk.CTkLabel(
-            self.profile_frame, 
-            text="Profile: (none)", 
-            font=("Roboto", 16, "bold"),
-            text_color=AppTheme.TEXT_PRIMARY,
-            image=self.icon_user,
-            compound="left",
-            padx=10
+            profile_left,
+            text="Profile: (none)",
+            font=("Roboto", 11),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
         )
-        self.profile_label.pack(side="left", padx=10, pady=10)
+        self.profile_label.pack(anchor="w", pady=(1, 0))
 
-        self.profile_btn = ctk.CTkButton(
-            self.profile_frame, 
-            text="Change", 
-            width=80, 
-            fg_color=AppTheme.BTN_PRIMARY,
-            hover_color=AppTheme.BTN_PRIMARY_HOVER,
+        self.profile_pill = ctk.CTkLabel(
+            profile_top,
+            text="LIVE STUDIO",
+            font=("Roboto", 10, "bold"),
             text_color=AppTheme.BTN_TEXT_ON_BLUE,
-            command=self.set_profile
+            fg_color=AppTheme.BTN_PRIMARY,
+            corner_radius=999,
+            padx=10,
+            pady=4,
         )
-        self.profile_btn.pack(side="right", padx=(5, 10))
-        
+        self.profile_pill.grid(row=0, column=1, sticky="e", padx=(8, 12))
+
+        actions_right = ctk.CTkFrame(profile_top, fg_color="transparent")
+        actions_right.grid(row=0, column=2, sticky="e")
+
         self.history_btn = ctk.CTkButton(
-            self.profile_frame, 
-            text="History", 
-            width=80, 
-            fg_color="transparent", 
+            actions_right,
+            text="History",
+            width=76,
+            height=34,
+            fg_color="transparent",
             border_width=2,
             border_color=AppTheme.BORDER_DIVIDER,
             text_color=AppTheme.TEXT_PRIMARY,
             command=self.view_history
         )
-        self.history_btn.pack(side="right", padx=0)
+        self.history_btn.pack(side="left", padx=(0, 6))
+
+        self.profile_btn = ctk.CTkButton(
+            actions_right,
+            text="Change",
+            width=76,
+            height=34,
+            fg_color=AppTheme.BTN_PRIMARY,
+            hover_color=AppTheme.BTN_PRIMARY_HOVER,
+            text_color=AppTheme.BTN_TEXT_ON_BLUE,
+            command=self.set_profile
+        )
+        self.profile_btn.pack(side="left")
+
+        # Wide screens use a true desktop workspace: capture and configuration
+        # on the left, then processing and results on the right. The outer
+        # scroll view remains only as a safety net for compact displays.
+        self.studio_columns = ctk.CTkFrame(parent, fg_color="transparent")
+        self.studio_columns.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        self.studio_columns.grid_columnconfigure(0, weight=3, uniform="studio_column")
+        self.studio_columns.grid_columnconfigure(1, weight=2, uniform="studio_column")
+
+        self.studio_left = ctk.CTkFrame(self.studio_columns, fg_color="transparent")
+        self.studio_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.studio_right = ctk.CTkFrame(self.studio_columns, fg_color="transparent")
+        self.studio_right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
         # 2. INPUT CARD
-        self.input_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
-        self.input_card.pack(padx=15, pady=5, fill="x")
-        
-        ctk.CTkLabel(
-            self.input_card, 
-            text="Input Source", 
-            font=("Roboto", 14, "bold"), 
-            text_color=AppTheme.TEXT_PRIMARY
-        ).pack(anchor="w", padx=15, pady=(10,5))
+        self.input_card = ctk.CTkFrame(self.studio_left, fg_color=AppTheme.BG_CARD)
+        self.input_card.pack(pady=(0, 6), fill="x")
+
+        add_section_header(
+            self.input_card,
+            "Input & Capture",
+            "Select audio, load an existing transcript, or record directly into a lesson."
+        )
 
         # A. File Select
         self.file_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
-        self.file_row.pack(fill="x", padx=10, pady=5)
+        self.file_row.pack(fill="x", padx=12, pady=(0, 6))
         
         self.audio_btn = ctk.CTkButton(
             self.file_row, 
             text="Select Audio", 
             image=self.icon_folder, 
-            width=120,
+            width=132,
             fg_color=AppTheme.BTN_PRIMARY,
             hover_color=AppTheme.BTN_PRIMARY_HOVER,
             text_color=AppTheme.BTN_TEXT_ON_BLUE,
@@ -326,11 +452,14 @@ class DiarizationApp:
             text="(No file selected)", 
             text_color=AppTheme.TEXT_MUTED
         )
-        self.audio_label.pack(side="left", padx=5)
+        self.audio_label.pack(side="left", padx=(8, 5), fill="x", expand=True, anchor="w")
 
-        # Load TXT Button (at bottom)
+        self.file_actions_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
+        self.file_actions_row.pack(fill="x", padx=12, pady=(0, 8))
+
+        # Load TXT Button
         self.load_txt_btn = ctk.CTkButton(
-            self.file_row, 
+            self.file_actions_row, 
             text="Load Existing TXT", 
             fg_color="transparent", 
             border_width=1, 
@@ -339,198 +468,365 @@ class DiarizationApp:
             hover_color=AppTheme.BG_ELEVATED,
             command=self.load_diarized_txt
         )
-        self.load_txt_btn.pack(padx=5)
+        self.load_txt_btn.pack(side="left", padx=(0, 6), expand=True, fill="x")
+
+        # Batch import
+        self.batch_btn = ctk.CTkButton(
+            self.file_actions_row,
+            text="Batch Import",
+            fg_color="transparent",
+            border_width=1,
+            border_color=AppTheme.BORDER_DIVIDER,
+            text_color=AppTheme.TEXT_SECONDARY,
+            hover_color=AppTheme.BTN_PRIMARY,
+            command=self.run_batch_import
+        )
+        self.batch_btn.pack(side="left", padx=(6, 0), expand=True, fill="x")
 
         ctk.CTkLabel(
             self.input_card, 
-            text="- OR -", 
+            text="Or record live", 
             text_color=AppTheme.TEXT_MUTED, 
-            font=("Arial", 10)
-        ).pack()
+            font=("Roboto", 10, "italic")
+        ).pack(anchor="w", padx=15, pady=(0, 4))
 
         # B. Recording
-        self.rec_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
-        self.rec_row.pack(fill="x", padx=10, pady=5)
+        self.rec_device_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
+        self.rec_device_row.pack(fill="x", padx=12, pady=(0, 6))
+
+        device_label = ctk.CTkLabel(
+            self.rec_device_row,
+            text="Input device",
+            text_color=AppTheme.TEXT_PRIMARY,
+        )
+        device_label.pack(anchor="w", pady=(0, 4))
 
         # Device list
         self.input_devices = self.recorder.list_input_devices()
         dev_names = ["(default)"] + [f"{d['index']}: {d['name']}" for d in self.input_devices]
-        
+
         self.device_var = ctk.StringVar(value="(default)")
         self.device_menu = ctk.CTkOptionMenu(
-            self.rec_row, 
-            variable=self.device_var, 
-            values=dev_names, 
-            width=220, 
-            height=40,
+            self.rec_device_row,
+            variable=self.device_var,
+            values=dev_names,
+            height=38,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
             button_color=AppTheme.BORDER_DIVIDER
         )
-        self.device_menu.pack(side="left", padx=5)
+        self.device_menu.pack(fill="x")
+
+        self.rec_control_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
+        self.rec_control_row.pack(fill="x", padx=12, pady=(0, 10))
 
         self.start_rec_btn = ctk.CTkButton(
-            self.rec_row, 
-            text="REC", 
-            width=120, 
-            height=40,
-            font=("Roboto", 14, "bold"), 
+            self.rec_control_row,
+            text="REC",
+            width=104,
+            height=38,
+            font=("Roboto", 13, "bold"),
             fg_color=AppTheme.BTN_RECORD,
             hover_color=AppTheme.BTN_RECORD_HOVER,
             text_color="#FFFFFF",
-            image=self.icon_mic, 
+            image=self.icon_mic,
             command=self.start_recording
         )
-        self.start_rec_btn.pack(side="left", padx=5)
-        
+        self.start_rec_btn.pack(side="left", padx=(0, 8))
+
         self.stop_rec_btn = ctk.CTkButton(
-            self.rec_row, 
-            text="STOP", 
-            width=120,
-            height=40,
-            font=("Roboto", 14, "bold"), 
-            state="disabled", 
+            self.rec_control_row,
+            text="STOP",
+            width=104,
+            height=38,
+            font=("Roboto", 13, "bold"),
+            state="disabled",
             fg_color=AppTheme.BTN_STOP,
             text_color_disabled=AppTheme.TEXT_MUTED,
             command=self.stop_recording
         )
-        self.stop_rec_btn.pack(side="left", padx=5)
+        self.stop_rec_btn.pack(side="left", padx=(0, 10))
 
         # Mic level meter
-        self.mic_level_label = ctk.CTkLabel(self.rec_row, text="Mic:", text_color=AppTheme.TEXT_MUTED)
-        self.mic_level_bar = ctk.CTkProgressBar(self.rec_row, width=120, progress_color=AppTheme.BTN_PRIMARY)
+        self.mic_level_label = ctk.CTkLabel(self.rec_control_row, text="Mic", text_color=AppTheme.TEXT_MUTED)
+        self.mic_level_bar = ctk.CTkProgressBar(self.rec_control_row, width=140, progress_color=AppTheme.BTN_PRIMARY)
         self.mic_level_bar.set(0.0)
-        self.mic_level_db = ctk.CTkLabel(self.rec_row, text="", text_color=AppTheme.TEXT_MUTED)
+        self.mic_level_db = ctk.CTkLabel(self.rec_control_row, text="", text_color=AppTheme.TEXT_MUTED)
 
-        self.mic_level_label.pack(side="left", padx=(12, 6))
-        self.mic_level_bar.pack(side="left", padx=(0, 6))
+        self.mic_level_label.pack(side="left", padx=(0, 6))
+        self.mic_level_bar.pack(side="left", padx=(0, 6), fill="x", expand=True)
         self.mic_level_db.pack(side="left", padx=(0, 0))
 
         # 3. SETTINGS CARD
-        self.settings_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
-        self.settings_card.pack(padx=15, pady=10, fill="x")
+        self.settings_card = ctk.CTkFrame(self.studio_left, fg_color=AppTheme.BG_CARD)
+        self.settings_card.pack(pady=(6, 0), fill="x")
         
-        ctk.CTkLabel(
-            self.settings_card, 
-            text="Processing Settings", 
-            font=("Roboto", 14, "bold"),
-            text_color=AppTheme.TEXT_PRIMARY
-        ).pack(anchor="w", padx=15, pady=(10,5))
-        
-        grid = ctk.CTkFrame(self.settings_card, fg_color="transparent")
-        grid.pack(fill="x", padx=10, pady=5)
+        add_section_header(
+            self.settings_card,
+            "Processing Settings",
+            "Tune diarization before you start the lesson."
+        )
 
-        # Output folder
+        settings_body = ctk.CTkFrame(self.settings_card, fg_color="transparent")
+        settings_body.pack(fill="x", padx=12, pady=(0, 10))
+
+        output_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        output_row.pack(fill="x", pady=(0, 8))
+
         self.out_btn = ctk.CTkButton(
-            grid, 
+            output_row, 
             text="Output Folder",
-            font=("Roboto", 18, "bold"), 
-            width=120, 
-            height=40,
+            font=("Roboto", 15, "bold"),
+            width=132,
+            height=38,
             fg_color=AppTheme.BTN_PRIMARY,
             hover_color=AppTheme.BTN_PRIMARY_HOVER,
             text_color=AppTheme.BTN_TEXT_ON_BLUE,
             command=self.select_output_dir
         )
-        self.out_btn.grid(row=0, column=0, padx=5, pady=5)
+        self.out_btn.pack(side="left", padx=(0, 10))
         
         self.output_label = ctk.CTkLabel(
-            grid, 
+            output_row, 
             text="(None)", 
-            text_color=AppTheme.TEXT_MUTED
+            text_color=AppTheme.TEXT_MUTED,
+            anchor="w",
         )
-        self.output_label.grid(row=0, column=1, padx=5, sticky="w")
+        self.output_label.pack(side="left", fill="x", expand=True)
 
-        lbl = ctk.CTkLabel(grid, text="Expected speakers:", text_color=AppTheme.TEXT_PRIMARY)
-        lbl.grid(row=0, column=1, padx=5, sticky="e")
+        speaker_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        speaker_row.pack(fill="x", pady=(0, 6))
+
+        spk_lbl = ctk.CTkLabel(speaker_row, text="Expected speakers", text_color=AppTheme.TEXT_PRIMARY)
+        spk_lbl.pack(side="left", padx=(0, 8))
         ToolTip(
-            lbl,
+            spk_lbl,
             "Set the expected number of speakers for diarization.\n"
-            "• Auto: WhisperX decides (may over-split).\n"
+            "• Auto: the selected diarization backend estimates the count.\n"
             "• 2 is recommended for tutor/student lessons."
         )
-        lbl.configure(cursor="question_arrow")
+        spk_lbl.configure(cursor="question_arrow")
 
         self.exp_spk_var = ctk.StringVar(value="2")
         self.exp_spk_menu = ctk.CTkOptionMenu(
-            grid,
+            speaker_row,
             variable=self.exp_spk_var,
             values=["Auto", "1", "2", "3", "4", "5", "6"],
-            width=100,
+            width=96,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
             button_color=AppTheme.BORDER_DIVIDER
         )
-        self.exp_spk_menu.grid(row=0, column=2, padx=5, sticky="w")
+        self.exp_spk_menu.pack(side="left")
 
         ToolTip(self.exp_spk_menu, "For group sessions, use Auto.\nFor lessons, 2 is usually best.")
 
-        # Model Size
-        ctk.CTkLabel(grid, text="Transcription Model Size:", text_color=AppTheme.TEXT_PRIMARY).grid(row=1, column=0, padx=(0, 8), pady=5, sticky="w")
-        self.model_var = ctk.StringVar(value="small")
+        config_row_top = ctk.CTkFrame(settings_body, fg_color="transparent")
+        config_row_top.pack(fill="x", pady=(0, 6))
+
+        model_label = ctk.CTkLabel(config_row_top, text="Model size", text_color=AppTheme.TEXT_PRIMARY)
+        model_label.pack(side="left", padx=(0, 8))
+        self.model_var = ctk.StringVar(value="large-v3")
         self.model_menu = ctk.CTkOptionMenu(
-            grid, 
+            config_row_top,
             variable=self.model_var,
-            values=["tiny", "base", "small", "medium", "large-v2"],
-            width=110,
+            values=["turbo", "tiny", "base", "small", "medium", "large-v3", "large-v2"],
+            width=104,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
             button_color=AppTheme.BORDER_DIVIDER
         )
-        self.model_menu.grid(row=1, column=1, padx=(0, 20), pady=5, sticky="w")
+        self.model_menu.pack(side="left", padx=(0, 18))
 
-        # Language
-        ctk.CTkLabel(grid, text="Language:", text_color=AppTheme.TEXT_PRIMARY).grid(row=1, column=2, padx=(0, 8), pady=5, sticky="w")
+        lang_label = ctk.CTkLabel(config_row_top, text="Language", text_color=AppTheme.TEXT_PRIMARY)
+        lang_label.pack(side="left", padx=(0, 8))
         self.lang_var = ctk.StringVar(value="Auto-Detect")
         self.lang_combo = ctk.CTkOptionMenu(
-            grid, variable=self.lang_var,
+            config_row_top, variable=self.lang_var,
             values=list(LANGUAGE_MAP.keys()),
-            width=140,
+            width=132,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
             button_color=AppTheme.BORDER_DIVIDER
         )
-        self.lang_combo.grid(row=1, column=3, padx=(0, 0), pady=5, sticky="w")
-        
-        # Checkbox
+        self.lang_combo.pack(side="left", padx=(0, 18))
+
+        config_row_bottom = ctk.CTkFrame(settings_body, fg_color="transparent")
+        config_row_bottom.pack(fill="x")
+
         self.context_var = ctk.BooleanVar(value=False)
         self.context_cb = ctk.CTkCheckBox(
-            grid, 
+            config_row_bottom,
             text="Context", 
             variable=self.context_var,
             text_color=AppTheme.TEXT_PRIMARY,
             hover_color=AppTheme.BTN_PRIMARY
         )
-        self.context_cb.grid(row=1, column=4, padx=(15, 0), sticky="w")
+        self.context_cb.pack(side="left")
+
+        ctk.CTkLabel(
+            config_row_bottom,
+            text="Adds a small amount of prior transcript context.",
+            text_color=AppTheme.TEXT_MUTED,
+            font=("Roboto", 10),
+        ).pack(side="left", padx=(8, 0))
+
+        # Hardware-aware backend controls
+        backend_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        backend_row.pack(fill="x", pady=(10, 0))
+
+        asr_label = ctk.CTkLabel(backend_row, text="ASR backend", text_color=AppTheme.TEXT_PRIMARY)
+        asr_label.pack(side="left", padx=(0, 8))
+        ToolTip(
+            asr_label,
+            "Auto uses MLX Whisper on Apple Silicon when available.\n"
+            "Fallbacks: openai-whisper on MPS/CPU, then WhisperX."
+        )
+
+        self.backend_var = ctk.StringVar(value=self.profile_config.get("asr_backend", "auto"))
+        self.backend_menu = ctk.CTkOptionMenu(
+            backend_row,
+            variable=self.backend_var,
+            values=["auto", "mlx", "whisper_mps", "whisperx"],
+            width=132,
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+            button_color=AppTheme.BORDER_DIVIDER
+        )
+        self.backend_menu.pack(side="left", padx=(0, 18))
+
+        diar_label = ctk.CTkLabel(backend_row, text="Diarization", text_color=AppTheme.TEXT_PRIMARY)
+        diar_label.pack(side="left", padx=(0, 8))
+        ToolTip(
+            diar_label,
+            "Auto uses FluidAudio/Core ML on Apple Silicon when available, with Pyannote fallback."
+        )
+
+        self.diar_backend_var = ctk.StringVar(value=self.profile_config.get("diarization_backend", "auto"))
+        self.diar_backend_menu = ctk.CTkOptionMenu(
+            backend_row,
+            variable=self.diar_backend_var,
+            values=["auto", "fluidaudio", "pyannote", "single_speaker"],
+            width=160,
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+            button_color=AppTheme.BORDER_DIVIDER
+        )
+        self.diar_backend_menu.pack(side="left", padx=(0, 18))
+
+        tune_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        tune_row.pack(fill="x", pady=(8, 0))
+
+        apple_label = ctk.CTkLabel(tune_row, text="Apple preset", text_color=AppTheme.TEXT_PRIMARY)
+        apple_label.pack(side="left", padx=(0, 8))
+        ToolTip(
+            apple_label,
+            "Balanced keeps memory usage conservative.\n"
+            "Memory Saver reduces batch size; Quality is slightly more aggressive."
+        )
+
+        self.apple_compute_var = ctk.StringVar(value=self.profile_config.get("apple_compute_preference", "balanced"))
+        self.apple_compute_menu = ctk.CTkOptionMenu(
+            tune_row,
+            variable=self.apple_compute_var,
+            values=["memory_saver", "balanced", "quality"],
+            width=132,
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+            button_color=AppTheme.BORDER_DIVIDER
+        )
+        self.apple_compute_menu.pack(side="left", padx=(0, 18))
+
+        batch_label = ctk.CTkLabel(tune_row, text="Batch size", text_color=AppTheme.TEXT_PRIMARY)
+        batch_label.pack(side="left", padx=(0, 8))
+        ToolTip(batch_label, "Smaller batch sizes are safer on MacBooks with limited memory.")
+
+        self.batch_size_var = ctk.StringVar(value=str(self.profile_config.get("batch_size", "2")))
+        self.batch_size_menu = ctk.CTkOptionMenu(
+            tune_row,
+            variable=self.batch_size_var,
+            values=["1", "2", "4", "8"],
+            width=96,
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+            button_color=AppTheme.BORDER_DIVIDER
+        )
+        self.batch_size_menu.pack(side="left")
+
+        server_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        server_row.pack(fill="x", pady=(10, 0))
+
+        self.server_processing_var = ctk.BooleanVar(value=bool(self.profile_config.get("server_processing_enabled", True)))
+        self.server_processing_cb = ctk.CTkCheckBox(
+            server_row,
+            text="Use server API",
+            variable=self.server_processing_var,
+            text_color=AppTheme.TEXT_PRIMARY,
+            hover_color=AppTheme.BTN_PRIMARY,
+        )
+        self.server_processing_cb.pack(side="left", padx=(0, 10))
+        ToolTip(
+            self.server_processing_cb,
+            "Send transcription and diarization to diarize-server, then mirror the lesson back into this profile.",
+        )
+
+        self.server_url_var = ctk.StringVar(value=self.profile_config.get("server_url", default_local_server_url()))
+        self.server_url_entry = ctk.CTkEntry(
+            server_row,
+            textvariable=self.server_url_var,
+            placeholder_text="http://server:8000",
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+        )
+        self.server_url_entry.pack(side="left", fill="x", expand=True)
 
         # 4. ACTION CARD (Run + Progress + Status)
-        self.action_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
-        self.action_card.pack(padx=15, pady=8, fill="x")
+        self.action_card = ctk.CTkFrame(self.studio_right, fg_color=AppTheme.BG_CARD)
+        self.action_card.pack(pady=(0, 6), fill="x")
+
+        add_section_header(
+            self.action_card,
+            "Processing",
+            "Run transcription and diarization for the lesson currently loaded in Studio."
+        )
 
         # Run button
         self.run_btn = ctk.CTkButton(
             self.action_card,
-            text="RUN PROCESSING",
-            height=50,
-            font=("Roboto", 18, "bold"),
+            text="Run Processing",
+            height=48,
+            font=("Roboto", 17, "bold"),
             fg_color=AppTheme.BTN_PRIMARY,
             hover_color=AppTheme.BTN_PRIMARY_HOVER,
             text_color=AppTheme.BTN_TEXT_ON_BLUE,
             command=self.run_diarization
         )
-        self.run_btn.pack(padx=12, pady=(12, 8), fill="x")
+        self.run_btn.pack(padx=12, pady=(0, 8), fill="x")
+
+        secondary_action_row = ctk.CTkFrame(self.action_card, fg_color="transparent")
+        secondary_action_row.pack(fill="x", padx=12, pady=(0, 8))
 
         self.assign_btn = ctk.CTkButton(
-            self.action_card, 
+            secondary_action_row, 
             text="Assign Speakers…",
-            width=160,
-            fg_color=AppTheme.BTN_PRIMARY, 
-            hover_color=AppTheme.BTN_PRIMARY_HOVER,
-            text_color=AppTheme.BTN_TEXT_ON_BLUE,
+            fg_color="transparent", 
+            border_width=1,
+            border_color=AppTheme.BORDER_DIVIDER,
+            text_color=AppTheme.TEXT_PRIMARY,
+            hover_color=AppTheme.BG_ELEVATED,
             command=self.open_assign_speakers,
             state="disabled"
         )
-        self.assign_btn.pack(side="left", padx=8, pady=8)
+        self.assign_btn.pack(side="left", expand=True, fill="x")
+
+        self.action_hint = ctk.CTkLabel(
+            self.action_card,
+            text="Speaker assignment unlocks after processing or loading a lesson.",
+            text_color=AppTheme.TEXT_MUTED,
+            font=("Roboto", 11),
+            anchor="w",
+        )
+        self.action_hint.pack(padx=12, pady=(0, 8), anchor="w")
 
         # Progress bar
         self.progress_bar = ctk.CTkProgressBar(self.action_card, progress_color=AppTheme.BTN_SUCCESS)
@@ -546,17 +842,19 @@ class DiarizationApp:
         )
         self.status_label.pack(padx=12, pady=(0, 12), anchor="w")
 
-        # 5. POST-PROCESSING CARD
-        self.post_card = ctk.CTkFrame(parent, fg_color="transparent")
-        self.post_card.pack(padx=15, pady=5, fill="x")
-
         # Analyze card
-        self.analyze_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
-        self.analyze_card.pack(padx=15, pady=(6, 10), fill="x")
+        self.analyze_card = ctk.CTkFrame(self.studio_right, fg_color=AppTheme.BG_CARD)
+        self.analyze_card.pack(pady=(6, 0), fill="x")
+
+        add_section_header(
+            self.analyze_card,
+            "AI Analysis",
+            "Generate feedback, grammar scores, and golden words for the current lesson."
+        )
 
         self.analyze_btn = ctk.CTkButton(
             self.analyze_card,
-            text="Analyze with AI Assistant",
+            text="Run AI Analysis",
             height=46,
             fg_color=AppTheme.BTN_SUCCESS,
             hover_color=AppTheme.BTN_SUCCESS_HOVER,
@@ -564,7 +862,7 @@ class DiarizationApp:
             font=("Roboto", 16, "bold"),
             command=self.analyze_transcript
         )
-        self.analyze_btn.pack(padx=12, pady=(10, 4), fill="x")
+        self.analyze_btn.pack(padx=12, pady=(0, 4), fill="x")
 
         self.analyze_help = ctk.CTkLabel(
             self.analyze_card,
@@ -576,8 +874,8 @@ class DiarizationApp:
         )
         self.analyze_help.pack(padx=12, pady=(0, 8), anchor="w")
 
-        exp_row = ctk.CTkFrame(self.post_card, fg_color="transparent")
-        exp_row.pack(fill="x", padx=10, pady=(0,10))
+        exp_row = ctk.CTkFrame(self.analyze_card, fg_color="transparent")
+        exp_row.pack(fill="x", padx=12, pady=(0, 8))
         
         # Export Buttons
         self.export_srt_btn = ctk.CTkButton(
@@ -617,14 +915,52 @@ class DiarizationApp:
         self.export_wav_btn.pack(side="left", padx=5, expand=True, fill="x")
 
         self.export_help = ctk.CTkLabel(
-            exp_row,
+            self.analyze_card,
             text="",
             text_color=AppTheme.TEXT_MUTED,
             font=("Roboto", 12),
             anchor="w",
             justify="left"
         )
+        self.export_help.pack(padx=12, pady=(0, 10), anchor="w")
+
+        # Use the flexible lower-right area as a calm brand anchor. Keeping the
+        # panel expandable prevents it from making the Studio taller.
+        self.brand_panel = ctk.CTkFrame(
+            self.studio_right,
+            fg_color="transparent",
+        )
+        self.brand_panel.pack(fill="both", expand=True, pady=(8, 0))
+        if self.logo_mark:
+            ctk.CTkLabel(
+                self.brand_panel,
+                text="",
+                image=self.logo_mark,
+            ).place(relx=0.92, rely=0.92, anchor="se")
+
+        self._install_studio_button_tooltips()
         self._update_analyze_ui_state()
+
+    def _install_studio_button_tooltips(self):
+        """Attach concise hover help to every persistent Studio action."""
+        descriptions = (
+            (self.history_btn, "Open completed lessons and their saved transcripts, exports, and analysis."),
+            (self.profile_btn, "Choose or create the learner profile used for lessons and dashboard history."),
+            (self.audio_btn, "Select an audio recording to transcribe and diarize."),
+            (self.load_txt_btn, "Load an existing diarized transcript without running transcription again."),
+            (self.batch_btn, "Import and process several recordings with the same settings."),
+            (self.start_rec_btn, "Start recording a live lesson from the selected input device."),
+            (self.stop_rec_btn, "Stop the current recording and prepare it for processing."),
+            (self.out_btn, "Choose where lesson files and exports are saved."),
+            (self.run_btn, "Transcribe the loaded audio and identify its speakers."),
+            (self.assign_btn, "Name speakers and identify which voice belongs to the learner."),
+            (self.analyze_btn, "Generate evidence-based learner feedback with the configured local or cloud model."),
+            (self.export_srt_btn, "Export a timestamped subtitle file."),
+            (self.export_txt_btn, "Export the readable speaker-labelled transcript."),
+            (self.export_wav_btn, "Export separate audio files for the identified speakers."),
+        )
+        for widget, description in descriptions:
+            ToolTip(widget, description)
 
     def open_assign_speakers(self):
         if not getattr(self, "current_lesson_dir", None):
@@ -693,9 +1029,9 @@ class DiarizationApp:
             return
 
         if not has_transcript:
-            self.analyze_help.configure(text="To enable analysis: run processing or load an existing TXT transcript.")
+            self.analyze_help.configure(text="Run processing or load a TXT transcript to enable analysis.")
             try:
-                self.export_help.configure(text="To enable export: run processing or load an existing TXT transcript.")
+                self.export_help.configure(text="Run processing or load a TXT transcript to enable export.")
             except Exception:
                 pass
             return
@@ -704,19 +1040,19 @@ class DiarizationApp:
         # Now enforce speaker assignment if segments exist
         if lesson_dir and os.path.isfile(os.path.join(lesson_dir, "segments.json")):
             if not self._has_speaker_assignment(lesson_dir):
-                self.analyze_help.configure(text="Action required: Assign Student Speaker(s) before analysis.")
+                self.analyze_help.configure(text="Assign the student speaker(s) before AI analysis.")
                 try:
-                    self.export_help.configure(text="Action required: Assign Student Speaker(s) before Speaker WAV export.")
+                    self.export_help.configure(text="Assign the student speaker(s) before speaker WAV export.")
                 except Exception:
                     pass
                 return
 
         self.analyze_btn.configure(state="normal")
-        self.analyze_help.configure(text="Ready for analysis.")
+        self.analyze_help.configure(text="Ready to generate feedback for this lesson.")
 
         try:
             self.export_wav_btn.configure(state="normal")
-            self.export_help.configure(text="Ready: Speaker WAV export available.")
+            self.export_help.configure(text="Speaker WAV export is ready.")
             self._set_status("Ready for Export and Analysis")
         except Exception:
             pass
@@ -806,9 +1142,9 @@ class DiarizationApp:
 
         # recorder may not exist or may not be recording
         try:
-            rms, peak = self.recorder.get_level()  # <-- adapt name if different
+            rms, _peak = self.recorder.get_level()
         except Exception:
-            rms, peak = 0.0, 0.0
+            rms, _peak = 0.0, 0.0
 
         # Map RMS (0..1) to progress bar (0..1)
         level = max(0.0, min(1.0, rms * 4.0))  # scale so normal speech shows up
@@ -841,6 +1177,147 @@ class DiarizationApp:
                 pass
         except Exception as e:
             messagebox.showerror("Error", f"Could not save profile config: {e}")
+        self._save_server_profile_settings(cfg)
+
+    def _server_profile_settings_from_config(self, cfg: dict) -> dict:
+        server_owned_keys = {
+            "whisper_model_size",
+            "language",
+            "contextual",
+            "asr_backend",
+            "diarization_backend",
+            "apple_compute_preference",
+            "batch_size",
+            "llm_provider",
+            "ollama_model",
+            "openai_model",
+            "analysis_lang",
+        }
+        return {key: cfg[key] for key in server_owned_keys if key in cfg}
+
+    def _server_request_json(self, method: str, path: str, payload=None, timeout: int = 10):
+        server_url = self._server_base_url()
+        url = f"{server_url}{path}"
+        if method == "GET":
+            response = requests.get(url, timeout=timeout)
+        elif method == "POST":
+            response = requests.post(url, json=payload or {}, timeout=timeout)
+        elif method == "PATCH":
+            response = requests.patch(url, json=payload or {}, timeout=timeout)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        response.raise_for_status()
+        return response.json()
+
+    def _save_server_profile_settings(self, cfg: dict):
+        if not self.profile_name:
+            return
+        try:
+            settings = self._server_profile_settings_from_config(cfg or {})
+            self._server_request_json(
+                "PATCH",
+                f"/api/profiles/{quote(self.profile_name, safe='')}",
+                {"display_name": self.profile_name, "settings": settings},
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"[WARN] Could not sync profile settings to server: {e}")
+
+    def _load_server_profiles(self):
+        try:
+            body = self._server_request_json("GET", "/api/profiles", timeout=8)
+            profiles = body.get("profiles", [])
+            if isinstance(profiles, list):
+                return sorted(
+                    [
+                        {
+                            "id": str(item.get("id") or ""),
+                            "display_name": str(item.get("display_name") or item.get("id") or ""),
+                            "settings": item.get("settings") if isinstance(item.get("settings"), dict) else {},
+                        }
+                        for item in profiles
+                        if isinstance(item, dict) and item.get("id")
+                    ],
+                    key=lambda item: item["display_name"].lower(),
+                )
+        except Exception as e:
+            print(f"[WARN] Could not load server profiles: {e}")
+        return None
+
+    def _create_server_profile(self, name: str):
+        payload = {
+            "id": name,
+            "display_name": name,
+            "settings": self._server_profile_settings_from_config(self.profile_config or {}),
+        }
+        try:
+            body = self._server_request_json("POST", "/api/profiles", payload, timeout=8)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 409:
+                body = self._server_request_json("GET", f"/api/profiles/{quote(name, safe='')}", timeout=8)
+            else:
+                raise
+        return body.get("id") or name
+
+    def _load_server_profile_config(self, profile_id: str) -> dict:
+        body = self._server_request_json("GET", f"/api/profiles/{quote(profile_id, safe='')}", timeout=8)
+        settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
+        return dict(settings)
+
+    def _activate_profile(self, profile_id: str, server_settings=None):
+        self.profile_name = profile_id
+        self.profile_label.configure(text=f"Profile: {profile_id}")
+        local_cfg = self._load_profile_config()
+        merged_cfg = dict(local_cfg)
+        if server_settings is None:
+            try:
+                server_settings = self._load_server_profile_config(profile_id)
+            except Exception as e:
+                print(f"[WARN] Could not load server profile settings: {e}")
+                server_settings = {}
+        if isinstance(server_settings, dict):
+            merged_cfg.update(server_settings)
+        self.profile_config = merged_cfg
+        self._apply_profile_config_to_controls()
+
+        if self.dashboard:
+            self.dashboard.destroy()
+        self.dashboard = DashboardFrame(
+            self.tab_dash,
+            profile_name=self.profile_name,
+            profile_dir=self._profile_dir(),
+            pipeline=self.pipeline,
+            server_url=self._server_base_url(),
+        )
+        self.dashboard.grid(row=0, column=0, sticky="nsew")
+
+    def _apply_profile_config_to_controls(self):
+        cfg = self.profile_config or {}
+        for attr, key in (
+            ("model_var", "whisper_model_size"),
+            ("lang_var", "language"),
+            ("context_var", "contextual"),
+            ("backend_var", "asr_backend"),
+            ("diar_backend_var", "diarization_backend"),
+            ("apple_compute_var", "apple_compute_preference"),
+            ("batch_size_var", "batch_size"),
+            ("server_processing_var", "server_processing_enabled"),
+            ("server_url_var", "server_url"),
+        ):
+            if not hasattr(self, attr):
+                continue
+            try:
+                widget_var = getattr(self, attr)
+                value = cfg.get(key)
+                if value is not None:
+                    if key == "batch_size":
+                        widget_var.set(str(value))
+                    elif key in {"contextual", "server_processing_enabled"}:
+                        widget_var.set(bool(value))
+                    else:
+                        widget_var.set(value)
+            except Exception:
+                pass
 
     def _cleanup_ollama(self):
         if hasattr(self, 'ollama_process') and self.ollama_process:
@@ -853,6 +1330,200 @@ class DiarizationApp:
     def _set_progress(self, value):
         # CTk progress bar is 0.0 to 1.0
         self.progress_bar.set(float(value) / 100.0)
+
+    def _refresh_dashboard_from_current_lesson(self):
+        """
+        Keep the dashboard in sync with the lesson currently loaded in the app.
+        """
+        if not getattr(self, "dashboard", None):
+            return
+
+        lesson_dir = getattr(self, "current_lesson_dir", None)
+        try:
+            self.dashboard.refresh_from_current_lesson(lesson_dir)
+        except Exception:
+            try:
+                self.dashboard.refresh_data()
+            except Exception:
+                pass
+
+    def _analysis_stats_suffix(self) -> str:
+        """
+        Ask the model to append a machine-readable summary block we can save to ai_stats.json.
+        """
+        example = {
+            "grammar_score": 75,
+            "communicative_effectiveness": 82,
+            "accuracy_score": 75,
+            "complexity_score": 70,
+            "lexical_range_score": 72,
+            "topics": ["topic 1", "topic 2", "topic 3"],
+            "golden_words": ["word 1 (translation)"],
+            "corrections": 2,
+            "feedback": "short summary",
+            "strengths": ["evidence-based strength"],
+            "priority_goals": ["high-impact goal"],
+            "recurring_patterns": [{
+                "category": "articles",
+                "pattern": "short description",
+                "estimated_count": 2,
+                "learner_example": "exact learner quote",
+                "better_form": "corrected form",
+                "practice_rule": "short reusable rule",
+            }],
+            "successful_self_repairs": ["exact learner example"],
+            "next_session_plan": [{
+                "goal": "specific goal",
+                "exercise": "tutor-ready activity",
+                "success_criterion": "observable target",
+            }],
+            "analysis_limitations": ["transcript-only limitation"],
+            "cefr_estimate": "B2",
+            "cefr_confidence": 0.7,
+            "topic_difficulty": 3,
+            "idea_density": 3,
+            "abstraction_level": 4,
+            "cognitive_branching": 4,
+            "technical_density": 2,
+            "discourse_depth": 4,
+            "lexical_retrieval_pressure": 3,
+            "topic_tags": ["tag 1", "tag 2"],
+            "context_notes": "short session-load rationale",
+            "self_repair_observations": "short observation",
+        }
+        return (
+            "\n\nAt the very end of your response, append this exact machine-readable block and nothing else inside it:\n"
+            "AI_STATS_JSON_START\n"
+            f"{json.dumps(example, ensure_ascii=False)}\n"
+            "AI_STATS_JSON_END\n"
+            "Use valid JSON only between the markers. Do not wrap it in markdown fences. "
+            "grammar_score must be an integer from 0 to 100, where 100 means near-native accuracy and 70 means understandable speech with recurring errors. Do not use a 1-10 scale. "
+            "For topic_difficulty use 1=daily life/simple narration, 2=familiar concrete topic, 3=opinion/explanation, 4=abstract argument, 5=technical/political/scientific/financial/philosophical or highly abstract. "
+            "For idea_density use 1=simple narration, 2=concrete personal topic, 3=opinion with reasons, 4=abstract argument with multiple clauses, 5=dense technical/political/scientific explanation. "
+            "For abstraction_level, cognitive_branching, technical_density, discourse_depth, and lexical_retrieval_pressure use 1-10 where 10 means very high conceptual or retrieval load. "
+            "Treat CEFR as an approximate secondary summary, not the main result. Copy learner evidence exactly, "
+            "separate communication success from accuracy, and prioritize repeated patterns over isolated slips. "
+            "Do not grade intelligence or opinions; estimate only session load."
+        )
+
+    def _normalize_ai_grammar_score(self, score):
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            return score
+
+        if 0 < value <= 10:
+            value *= 10
+
+        value = float(max(0, min(100, value)))
+        return int(value) if value.is_integer() else value
+
+    def _split_analysis_response(self, text: str):
+        """
+        Return (human_readable_text, stats_dict_or_none).
+        """
+        pattern = re.compile(
+            r"\n?AI_STATS_JSON_START\s*(\{.*?\})\s*AI_STATS_JSON_END\s*$",
+            re.DOTALL,
+        )
+        match = pattern.search(text or "")
+        if not match:
+            return (text or "").strip(), None
+
+        stats_raw = match.group(1).strip()
+        analysis_text = (text or "")[: match.start()].rstrip()
+
+        try:
+            stats = json.loads(stats_raw)
+        except Exception:
+            return analysis_text.strip(), None
+
+        if not isinstance(stats, dict):
+            return analysis_text.strip(), None
+
+        if "grammar_score" in stats:
+            stats["grammar_score"] = self._normalize_ai_grammar_score(stats.get("grammar_score"))
+
+        try:
+            from .pipeline import DiarizationPipelineRunner
+
+            stats["golden_words"] = DiarizationPipelineRunner._normalize_golden_words(
+                stats.get("golden_words")
+            )
+        except Exception:
+            pass
+
+        return analysis_text.strip(), stats
+
+    def _write_ai_stats(self, lesson_dir: str, stats: dict, provider: str, model: str, speakers=None):
+        if not lesson_dir or not stats:
+            return
+
+        payload = dict(stats)
+        if "grammar_score" in payload:
+            payload["grammar_score"] = self._normalize_ai_grammar_score(payload.get("grammar_score"))
+
+        context = payload.get("context_metrics") if isinstance(payload.get("context_metrics"), dict) else {}
+        raw_wpm = self._compute_lesson_raw_wpm(lesson_dir)
+        payload["context_metrics"] = build_context_metrics(
+            raw_grammar_score=payload.get("grammar_score", context.get("raw_grammar_score")),
+            raw_wpm=raw_wpm if raw_wpm is not None else context.get("raw_wpm"),
+            practice_hours_last_7_days=context.get("practice_hours_last_7_days"),
+            topic_difficulty=payload.get("topic_difficulty", context.get("topic_difficulty")),
+            idea_density=payload.get("idea_density", context.get("idea_density")),
+            abstraction_level=payload.get("abstraction_level", context.get("abstraction_level")),
+            cognitive_branching=payload.get("cognitive_branching", context.get("cognitive_branching")),
+            technical_density=payload.get("technical_density", context.get("technical_density")),
+            discourse_depth=payload.get("discourse_depth", context.get("discourse_depth")),
+            lexical_retrieval_pressure=payload.get(
+                "lexical_retrieval_pressure",
+                context.get("lexical_retrieval_pressure"),
+            ),
+            fatigue_or_stress=context.get("fatigue_or_stress"),
+            long_pauses_per_min=context.get("long_pauses_per_min"),
+            self_repairs_per_min=context.get("self_repairs_per_min"),
+            filled_pauses_per_min=context.get("filled_pauses_per_min"),
+            notes=payload.get("context_notes", context.get("notes")),
+        )
+        payload["llm_provider"] = provider
+        payload["llm_model"] = model
+        payload["analysis_updated_at"] = datetime.now().isoformat(timespec="seconds")
+        payload["source"] = "studio_analysis"
+        try:
+            from .pipeline import (
+                AI_METRICS_SCHEMA_VERSION,
+                DEFAULT_MAX_CHARS,
+                DiarizationPipelineRunner,
+            )
+
+            DiarizationPipelineRunner._validate_ai_metrics(payload)
+            full_text = self.pipeline.get_transcript_text(
+                include_speaker=True,
+                speaker_filters=speakers,
+                max_chars=10_000_000,
+            )
+            transcript_chars = len(full_text)
+            chars_used = min(transcript_chars, DEFAULT_MAX_CHARS)
+            payload["analysis_schema_version"] = AI_METRICS_SCHEMA_VERSION
+            payload["analysis_scope"] = {
+                "student_speakers": list(speakers or []),
+                "speaker_scope": "explicit" if speakers else "unresolved",
+            }
+            payload["analysis_provenance"] = {
+                "provider": provider,
+                "model": model,
+                "transcript_chars": transcript_chars,
+                "transcript_chars_used": chars_used,
+                "transcript_coverage": chars_used / transcript_chars if transcript_chars else 0,
+                "student_scope": "explicit" if speakers else "unresolved",
+                "structured_output": False,
+            }
+        except (TypeError, ValueError):
+            payload["analysis_schema_version"] = 1
+
+        ai_stats_path = os.path.join(lesson_dir, "ai_stats.json")
+        with open(ai_stats_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
     def _enable_export_buttons(self):
         self.analyze_btn.configure(state="normal")
@@ -880,6 +1551,47 @@ class DiarizationApp:
     def _write_json_file(self, path: str, data: dict) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _format_metric_value(self, value, suffix: str = "") -> str:
+        if value is None:
+            return "--"
+        if isinstance(value, bool):
+            return self._yes_no(value)
+        if isinstance(value, (int, float)):
+            text = f"{value:.1f}" if abs(float(value) - int(value)) > 0.01 else f"{int(value)}"
+            return f"{text}{suffix}"
+        return str(value)
+
+    def _yes_no(self, value) -> str:
+        if value is None:
+            return "--"
+        return "yes" if bool(value) else "no"
+
+    def _compute_lesson_raw_wpm(self, lesson_dir: str):
+        meta = self._read_json_file(os.path.join(lesson_dir, "meta.json"))
+        segments = self._read_json_file(os.path.join(lesson_dir, "segments.json"))
+        if not isinstance(segments, list):
+            return None
+
+        student_ids = set(meta.get("student_speakers", []))
+        words = 0
+        seconds = 0.0
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            spk = seg.get("speaker", "UNKNOWN")
+            is_student = (spk in student_ids) or (not student_ids and "01" in str(spk))
+            if not is_student:
+                continue
+            try:
+                start = float(seg.get("start", 0))
+                end = float(seg.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            text = str(seg.get("text", "")).strip()
+            seconds += max(0.0, end - start)
+            words += len(text.split())
+        return (words / (seconds / 60.0)) if seconds > 10 else None
 
     def _reassociate_audio_for_lesson(self, lesson_dir: str, status_label=None):
         # Let user pick an audio file
@@ -924,11 +1636,18 @@ class DiarizationApp:
     # --- PROFILE MANAGEMENT ---
 
     def _load_existing_profiles(self):
+        server_profiles = self._load_server_profiles()
+        if server_profiles is not None:
+            return server_profiles
+
         base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
         profiles_dir = os.path.join(base_dir, "profiles")
         if not os.path.isdir(profiles_dir):
             return []
-        return sorted([n for n in os.listdir(profiles_dir) if os.path.isdir(os.path.join(profiles_dir, n))])
+        return [
+            {"id": name, "display_name": name, "settings": {}}
+            for name in sorted([n for n in os.listdir(profiles_dir) if os.path.isdir(os.path.join(profiles_dir, n))])
+        ]
 
     def _prompt_profile_on_startup(self):
         existing = self._load_existing_profiles()
@@ -944,30 +1663,14 @@ class DiarizationApp:
         scroll.pack(fill="both", expand=True, padx=20, pady=10)
 
         # Helper to set and close
-        def select_and_close(name):
-            self.profile_name = name
-            self.profile_label.configure(text=f"Profile: {name}")
-            self.profile_config = self._load_profile_config()
-            
-            # --- ADD THIS BLOCK ---
-            # Reload Dashboard
-            if self.dashboard:
-                self.dashboard.destroy()
-            
-            self.dashboard = DashboardFrame(
-                self.tab_dash, 
-                profile_name=self.profile_name, 
-                profile_dir=self._profile_dir(),
-                pipeline=self.pipeline  
-            )
-            self.dashboard.pack(fill="both", expand=True)
-            # ----------------------
-
+        def select_and_close(profile):
+            self._activate_profile(profile["id"], profile.get("settings"))
             win.destroy()
 
-        for name in existing:
-            btn = ctk.CTkButton(scroll, text=name, fg_color="transparent", border_width=1, 
-                                command=lambda n=name: select_and_close(n))
+        for profile in existing:
+            label = profile.get("display_name") or profile.get("id")
+            btn = ctk.CTkButton(scroll, text=label, fg_color="transparent", border_width=1,
+                                command=lambda p=profile: select_and_close(p))
             btn.pack(fill="x", pady=2)
 
         ctk.CTkLabel(win, text="Or create new:").pack(pady=(10,0))
@@ -977,7 +1680,12 @@ class DiarizationApp:
         def create_new():
             name = entry.get().strip()
             if name:
-                select_and_close(name)
+                try:
+                    profile_id = self._create_server_profile(name)
+                    settings = self._load_server_profile_config(profile_id)
+                    select_and_close({"id": profile_id, "display_name": name, "settings": settings})
+                except Exception as e:
+                    messagebox.showerror("Profile", f"Could not create server profile: {e}")
 
         ctk.CTkButton(win, text="Create & Start", command=create_new).pack(pady=10)
         win.wait_window() # Block until done
@@ -986,13 +1694,198 @@ class DiarizationApp:
         dialog = ctk.CTkInputDialog(text="Enter new profile name:", title="New Profile")
         name = dialog.get_input()
         if name and name.strip():
-            self.profile_name = name.strip()
-            self.profile_label.configure(text=f"Profile: {self.profile_name}")
-            self.profile_config = self._load_profile_config()
+            try:
+                profile_id = self._create_server_profile(name.strip())
+                self._activate_profile(profile_id)
+            except Exception as e:
+                messagebox.showerror("Profile", f"Could not create or select server profile: {e}")
+    
+    # --- BATCH IMPORT LOGIC ---
+    def run_batch_import(self):
+        """
+        Allows selecting multiple audio files and processing them sequentially
+        with hardcoded settings (Medium model, Spanish, 4 Speakers).
+        """
+        if not self.profile_name:
+            messagebox.showerror("Error", "Please select a profile first.")
+            return
 
+        # 1. Multi-file selection
+        paths = filedialog.askopenfilenames(
+            title="Select Audio Files for Batch Import",
+            filetypes=[("Audio", "*.mp3 *.wav *.m4a *.flac *.ogg *.aac"), ("All", "*.*")]
+        )
+        if not paths: return
+
+        # 2. Open Settings Window
+        self._open_batch_settings_window(paths)
+
+    def _open_batch_settings_window(self, paths):
+        count = len(paths)
+        
+        # Create Popup
+        win = ctk.CTkToplevel(self.master)
+        win.title("Batch Import Settings")
+        win.geometry("400x350")
+        win.transient(self.master)
+        win.grab_set()  # Make modal
+
+        # Header
+        ctk.CTkLabel(win, text=f"Importing {count} files", font=("Roboto", 16, "bold")).pack(pady=(20, 10))
+        ctk.CTkLabel(win, text="Configure settings for all files:", text_color="gray").pack(pady=(0, 20))
+
+        # Form Container
+        form = ctk.CTkFrame(win, fg_color="transparent")
+        form.pack(padx=40, fill="x")
+
+        # 1. Model Size
+        ctk.CTkLabel(form, text="Model Size:", anchor="w").grid(row=0, column=0, sticky="w", pady=10)
+        model_var = ctk.StringVar(value="large-v3")
+        model_menu = ctk.CTkOptionMenu(
+            form, 
+            variable=model_var,
+            values=["turbo", "tiny", "base", "small", "medium", "large-v3", "large-v2"]
+        )
+        model_menu.grid(row=0, column=1, sticky="e", pady=10)
+
+        # 2. Language
+        ctk.CTkLabel(form, text="Language:", anchor="w").grid(row=1, column=0, sticky="w", pady=10)
+        lang_var = ctk.StringVar(value="Spanish") # Default to Spanish as requested
+        lang_menu = ctk.CTkOptionMenu(
+            form, 
+            variable=lang_var,
+            values=list(LANGUAGE_MAP.keys())
+        )
+        lang_menu.grid(row=1, column=1, sticky="e", pady=10)
+
+        # 3. Speakers
+        ctk.CTkLabel(form, text="Speakers:", anchor="w").grid(row=2, column=0, sticky="w", pady=10)
+        spk_var = ctk.StringVar(value="4")
+        spk_menu = ctk.CTkOptionMenu(
+            form, 
+            variable=spk_var,
+            values=["Auto", "1", "2", "3", "4", "5", "6", "7", "8"]
+        )
+        spk_menu.grid(row=2, column=1, sticky="e", pady=10)
+
+        # Actions
+        def on_start():
+            # Get values
+            m_size = model_var.get()
+            l_name = lang_var.get()
+            l_code = LANGUAGE_MAP.get(l_name)
+            s_val = spk_var.get()
+            n_spk = None if s_val == "Auto" else int(s_val)
+
+            # Close window
+            win.destroy()
+
+            # Lock UI
+            self.batch_btn.configure(state="disabled")
+            self.run_btn.configure(state="disabled")
+
+            # Start Thread
+            threading.Thread(
+                target=self._run_batch_thread, 
+                args=(paths, m_size, l_code, n_spk), 
+                daemon=True
+            ).start()
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(pady=30, fill="x", padx=40)
+
+        ctk.CTkButton(btn_row, text="Cancel", fg_color="transparent", border_width=1, command=win.destroy).pack(side="left", expand=True)
+        ctk.CTkButton(btn_row, text="Start Batch", command=on_start).pack(side="right", expand=True)
+
+    def _run_batch_thread(self, paths, model_size, language, num_speakers):
+        successful_lessons = []
+        total = len(paths)
+        
+        for i, audio_path in enumerate(paths):
+            filename = os.path.basename(audio_path)
+            self._set_status(f"Batch ({i+1}/{total}): Processing {filename}...")
+            self._set_progress(0)
+
+            try:
+                # 1. Determine Date (Same logic as before)
+                try:
+                    stat = os.stat(audio_path)
+                    if hasattr(stat, 'st_birthtime'):
+                        ts = stat.st_birthtime
+                    else:
+                        ts = stat.st_mtime
+                except OSError:
+                    ts = os.path.getmtime(audio_path)
+                
+                dt_obj = datetime.fromtimestamp(ts)
+                lesson_id = dt_obj.strftime("%Y%m%d_%H%M%S")
+                
+                # Handle duplicates
+                base_dir = self._profile_lessons_dir()
+                lesson_dir = os.path.join(base_dir, lesson_id)
+                if os.path.exists(lesson_dir):
+                    lesson_dir = os.path.join(base_dir, f"{lesson_id}_{i}")
+                
+                os.makedirs(lesson_dir, exist_ok=True)
+
+                # 2. Run Pipeline (USING PASSED ARGS)
+                self.pipeline.process_audio(
+                    audio_path=audio_path,
+                    output_dir=lesson_dir,
+                    model_size=model_size,     # <--- Use arg
+                    language=language,         # <--- Use arg
+                    num_speakers=num_speakers,  # <--- Use arg
+                    backend=self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                    diarization_backend=self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+                    apple_compute_preference=self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else None,
+                    batch_size=int(self.batch_size_var.get()) if hasattr(self, "batch_size_var") and str(self.batch_size_var.get()).isdigit() else None,
+                )
+
+                # 3. Save Artifacts
+                self.pipeline.save_lesson_artifacts(
+                    lesson_dir,
+                    profile_name=self.profile_name,
+                    whisper_model_size=model_size,
+                    language=language,  # Store the readable name or code? pipeline usually expects code.
+                    contextual=False,
+                    extra_meta={
+                        "recorded_at": dt_obj.isoformat(),
+                        "batch_imported": True,
+                        "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                        "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+                    }
+                )
+                
+                successful_lessons.append(lesson_dir)
+
+            except Exception as e:
+                print(f"Batch Error on {filename}: {e}")
+                continue
+
+        # Finish
+        self._set_status("Batch Import Complete")
+        self._set_progress(100)
+        self.master.after(0, lambda: self._on_batch_finished(successful_lessons))
+
+    def _on_batch_finished(self, lessons):
+        self.batch_btn.configure(state="normal")
+        self.run_btn.configure(state="normal")
+        
+        count = len(lessons)
+        if count == 0:
+            messagebox.showerror("Batch Failed", "No lessons were successfully processed.")
+            return
+
+        # Prompt for assignment
+        if messagebox.askyesno("Batch Complete", 
+                               f"Successfully imported {count} lessons.\n\n"
+                               "Would you like to assign speakers now?"):
+            self.view_history() 
+            # Note: Opening 20 modal windows sequentially is bad UX. 
+            # Sending them to History is cleaner—they can click "Load" -> "Assign" 
+            # on the specific lessons they want to fix.
 
     # --- MAIN FUNCTIONS ---
-
     def select_audio(self):
         path = filedialog.askopenfilename(filetypes=[("Audio", "*.mp3 *.wav *.m4a *.flac *.ogg"), ("All", "*.*")])
         if path:
@@ -1050,6 +1943,10 @@ class DiarizationApp:
 
     def _run_pipeline_thread(self):
         try:
+            if getattr(self, "server_processing_var", None) is not None and self.server_processing_var.get():
+                self._run_server_pipeline_thread()
+                return
+
             lang = self.lang_var.get()
             lang_code = LANGUAGE_MAP.get(lang)
             exp = self.exp_spk_var.get() if hasattr(self, "exp_spk_var") else "Auto"
@@ -1061,6 +1958,10 @@ class DiarizationApp:
                 model_size=self.model_var.get(),
                 language=lang_code,
                 num_speakers=num_speakers,
+                backend=self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                diarization_backend=self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+                apple_compute_preference=self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else None,
+                batch_size=int(self.batch_size_var.get()) if hasattr(self, "batch_size_var") and str(self.batch_size_var.get()).isdigit() else None,
             )
             self.has_result = True
             self.master.after(0, self._enable_export_buttons)
@@ -1070,13 +1971,31 @@ class DiarizationApp:
             try:
                 self.current_lesson_dir = self._new_lesson_dir()
                 if self.current_lesson_dir:
+                    cfg = self._load_profile_config()
+                    cfg.update(
+                        {
+                            "whisper_model_size": self.model_var.get(),
+                            "language": self.lang_var.get(),
+                            "contextual": self.context_var.get(),
+                            "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+                            "apple_compute_preference": self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else "balanced",
+                            "batch_size": self.batch_size_var.get() if hasattr(self, "batch_size_var") else "2",
+                        }
+                    )
+                    self._save_profile_config(cfg)
+                    self.profile_config = cfg
                     self.pipeline.save_lesson_artifacts(
                         self.current_lesson_dir,
                         profile_name=self.profile_name,
                         whisper_model_size=self.model_var.get(),
                         language=self.lang_var.get(),
                         contextual=self.context_var.get(),
-                        extra_meta={"recorded_at": self.recorder.recorded_at_time}
+                        extra_meta={
+                            "recorded_at": self.recorder.recorded_at_time,
+                            "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+                        }
                     )
                     self.master.after(0, self._enforce_speaker_assignment_after_save)
             except Exception as e:
@@ -1088,6 +2007,147 @@ class DiarizationApp:
             self.master.after(0, lambda: messagebox.showerror("Error", info))
         finally:
             self.master.after(0, lambda: self.run_btn.configure(state="normal", text="RUN PROCESSING"))
+
+    def _server_base_url(self):
+        value = self.server_url_var.get().strip() if hasattr(self, "server_url_var") else ""
+        return (value or default_local_server_url()).rstrip("/")
+
+    def _run_server_pipeline_thread(self):
+        lang = self.lang_var.get()
+        lang_code = LANGUAGE_MAP.get(lang)
+        exp = self.exp_spk_var.get() if hasattr(self, "exp_spk_var") else "Auto"
+        num_speakers = None if exp == "Auto" else int(exp)
+        batch_size = int(self.batch_size_var.get()) if hasattr(self, "batch_size_var") and str(self.batch_size_var.get()).isdigit() else None
+        server_url = self._server_base_url()
+
+        self._set_status("Uploading to server...")
+        self._set_progress(2)
+        self._ensure_server_profile(server_url)
+
+        data = {
+            "model_size": self.model_var.get(),
+            "backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+        }
+        if lang_code:
+            data["language"] = lang_code
+        if num_speakers is not None:
+            data["num_speakers"] = str(num_speakers)
+        if batch_size is not None:
+            data["batch_size"] = str(batch_size)
+
+        profile = quote(self.profile_name or "default", safe="")
+        with open(self.audio_path, "rb") as audio_file:
+            response = requests.post(
+                f"{server_url}/api/profiles/{profile}/jobs",
+                data=data,
+                files={"audio": (os.path.basename(self.audio_path), audio_file, "application/octet-stream")},
+                timeout=120,
+            )
+        response.raise_for_status()
+        job = response.json()
+        job_id = job["id"]
+
+        while True:
+            polled = requests.get(f"{server_url}/api/jobs/{job_id}", timeout=30)
+            polled.raise_for_status()
+            job = polled.json()
+            status = job.get("status", "unknown")
+            message = job.get("message") or status
+            progress = float(job.get("progress") or 0)
+            self._set_status(f"Server: {message}")
+            self._set_progress(progress)
+            if status == "succeeded":
+                break
+            if status == "failed":
+                raise RuntimeError(job.get("error") or "Server processing failed")
+            time.sleep(1.5)
+
+        lesson_id = job.get("lesson_id") or (job.get("result") or {}).get("lesson_id")
+        if not lesson_id:
+            raise RuntimeError("Server job completed without a lesson id.")
+
+        self._set_status("Downloading server lesson...")
+        self.current_lesson_dir = self._new_lesson_dir()
+        if not self.current_lesson_dir:
+            raise RuntimeError("Could not create local lesson mirror.")
+        self._mirror_server_lesson(server_url, lesson_id, self.current_lesson_dir)
+        self.pipeline.load_lesson_artifacts(self.current_lesson_dir)
+
+        cfg = self._load_profile_config()
+        cfg.update(
+            {
+                "server_processing_enabled": True,
+                "server_url": server_url,
+                "whisper_model_size": self.model_var.get(),
+                "language": self.lang_var.get(),
+                "contextual": self.context_var.get(),
+                "asr_backend": data["backend"],
+                "diarization_backend": data["diarization_backend"],
+                "apple_compute_preference": self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else "balanced",
+                "batch_size": self.batch_size_var.get() if hasattr(self, "batch_size_var") else "2",
+            }
+        )
+        self._save_profile_config(cfg)
+        self.profile_config = cfg
+        self.has_result = True
+        self.output_dir = self.current_lesson_dir
+        self.master.after(0, lambda: self.output_label.configure(text=os.path.basename(self.current_lesson_dir)))
+        self.master.after(0, self._enable_export_buttons)
+        self.master.after(0, self._enforce_speaker_assignment_after_save)
+        self.master.after(0, lambda: messagebox.showinfo("Done", "Server processing complete."))
+        self._set_status("Complete")
+
+    def _ensure_server_profile(self, server_url: str):
+        profile = self.profile_name or "default"
+        settings = {
+            "whisper_model_size": self.model_var.get() if hasattr(self, "model_var") else "large-v3",
+            "language": self.lang_var.get() if hasattr(self, "lang_var") else "Auto-Detect",
+            "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+            "batch_size": self.batch_size_var.get() if hasattr(self, "batch_size_var") else "2",
+        }
+        response = requests.put(
+            f"{server_url}/api/profiles/{quote(profile, safe='')}",
+            json={"display_name": profile, "settings": settings},
+            timeout=30,
+        )
+        response.raise_for_status()
+
+    def _mirror_server_lesson(self, server_url: str, lesson_id: str, lesson_dir: str):
+        encoded_lesson = quote(lesson_id, safe="")
+        lesson = requests.get(f"{server_url}/api/lessons/{encoded_lesson}", timeout=60)
+        lesson.raise_for_status()
+        lesson_body = lesson.json()
+        artifacts = lesson_body.get("artifacts") or []
+        os.makedirs(lesson_dir, exist_ok=True)
+        for artifact in artifacts:
+            name = artifact.get("name")
+            filename = artifact.get("filename")
+            if not name or not filename:
+                continue
+            res = requests.get(
+                f"{server_url}/api/lessons/{encoded_lesson}/artifacts/{quote(name, safe='')}",
+                timeout=120,
+            )
+            if res.status_code == 404:
+                continue
+            res.raise_for_status()
+            with open(os.path.join(lesson_dir, filename), "wb") as f:
+                f.write(res.content)
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        meta = {}
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+            except Exception:
+                meta = {}
+        meta["server_url"] = server_url
+        meta["server_lesson_id"] = lesson_id
+        meta["mirrored_from_server_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
             
 
     def load_diarized_txt(self):
@@ -1110,6 +2170,10 @@ class DiarizationApp:
                             whisper_model_size=None,
                             language=None,
                             contextual=None,
+                            extra_meta={
+                                "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+                                "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+                            },
                         )
                         self.master.after(0, self._enforce_speaker_assignment_after_save)
                 except Exception as e:
@@ -1120,35 +2184,94 @@ class DiarizationApp:
 
     # --- HISTORY VIEW ---
 
+    def _server_profile_lessons(self):
+        if not self.profile_name:
+            return None
+        try:
+            body = self._server_request_json(
+                "GET",
+                f"/api/profiles/{quote(self.profile_name, safe='')}/lessons",
+                timeout=12,
+            )
+            lessons = body.get("lessons", [])
+            if isinstance(lessons, list):
+                return lessons
+        except Exception as e:
+            print(f"[WARN] Could not load server history: {e}")
+        return None
+
+    def _local_lesson_dir_for_id(self, lesson_id: str) -> str:
+        base = self._profile_lessons_dir()
+        if not base:
+            base = os.path.join(self._profile_base_dir(), "profiles", self.profile_name or "default", "lessons")
+        return os.path.join(base, lesson_id)
+
+    def _ensure_history_item_local(self, item: dict) -> str:
+        lesson_dir = item.get("lesson_dir")
+        if lesson_dir and os.path.isdir(lesson_dir):
+            return lesson_dir
+
+        server_lesson_id = item.get("server_lesson_id") or item.get("lesson_id")
+        if not server_lesson_id:
+            raise RuntimeError("History item has no lesson id.")
+
+        lesson_dir = self._local_lesson_dir_for_id(server_lesson_id)
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        if not os.path.isfile(meta_path):
+            self._mirror_server_lesson(self._server_base_url(), server_lesson_id, lesson_dir)
+        return lesson_dir
+
+    def _load_history_item(self, item: dict):
+        try:
+            self._load_lesson_into_app(self._ensure_history_item_local(item))
+        except Exception as e:
+            messagebox.showerror("History", str(e))
+
+    def _open_history_item_detail(self, item: dict):
+        try:
+            self._open_lesson_detail(self._ensure_history_item_local(item))
+        except Exception as e:
+            messagebox.showerror("History", str(e))
+
     def view_history(self):
         if not self.profile_name:
             messagebox.showerror("Error", "No profile selected.")
             return
 
-        base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
-        lesson_dir = os.path.join(base_dir, "profiles", self.profile_name, "lessons")
-        
-        if not os.path.isdir(lesson_dir):
+        server_lessons = self._server_profile_lessons()
+        if server_lessons is not None:
+            lessons = [
+                {
+                    "lesson_id": item.get("id"),
+                    "server_lesson_id": item.get("id"),
+                    "meta": item,
+                }
+                for item in server_lessons
+                if isinstance(item, dict) and item.get("id")
+            ]
+        else:
+            lesson_dir = self._profile_lessons_dir()
+            lessons = []
+            if lesson_dir and os.path.isdir(lesson_dir):
+                for entry in os.listdir(lesson_dir):
+                    path = os.path.join(lesson_dir, entry)
+                    meta_path = os.path.join(path, "meta.json")
+                    if os.path.isdir(path) and os.path.isfile(meta_path):
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                meta = json.load(f) or {}
+                            lessons.append({"lesson_id": entry, "lesson_dir": path, "meta": meta})
+                        except Exception:
+                            pass
+
+        if not lessons:
             messagebox.showinfo("History", "No history found for this profile.")
             return
-
-        # Load lessons from artifact folders: lessons/<lesson_id>/meta.json
-        lessons = []
-        for entry in os.listdir(lesson_dir):
-            path = os.path.join(lesson_dir, entry)
-            meta_path = os.path.join(path, "meta.json")
-            if os.path.isdir(path) and os.path.isfile(meta_path):
-                try:
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f) or {}
-                    lessons.append({"lesson_id": entry, "lesson_dir": path, "meta": meta})
-                except Exception:
-                    pass
 
         # Sort newest first (prefer created_at; fallback to folder name)
         def _sort_key(x):
             meta = x.get("meta", {}) or {}
-            return meta.get("created_at") or x.get("lesson_id") or ""
+            return meta.get("recorded_at") or meta.get("processed_at") or meta.get("created_at") or x.get("lesson_id") or ""
 
         lessons.sort(key=_sort_key, reverse=True)
 
@@ -1165,7 +2288,6 @@ class DiarizationApp:
         for item in lessons:
             meta = item.get("meta", {}) or {}
             lesson_id = item.get("lesson_id", "???")
-            ldir = item.get("lesson_dir")
 
             ts = meta.get("recorded_at") or meta.get("processed_at") or meta.get("created_at") or lesson_id
             provider = meta.get("llm_provider", meta.get("provider", "—"))
@@ -1173,25 +2295,35 @@ class DiarizationApp:
             dur = meta.get("duration_sec", 0.0)
             nspk = meta.get("num_speakers", "—")
             nseg = meta.get("num_segments", "—")
+            asr_backend = meta.get("asr_backend", "—")
+            asr_device = meta.get("device", "—")
+            diar_backend = meta.get("diarization_backend", "—")
+            fallback = meta.get("asr_backend_fallback") or meta.get("diarization_backend_fallback")
+            fallback_line = f"\nFallback: {fallback}" if fallback else ""
 
             card = ctk.CTkFrame(scroll, fg_color="#2B2B2B")
             card.pack(fill="x", pady=5)
 
             lbl = ctk.CTkLabel(
                 card,
-                text=f"Date: {ts}\nSpeakers: {nspk} | Segments: {nseg} | Duration: {dur/60:.1f} min\nLLM: {provider} / {model}",
+                text=(
+                    f"Date: {ts}\n"
+                    f"Speakers: {nspk} | Segments: {nseg} | Duration: {dur/60:.1f} min\n"
+                    f"ASR: {asr_backend} ({asr_device}) | Diarization: {diar_backend}\n"
+                    f"LLM: {provider} / {model}{fallback_line}"
+                ),
                 justify="left",
             )
             lbl.pack(side="left", padx=10, pady=8)
 
-            btn_view = ctk.CTkButton(card,text="View", width=70, command=lambda d=ldir: self._open_lesson_detail(d))
+            btn_view = ctk.CTkButton(card, text="View", width=70, command=lambda i=item: self._open_history_item_detail(i))
             btn_view.pack(side="right", padx=(6, 10), pady=10)
 
             btn = ctk.CTkButton(
-            card,
-            text="Load",
-            width=60,
-            command=lambda d=ldir: self._load_lesson_into_app(d)
+                card,
+                text="Load",
+                width=60,
+                command=lambda i=item: self._load_history_item(i)
             )
 
             btn.pack(side="right", padx=10, pady=10)
@@ -1230,11 +2362,12 @@ class DiarizationApp:
 
     def _load_lesson_into_app(self, lesson_dir: str):
         try:
-            meta = self.pipeline.load_lesson_artifacts(lesson_dir)
+            self.pipeline.load_lesson_artifacts(lesson_dir)
 
             self.current_lesson_dir = lesson_dir
             self.output_dir = lesson_dir
             self.output_label.configure(text=os.path.basename(lesson_dir))
+            self._refresh_dashboard_from_current_lesson()
 
             self.has_result = True
             self._enable_export_buttons()
@@ -1291,6 +2424,14 @@ class DiarizationApp:
         audio_status = ctk.CTkLabel(header, text=audio_text, text_color=audio_color)
         audio_status.pack(side="left", padx=(10, 8), pady=8)
 
+        btn_export_analysis = ctk.CTkButton(
+            header,
+            text="Export analysis…",
+            width=150,
+            command=lambda d=lesson_dir: self._export_lesson_analysis(d),
+        )
+        btn_export_analysis.pack(side="right", padx=(0, 10), pady=8)
+
         btn_relink = ctk.CTkButton(
             header,
             text="Re-associate audio…",
@@ -1304,6 +2445,7 @@ class DiarizationApp:
 
         t_tab = tabview.add("Transcript")
         a_tab = tabview.add("Analysis")
+        c_tab = tabview.add("Context Metrics")
 
         # --- Transcript ---
         t_box = ctk.CTkTextbox(t_tab)
@@ -1330,6 +2472,153 @@ class DiarizationApp:
             a_box.insert("1.0", "No analysis available for this lesson.")
 
         a_box.configure(state="disabled")
+
+        # --- Context-adjusted metrics ---
+        ai_stats = self._read_json_file(os.path.join(lesson_dir, "ai_stats.json"))
+        context = ai_stats.get("context_metrics") if isinstance(ai_stats.get("context_metrics"), dict) else {}
+        raw_wpm = self._compute_lesson_raw_wpm(lesson_dir)
+        context = build_context_metrics(
+            raw_grammar_score=ai_stats.get("grammar_score", context.get("raw_grammar_score")),
+            raw_wpm=raw_wpm if raw_wpm is not None else context.get("raw_wpm"),
+            practice_hours_last_7_days=context.get("practice_hours_last_7_days"),
+            topic_difficulty=ai_stats.get("topic_difficulty", context.get("topic_difficulty")),
+            idea_density=ai_stats.get("idea_density", context.get("idea_density")),
+            abstraction_level=ai_stats.get("abstraction_level", context.get("abstraction_level")),
+            cognitive_branching=ai_stats.get("cognitive_branching", context.get("cognitive_branching")),
+            technical_density=ai_stats.get("technical_density", context.get("technical_density")),
+            discourse_depth=ai_stats.get("discourse_depth", context.get("discourse_depth")),
+            lexical_retrieval_pressure=ai_stats.get(
+                "lexical_retrieval_pressure",
+                context.get("lexical_retrieval_pressure"),
+            ),
+            fatigue_or_stress=context.get("fatigue_or_stress"),
+            long_pauses_per_min=context.get("long_pauses_per_min"),
+            self_repairs_per_min=context.get("self_repairs_per_min"),
+            filled_pauses_per_min=context.get("filled_pauses_per_min"),
+            notes=ai_stats.get("context_notes", context.get("notes")),
+        )
+
+        form = ctk.CTkFrame(c_tab)
+        form.pack(fill="x", padx=8, pady=(8, 4))
+        context_entries = {}
+        editable_fields = [
+            ("practice_hours_last_7_days", "Practice hrs 7d"),
+            ("topic_difficulty", "Topic difficulty"),
+            ("idea_density", "Idea density"),
+            ("abstraction_level", "Abstraction"),
+            ("cognitive_branching", "Branching"),
+            ("technical_density", "Technical density"),
+            ("discourse_depth", "Discourse depth"),
+            ("lexical_retrieval_pressure", "Lexical pressure"),
+            ("fatigue_or_stress", "Fatigue/stress"),
+            ("long_pauses_per_min", "Long pauses/min"),
+            ("self_repairs_per_min", "Repairs/min"),
+            ("filled_pauses_per_min", "Filled pauses/min"),
+        ]
+        for idx, (key, label) in enumerate(editable_fields):
+            row = idx // 2
+            col = (idx % 2) * 2
+            ctk.CTkLabel(form, text=label, anchor="w").grid(row=row, column=col, sticky="w", padx=(8, 4), pady=4)
+            entry = ctk.CTkEntry(form, width=100)
+            value = context.get(key)
+            if value is not None:
+                entry.insert(0, self._format_metric_value(value))
+            entry.grid(row=row, column=col + 1, sticky="ew", padx=(0, 8), pady=4)
+            context_entries[key] = entry
+        form.grid_columnconfigure(1, weight=1)
+        form.grid_columnconfigure(3, weight=1)
+
+        c_box = ctk.CTkTextbox(c_tab)
+        c_box.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+        def refresh_context_box(updated_context):
+            c_box.configure(state="normal")
+            c_box.delete("1.0", "end")
+            lines = [
+                "Context-Adjusted Metrics",
+                "",
+                f"Raw Grammar Score: {self._format_metric_value(updated_context.get('raw_grammar_score'), '/100')}",
+                f"Context-Adjusted Grammar Score: {self._format_metric_value(updated_context.get('adjusted_grammar_score'), '/100')}",
+                f"Raw WPM: {self._format_metric_value(updated_context.get('raw_wpm'))}",
+                f"Cognitive-Load-Adjusted WPM: {self._format_metric_value(updated_context.get('cognitive_load_adjusted_wpm'))}",
+                f"Fluency Under Load: {self._format_metric_value(updated_context.get('fluency_under_load'))}",
+                f"Effective Fluency: {self._format_metric_value(updated_context.get('effective_fluency_score'), '/100')}",
+                f"Complexity Resilience: {self._format_metric_value(updated_context.get('complexity_resilience_score'), '/100')}",
+                f"Conceptual Load: {self._format_metric_value(updated_context.get('conceptual_load_score'), '/10')}",
+                f"Topic Difficulty: {self._format_metric_value(updated_context.get('topic_difficulty'))}",
+                f"Idea Density: {self._format_metric_value(updated_context.get('idea_density'))}",
+                f"Abstraction: {self._format_metric_value(updated_context.get('abstraction_level'), '/10')}",
+                f"Cognitive Branching: {self._format_metric_value(updated_context.get('cognitive_branching'), '/10')}",
+                f"Technical Density: {self._format_metric_value(updated_context.get('technical_density'), '/10')}",
+                f"Discourse Depth: {self._format_metric_value(updated_context.get('discourse_depth'), '/10')}",
+                f"Lexical Retrieval Pressure: {self._format_metric_value(updated_context.get('lexical_retrieval_pressure'), '/10')}",
+                f"Practice Hours Last 7 Days: {self._format_metric_value(updated_context.get('practice_hours_last_7_days'))}",
+                f"Fatigue/Stress: {self._format_metric_value(updated_context.get('fatigue_or_stress'))}",
+                f"Cold Session: {self._yes_no(updated_context.get('cold_session'))}",
+                f"Hard Topic: {self._yes_no(updated_context.get('hard_topic'))}",
+                f"High Idea Density: {self._yes_no(updated_context.get('high_idea_density'))}",
+                "",
+                "Interpretation",
+                interpretation_for_context_metrics(updated_context),
+            ]
+            notes = updated_context.get("notes") or ai_stats.get("context_notes")
+            if notes:
+                lines.extend(["", "Notes", str(notes)])
+            topic_tags = ai_stats.get("topic_tags")
+            if isinstance(topic_tags, list) and topic_tags:
+                lines.extend(["", "Topic Tags", ", ".join(str(tag) for tag in topic_tags)])
+            c_box.insert("1.0", "\n".join(lines))
+            c_box.configure(state="disabled")
+
+        def parse_entry_value(entry):
+            text = entry.get().strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+
+        def save_context_metrics():
+            updated = build_context_metrics(
+                raw_grammar_score=ai_stats.get("grammar_score", context.get("raw_grammar_score")),
+                raw_wpm=raw_wpm if raw_wpm is not None else context.get("raw_wpm"),
+                practice_hours_last_7_days=parse_entry_value(context_entries["practice_hours_last_7_days"]),
+                topic_difficulty=parse_entry_value(context_entries["topic_difficulty"]),
+                idea_density=parse_entry_value(context_entries["idea_density"]),
+                abstraction_level=parse_entry_value(context_entries["abstraction_level"]),
+                cognitive_branching=parse_entry_value(context_entries["cognitive_branching"]),
+                technical_density=parse_entry_value(context_entries["technical_density"]),
+                discourse_depth=parse_entry_value(context_entries["discourse_depth"]),
+                lexical_retrieval_pressure=parse_entry_value(context_entries["lexical_retrieval_pressure"]),
+                fatigue_or_stress=parse_entry_value(context_entries["fatigue_or_stress"]),
+                long_pauses_per_min=parse_entry_value(context_entries["long_pauses_per_min"]),
+                self_repairs_per_min=parse_entry_value(context_entries["self_repairs_per_min"]),
+                filled_pauses_per_min=parse_entry_value(context_entries["filled_pauses_per_min"]),
+                notes=ai_stats.get("context_notes", context.get("notes")),
+            )
+            ai_stats["context_metrics"] = updated
+            if "topic_difficulty" in updated:
+                ai_stats["topic_difficulty"] = updated.get("topic_difficulty")
+            if "idea_density" in updated:
+                ai_stats["idea_density"] = updated.get("idea_density")
+            for key in (
+                "abstraction_level",
+                "cognitive_branching",
+                "technical_density",
+                "discourse_depth",
+                "lexical_retrieval_pressure",
+            ):
+                if key in updated:
+                    ai_stats[key] = updated.get(key)
+            self._write_json_file(os.path.join(lesson_dir, "ai_stats.json"), ai_stats)
+            refresh_context_box(updated)
+            self._refresh_dashboard_from_current_lesson()
+
+        save_btn = ctk.CTkButton(form, text="Save Context", width=130, command=save_context_metrics)
+        save_btn.grid(row=(len(editable_fields) + 1) // 2, column=0, columnspan=4, sticky="e", padx=8, pady=(4, 8))
+
+        refresh_context_box(context)
 
     # --- ANALYSIS FLOW ---
     def analyze_transcript(self):
@@ -1454,15 +2743,22 @@ class DiarizationApp:
 
         ctk.CTkLabel(model_row, text="Model:", width=60).pack(side="left")
 
-        self.ollama_models = ["mistral", "mixtral", "gemma:2b", "llama3.2"]
-        self.openai_models = ["gpt-4o", "gpt-4o-mini", "gpt-5.1", "gpt-5.2"]
+        self.ollama_models = [
+            "gemma4:12b-mlx",
+            DEFAULT_OLLAMA_ANALYSIS_MODEL,
+            "mistral",
+            "mixtral",
+            "gemma:2b",
+            "qwen2.5",
+        ]
+        self.openai_models = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.2", "gpt-5.1", "gpt-4o", "gpt-4o-mini"]
         
         # Pick model default from profile depending on provider
         provider0 = self.analysis_provider_var.get()
         if provider0 == "openai":
-            default_model = self.profile_config.get("openai_model", "gpt-5.1")
+            default_model = self.profile_config.get("openai_model", "gpt-5.4")
         else:
-            default_model = self.profile_config.get("ollama_model", "mistral")
+            default_model = self.profile_config.get("ollama_model", DEFAULT_OLLAMA_ANALYSIS_MODEL)
 
         self.analysis_model_var = ctk.StringVar(value=default_model)
 
@@ -1512,13 +2808,13 @@ class DiarizationApp:
             if provider == "openai":
                 self.model_menu.configure(values=self.openai_models)
                 if self.analysis_model_var.get() not in self.openai_models:
-                    self.analysis_model_var.set(self.profile_config.get("openai_model", "gpt-4o"))
+                    self.analysis_model_var.set(self.profile_config.get("openai_model", "gpt-5.4"))
                 self.openai_key_entry.configure(state="normal")
                 self.save_key_cb.configure(state="normal")
             else:
                 self.model_menu.configure(values=self.ollama_models)
                 if self.analysis_model_var.get() not in self.ollama_models:
-                    self.analysis_model_var.set(self.profile_config.get("ollama_model", "mistral"))
+                    self.analysis_model_var.set(DEFAULT_OLLAMA_ANALYSIS_MODEL)
                 self.openai_key_entry.configure(state="disabled")
                 self.save_key_cb.configure(state="disabled")
             update_cost_estimate()
@@ -1535,7 +2831,7 @@ class DiarizationApp:
         prompt_box.bind("<FocusOut>", update_cost_estimate)
 
         default_prompt = (
-            "You are an expert Spanish language teacher and pronunciation coach. \
+            "You are an expert Spanish language teacher. \
             You will analyze ONLY the student’s speech from a lesson transcript. \
             Do not analyze or comment on the tutor’s speech. \
  \
@@ -1554,32 +2850,25 @@ class DiarizationApp:
             - Provide 2–4 representative examples with corrections. \
             - Briefly explain why the correction is needed (no long grammar lessons). \
  \
-            3. Fluency \
-            - Evaluate flow, hesitation patterns, false starts, and sentence completion. \
-            - Comment on whether pauses interfere with meaning or are natural at this level. \
+            3. Complexity and Range \
+            - Describe sentence complexity, connector use, and vocabulary range using exact examples. \
+            - Reward sustained explanation and successful self-correction. \
 \
-            4. Pronunciation & Prosody \
-            - Assess rhythm, syllable timing, stress, and intonation. \
-            - Note any features that sound non-native (e.g., English stress patterns, vowel reduction). \
-            - Also identify any aspects that already sound natural. \
+            4. Transcript Limitations \
+            - Do not assess pronunciation, rhythm, stress, intonation, or audio quality from transcript text. \
+            - State briefly which observations would require listening to the audio. \
 \
             5. Positive Observations \
             - Highlight specific strengths demonstrated in this lesson \
             (e.g., verb tense control, use of connectors, conversational strategies). \
 \
-            6. CEFR Profile (Estimated) \
-            Provide an estimated CEFR level for each dimension: \
-            - Grammar accuracy \
-            - Fluency \
-            - Pronunciation & prosody \
-            - Vocabulary range \
-            Use labels such as: A2 / B1 / B2 / C1. \
-            Briefly justify each estimate (1 sentence each). \
+            6. Approximate CEFR Context \
+            - Give one tentative overall range, a confidence level, and a one-sentence caveat. \
+            - Do not infer listening ability, pronunciation, or spontaneous fluency from transcript text. \
 \
-            7. Priority Practice Goals (Next 2–3 Weeks) \
-            - List 3–5 concrete, actionable goals. \
-            - Focus on the highest-impact improvements for the student. \
-            - Phrase goals in practical terms (e.g., “practice linking clauses with…”, not “improve grammar”). \
+            7. Next-Session Coaching Plan \
+            - Select no more than 3 high-impact recurring patterns. \
+            - For each, give a tutor-ready exercise and an observable success criterion. \
 \
             Guidelines: \
             - Do not rewrite the entire transcript. \
@@ -1707,6 +2996,7 @@ class DiarizationApp:
                 final_prompt += "\n\nWrite response in ENGLISH."
             else:
                 final_prompt += "\n\nEscribe la respuesta en ESPAÑOL."
+            final_prompt += self._analysis_stats_suffix()
 
             # Load existing config and update preferences
             cfg = self._load_profile_config()
@@ -1780,37 +3070,35 @@ class DiarizationApp:
         prog.start()
 
         def worker():
-            # --- FIX: Reliable Path Logic ---
-            if getattr(sys, 'frozen', False):
-                # In the .app bundle, resources are relative to the executable
-                # Path: .../DiarizeApp.app/Contents/MacOS/
-                base_path = os.path.dirname(os.path.abspath(sys.executable))
-            else:
-                # In Dev Mode, use the helper we defined
-                base_path = get_resource_base_path()
-            
-            # Look in the 'deps' folder first (Standard for our build)
-            ollama_bin = os.path.join(base_path, "deps", "ollama")
-            
-            # Fallback (Only needed for dev mode or old structures)
-            if not os.path.exists(ollama_bin):
-                print(f"DEBUG: deps/ollama not found at {ollama_bin}, trying fallback...")
-                ollama_bin = os.path.join(base_path, "ollama")
-            
+            ollama_bin = find_ollama_binary()
             print(f"DEBUG: Using ollama binary at: {ollama_bin}")
-            # --------------------------------
 
             env = os.environ.copy()
-            # Ensure models are saved in Application Support, not the temp bundle
-            env["OLLAMA_MODELS"] = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
+            env["OLLAMA_MODELS"] = ollama_models_dir()
             env["OLLAMA_HOST"] = "127.0.0.1:11435"
 
             try:
                 # Check if binary exists before running to avoid obscure error codes
-                if not os.path.exists(ollama_bin):
-                    raise FileNotFoundError(f"Ollama binary not found at: {ollama_bin}")
+                if not ollama_bin:
+                    raise FileNotFoundError("Ollama binary not found. Install Ollama or use OpenAI analysis.")
 
-                subprocess.run([ollama_bin, "pull", model_name], env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if not wait_for_ollama_server(timeout_s=30):
+                    raise RuntimeError("Ollama server did not become ready in time.")
+
+                result = subprocess.run(
+                    [ollama_bin, "pull", model_name],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=3600,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        "Ollama pull failed.\n"
+                        f"stdout:\n{result.stdout or ''}\n"
+                        f"stderr:\n{result.stderr or ''}"
+                    )
                 self.master.after(0, lambda: messagebox.showinfo("Success", "Model Installed!"))
             except Exception as e:
                 msg = str(e)
@@ -1873,6 +3161,8 @@ class DiarizationApp:
                 speakers=speakers,
             )
 
+            analysis_text, ai_stats = self._split_analysis_response(res)
+
             # Ensure we have a lesson folder to attach analysis to
             if not getattr(self, "current_lesson_dir", None):
                 self.current_lesson_dir = self._new_lesson_dir()
@@ -1890,7 +3180,10 @@ class DiarizationApp:
             if self.current_lesson_dir:
                 analysis_path = os.path.join(self.current_lesson_dir, "analysis.txt")
                 with open(analysis_path, "w", encoding="utf-8") as f:
-                    f.write(res)
+                    f.write(analysis_text)
+
+                if ai_stats:
+                    self._write_ai_stats(self.current_lesson_dir, ai_stats, provider, model, speakers)
 
                 meta_path = os.path.join(self.current_lesson_dir, "meta.json")
                 meta = {}
@@ -1907,7 +3200,8 @@ class DiarizationApp:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
 
             # Show result
-            self.master.after(0, lambda text=res: self._show_analysis_window(text))
+            self.master.after(0, lambda text=analysis_text: self._show_analysis_window(text))
+            self.master.after(0, self._refresh_dashboard_from_current_lesson)
             self._set_status("Analysis Done")
             self._set_progress(100)
 
@@ -2020,13 +3314,16 @@ class DiarizationApp:
         # Pre-select from existing mapping if present
         speaker_map_path = os.path.join(lesson_dir, "speaker_map.json")
         pre_selected = set()
+        existing_map = {}
         if os.path.isfile(speaker_map_path):
             try:
                 with open(speaker_map_path, "r", encoding="utf-8") as f:
                     existing = json.load(f) or {}
                 pre_selected = set(existing.get("student_speakers") or [])
+                existing_map = existing.get("map") or {}
             except Exception:
                 pre_selected = set()
+                existing_map = {}
 
         # --- Window ---
         win = ctk.CTkToplevel(self.master)
@@ -2076,6 +3373,7 @@ class DiarizationApp:
 
         # State vars
         spk_vars: dict[str, ctk.BooleanVar] = {}
+        canonical_vars: dict[str, ctk.StringVar] = {}
 
         def update_preview(_evt=None):
             selected = {spk for spk, v in spk_vars.items() if v.get()}
@@ -2093,12 +3391,27 @@ class DiarizationApp:
             btn_save.configure(state="normal" if selected else "disabled")
 
 
-        # Build speaker checkboxes
+        # Build speaker review rows
         for spk in speakers:
             var = ctk.BooleanVar(value=(spk in pre_selected))
             spk_vars[spk] = var
-            cb = ctk.CTkCheckBox(spk_scroll, text=spk, variable=var, command=update_preview)
-            cb.pack(anchor="w", padx=10, pady=6)
+            row = ctk.CTkFrame(spk_scroll, fg_color="transparent")
+            row.pack(fill="x", padx=6, pady=6)
+
+            cb = ctk.CTkCheckBox(row, text="Student", variable=var, command=update_preview, width=90)
+            cb.pack(side="left")
+
+            ctk.CTkLabel(row, text=spk, width=110, anchor="w").pack(side="left", padx=(6, 6))
+
+            canonical_var = ctk.StringVar(value=str(existing_map.get(spk, spk)))
+            canonical_vars[spk] = canonical_var
+            canonical_entry = ctk.CTkEntry(
+                row,
+                textvariable=canonical_var,
+                width=110,
+                placeholder_text="Canonical",
+            )
+            canonical_entry.pack(side="left", padx=(0, 6), fill="x", expand=True)
 
         # Initialize preview
         self.master.after(0, update_preview)
@@ -2117,13 +3430,21 @@ class DiarizationApp:
                 messagebox.showwarning("Required", "Please select at least one Student speaker.")
                 return
 
+            speaker_map = {}
+            for spk, var in canonical_vars.items():
+                canonical = (var.get() or spk).strip()
+                speaker_map[spk] = canonical or spk
+
+            student_canonical = sorted({speaker_map.get(spk, spk) for spk in selected})
+
             # Write speaker_map.json
             payload = {
                 "version": 1,
                 "assigned_at": datetime.now().isoformat(timespec="seconds"),
-                "student_speakers": selected,
-                "num_student_speakers": len(selected),
-                "map": {spk: ("student" if spk in selected else "other") for spk in speakers},
+                "student_speakers": student_canonical,
+                "num_student_speakers": len(student_canonical),
+                "map": speaker_map,
+                "original_speakers": speakers,
             }
             try:
                 with open(speaker_map_path, "w", encoding="utf-8") as f:
@@ -2132,28 +3453,135 @@ class DiarizationApp:
                 messagebox.showerror("Error", f"Failed to write speaker_map.json:\n{e}")
                 return
 
-            # Patch meta.json
-            meta_path = os.path.join(lesson_dir, "meta.json")
-            meta = {}
-            if os.path.isfile(meta_path):
-                try:
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f) or {}
-                except Exception:
-                    meta = {}
-
-            meta["has_speaker_map"] = True
-            meta["student_speakers"] = selected
-            meta["speaker_map_file"] = "speaker_map.json"
-            meta["speaker_map_updated_at"] = datetime.now().isoformat(timespec="seconds")
-
+            # Rewrite cleaned lesson artifacts so analysis sees the merged labels
             try:
-                with open(meta_path, "w", encoding="utf-8") as f:
-                    json.dump(meta, f, ensure_ascii=False, indent=2)
+                segments_path = os.path.join(lesson_dir, "segments.json")
+                transcript_path = os.path.join(lesson_dir, "transcript.txt")
+                transcript_raw_path = os.path.join(lesson_dir, "transcript_raw.txt")
+                transcript_cleaned_path = os.path.join(lesson_dir, "transcript_cleaned.txt")
+                transcript_highlighted_path = os.path.join(lesson_dir, "transcript_cleaned_highlighted.txt")
+                artifact_path = os.path.join(lesson_dir, "transcript_artifact.json")
+                meta_path = os.path.join(lesson_dir, "meta.json")
+                diar_path = os.path.join(lesson_dir, "diarization.json")
+
+                with open(segments_path, "r", encoding="utf-8") as f:
+                    current_segments = json.load(f) or []
+
+                updated_segments = []
+                for seg in current_segments:
+                    updated = dict(seg)
+                    src_spk = str(updated.get("speaker") or "UNKNOWN")
+                    updated["speaker"] = speaker_map.get(src_spk, src_spk)
+                    updated_segments.append(updated)
+
+                raw_seg_path = os.path.join(lesson_dir, "segments_raw.json")
+                raw_segments = []
+                if os.path.isfile(raw_seg_path):
+                    try:
+                        with open(raw_seg_path, "r", encoding="utf-8") as f:
+                            raw_segments = json.load(f) or []
+                    except Exception:
+                        raw_segments = []
+
+                updated_raw_segments = []
+                for seg in raw_segments:
+                    updated = dict(seg)
+                    src_spk = str(updated.get("speaker") or "UNKNOWN")
+                    updated["speaker"] = speaker_map.get(src_spk, src_spk)
+                    updated_raw_segments.append(updated)
+
+                def fmt_line(seg, highlight=False):
+                    speaker = seg.get("speaker", "UNKNOWN")
+                    text = (seg.get("text") or "").strip()
+                    label = "[LOW] " if highlight and seg.get("low_confidence") else ""
+                    return f"{label}{speaker}: {text}"
+
+                cleaned_text = "\n".join(fmt_line(seg) for seg in updated_segments)
+                highlighted_text = "\n".join(fmt_line(seg, highlight=True) for seg in updated_segments)
+                raw_text = "\n".join(fmt_line(seg) for seg in updated_raw_segments)
+
+                with open(segments_path, "w", encoding="utf-8") as f:
+                    json.dump(updated_segments, f, ensure_ascii=False, indent=2)
+                if os.path.isfile(raw_seg_path):
+                    with open(raw_seg_path, "w", encoding="utf-8") as f:
+                        json.dump(updated_raw_segments, f, ensure_ascii=False, indent=2)
+
+                with open(transcript_path, "w", encoding="utf-8") as f:
+                    f.write(cleaned_text + ("\n" if cleaned_text else ""))
+                if os.path.isfile(transcript_cleaned_path):
+                    with open(transcript_cleaned_path, "w", encoding="utf-8") as f:
+                        f.write(cleaned_text + ("\n" if cleaned_text else ""))
+                if os.path.isfile(transcript_raw_path):
+                    with open(transcript_raw_path, "w", encoding="utf-8") as f:
+                        f.write(raw_text + ("\n" if raw_text else ""))
+                if os.path.isfile(transcript_highlighted_path):
+                    with open(transcript_highlighted_path, "w", encoding="utf-8") as f:
+                        f.write(highlighted_text + ("\n" if highlighted_text else ""))
+
+                if os.path.isfile(artifact_path):
+                    try:
+                        with open(artifact_path, "r", encoding="utf-8") as f:
+                            artifact = json.load(f) or {}
+                    except Exception:
+                        artifact = {}
+                    artifact["cleaned_transcript"] = cleaned_text
+                    artifact["highlighted_transcript"] = highlighted_text
+                    artifact["cleaned_segments"] = updated_segments
+                    artifact["raw_segments"] = updated_raw_segments or artifact.get("raw_segments", [])
+                    artifact["speaker_map"] = payload
+                    with open(artifact_path, "w", encoding="utf-8") as f:
+                        json.dump(artifact, f, ensure_ascii=False, indent=2)
+
+                if os.path.isfile(meta_path):
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f) or {}
+                    except Exception:
+                        meta = {}
+                    meta["has_speaker_map"] = True
+                    meta["student_speakers"] = student_canonical
+                    meta["speaker_map_file"] = "speaker_map.json"
+                    meta["speaker_map_updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    with open(meta_path, "w", encoding="utf-8") as f:
+                        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+                if os.path.isfile(diar_path):
+                    try:
+                        with open(diar_path, "r", encoding="utf-8") as f:
+                            diarization = json.load(f) or []
+                        updated_diar = []
+                        for seg in diarization:
+                            updated = dict(seg)
+                            src_spk = str(updated.get("speaker") or "UNKNOWN")
+                            updated["speaker"] = speaker_map.get(src_spk, src_spk)
+                            updated_diar.append(updated)
+                        with open(diar_path, "w", encoding="utf-8") as f:
+                            json.dump(updated_diar, f, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+
+                self.pipeline.last_result = {"segments": updated_segments}
+                self.pipeline.last_raw_result = {"segments": updated_raw_segments or raw_segments}
+                self.pipeline.last_diar_df = None
+                if os.path.isfile(diar_path):
+                    try:
+                        with open(diar_path, "r", encoding="utf-8") as f:
+                            diarization = json.load(f) or []
+                        import pandas as pd
+
+                        self.pipeline.last_diar_df = pd.DataFrame(diarization)
+                    except Exception:
+                        pass
+                self.pipeline.last_processing_meta = {
+                    **(self.pipeline.last_processing_meta or {}),
+                    "speaker_map": speaker_map,
+                    "student_speakers": student_canonical,
+                }
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to update meta.json:\n{e}")
+                messagebox.showerror("Error", f"Failed to rewrite lesson artifacts:\n{e}")
                 return
 
+            # Patch meta.json
             win.grab_release()
             win.destroy()
             self.master.after(0, self._update_analyze_ui_state)
@@ -2188,6 +3616,37 @@ class DiarizationApp:
             self.pipeline.export_txt(path)
             messagebox.showinfo("Export", "Saved TXT")
 
+    def _export_lesson_analysis(self, lesson_dir: str):
+        analysis_path = os.path.join(lesson_dir, "analysis.txt")
+        if not os.path.isfile(analysis_path):
+            messagebox.showwarning(
+                "Analysis not found",
+                "This lesson does not have a saved analysis.txt file yet.",
+            )
+            return
+
+        default_name = f"{os.path.basename(lesson_dir)}_analysis.txt"
+        path = filedialog.asksaveasfilename(
+            title="Export lesson analysis",
+            defaultextension=".txt",
+            initialfile=default_name,
+            filetypes=[
+                ("Text file", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            with open(analysis_path, "r", encoding="utf-8") as src:
+                content = src.read()
+            with open(path, "w", encoding="utf-8") as dst:
+                dst.write(content)
+            messagebox.showinfo("Export", f"Saved analysis to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
     def export_speaker_audio(self):
         if self.current_lesson_dir and not self._has_speaker_assignment(self.current_lesson_dir):
             messagebox.showwarning("Action required", "Please assign Student speaker(s) first.")
@@ -2200,13 +3659,18 @@ class DiarizationApp:
             messagebox.showinfo("Export", "Saved Speaker Audios")
 
 
+
 def main():
+    local_server = start_local_server_if_enabled()
     root = ctk.CTk()
     app = DiarizationApp(root)
     
     def on_closing():
         # 1. Stop Ollama
         app._cleanup_ollama()
+
+        if local_server:
+            local_server.stop()
         
         # 2. Force Matplotlib to close all charts
         try:

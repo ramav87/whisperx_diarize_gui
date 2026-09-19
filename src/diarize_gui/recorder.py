@@ -1,16 +1,24 @@
 import os
 from datetime import datetime
 from typing import Optional, Callable
-import sounddevice as sd
 import soundfile as sf
 from tkinter import messagebox
 import numpy as np
 import threading
 
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_IMPORT_ERROR = None
+except (ImportError, OSError) as exc:
+    sd = None
+    SOUNDDEVICE_IMPORT_ERROR = exc
+
+
 class AudioRecorder:
     """
     Simple audio recorder using sounddevice + soundfile.
-    Records mono 16 kHz audio into a WAV file.
+    Records mono audio into a WAV file. The processing pipeline normalizes the
+    result to 16 kHz before transcription.
     """
 
     def __init__(
@@ -37,8 +45,27 @@ class AudioRecorder:
         if self.on_status is not None:
             self.on_status(text)
 
+    def _require_sounddevice(self) -> bool:
+        if sd is not None:
+            return True
+
+        detail = str(SOUNDDEVICE_IMPORT_ERROR) if SOUNDDEVICE_IMPORT_ERROR else "sounddevice is unavailable"
+        msg = (
+            "Live recording is unavailable because PortAudio is not installed.\n\n"
+            f"{detail}\n\n"
+            "On Ubuntu, install it with:\n"
+            "sudo apt-get install libportaudio2"
+        )
+        self._set_status("Recording unavailable: PortAudio is not installed")
+        messagebox.showerror("Recording unavailable", msg)
+        return False
+
     def list_input_devices(self):
         devices = []
+        if sd is None:
+            self._set_status("Recording unavailable: PortAudio is not installed")
+            return devices
+
         try:
             all_devices = sd.query_devices()
             for idx, dev in enumerate(all_devices):
@@ -47,6 +74,40 @@ class AudioRecorder:
         except Exception as e:
             messagebox.showerror("Error querying audio devices", str(e))
         return devices
+
+    def _candidate_samplerates(self, device_index: Optional[int]) -> list[int]:
+        rates: list[int] = []
+        if sd is not None:
+            try:
+                dev = sd.query_devices(device_index, "input") if device_index is not None else sd.query_devices(kind="input")
+                default_rate = int(float(dev.get("default_samplerate", 0) or 0))
+                if default_rate > 0:
+                    rates.append(default_rate)
+            except Exception:
+                pass
+
+        rates.extend([self.samplerate, 48000, 44100, 32000, 22050])
+        deduped: list[int] = []
+        for rate in rates:
+            if rate > 0 and rate not in deduped:
+                deduped.append(rate)
+        return deduped
+
+    def _select_samplerate(self, device_index: Optional[int]) -> int:
+        errors: list[str] = []
+        for samplerate in self._candidate_samplerates(device_index):
+            try:
+                sd.check_input_settings(
+                    device=device_index,
+                    channels=self.channels,
+                    samplerate=samplerate,
+                )
+                return samplerate
+            except Exception as exc:
+                errors.append(f"{samplerate} Hz: {exc}")
+
+        detail = "\n".join(errors) if errors else "No sample rates were accepted."
+        raise RuntimeError(f"Could not open input device with a supported sample rate.\n{detail}")
     
     def get_level(self):
         """Returns (rms, peak) in 0..1 range."""
@@ -58,6 +119,9 @@ class AudioRecorder:
         if self.is_recording:
             return
 
+        if not self._require_sounddevice():
+            return
+
         os.makedirs(output_dir, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -67,14 +131,6 @@ class AudioRecorder:
         self.recorded_at_time = recording_started_at
 
         try:
-            self.record_file = sf.SoundFile(
-                self.recorded_file_path,
-                mode="w",
-                samplerate=self.samplerate,
-                channels=self.channels,
-                subtype="PCM_16",
-            )
-
             def callback(indata, frames, time, status):
                 if status:
                     print(status)
@@ -97,8 +153,16 @@ class AudioRecorder:
                 except Exception:
                     pass
 
+            recording_samplerate = self._select_samplerate(device_index)
+            self.record_file = sf.SoundFile(
+                self.recorded_file_path,
+                mode="w",
+                samplerate=recording_samplerate,
+                channels=self.channels,
+                subtype="PCM_16",
+            )
             self.record_stream = sd.InputStream(
-                samplerate=self.samplerate,
+                samplerate=recording_samplerate,
                 channels=self.channels,
                 callback=callback,
                 device=device_index,
@@ -106,7 +170,7 @@ class AudioRecorder:
 
             self.record_stream.start()
             self.is_recording = True
-            self._set_status("Recording...")
+            self._set_status(f"Recording... ({recording_samplerate} Hz)")
 
         except Exception as e:
             self._set_status("Error starting recording")

@@ -1,0 +1,421 @@
+:root {
+  color-scheme: light;
+  --bg: #f4f7f6;
+  --surface: #ffffff;
+  --surface-strong: #eef5f2;
+  --text: #17211f;
+  --muted: #60716d;
+  --border: #d7e1de;
+  --primary: #0f766e;
+  --primary-strong: #0a5f59;
+  --danger: #b42318;
+  --warning: #b7791f;
+  --shadow: 0 14px 40px rgba(20, 40, 36, 0.09);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  min-height: 44px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 14px;
+  background: var(--surface-strong);
+  color: var(--text);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+input,
+select {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: #ffffff;
+  color: var(--text);
+}
+
+label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
+.app-shell {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: max(14px, env(safe-area-inset-top)) 14px max(24px, env(safe-area-inset-bottom));
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 2px 16px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 2rem;
+  line-height: 1;
+}
+
+h2 {
+  font-size: 1.12rem;
+  line-height: 1.2;
+}
+
+.eyebrow {
+  color: var(--primary);
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.91rem;
+}
+
+main {
+  display: grid;
+  gap: 14px;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 16px;
+}
+
+.section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.server-form {
+  display: grid;
+  gap: 8px;
+}
+
+.input-action {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}
+
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.recording-controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.timer {
+  min-width: 56px;
+  color: var(--muted);
+  font-weight: 800;
+  text-align: right;
+}
+
+.file-picker {
+  margin: 4px 0 14px;
+}
+
+.selected-audio {
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+
+.primary {
+  background: var(--primary);
+  color: #ffffff;
+}
+
+.primary:hover {
+  background: var(--primary-strong);
+}
+
+.secondary {
+  background: #e4efed;
+  color: #0b4f49;
+}
+
+.danger {
+  background: #fce8e5;
+  color: var(--danger);
+}
+
+.full-width {
+  width: 100%;
+}
+
+.icon-button {
+  width: 44px;
+  padding: 0;
+  font-size: 1.25rem;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  border-radius: 999px;
+  padding: 0 10px;
+  font-size: 0.78rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.status-badge.neutral {
+  background: #edf2f1;
+  color: #52615e;
+}
+
+.status-badge.ok {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.status-badge.busy {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.status-badge.error {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.progress-track {
+  height: 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e6eeeb;
+}
+
+.progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary);
+  transition: width 180ms ease;
+}
+
+.content-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.lessons-list {
+  display: grid;
+  gap: 8px;
+}
+
+.lesson-item {
+  width: 100%;
+  min-height: 68px;
+  display: grid;
+  gap: 5px;
+  justify-items: start;
+  padding: 12px;
+  border: 1px solid var(--border);
+  background: #fbfdfc;
+  text-align: left;
+}
+
+.lesson-item.active {
+  border-color: var(--primary);
+  background: #ecfdf8;
+}
+
+.lesson-item strong {
+  font-size: 0.96rem;
+}
+
+.empty-state {
+  display: grid;
+  min-height: 220px;
+  place-content: center;
+  gap: 8px;
+  text-align: center;
+}
+
+.tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 4px;
+  border-radius: 8px;
+  background: var(--surface-strong);
+}
+
+.tab {
+  min-height: 40px;
+  background: transparent;
+  font-size: 0.9rem;
+}
+
+.tab.active {
+  background: #ffffff;
+  box-shadow: 0 1px 8px rgba(20, 40, 36, 0.08);
+}
+
+.transcript {
+  display: grid;
+  gap: 10px;
+  max-height: 58vh;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.segment {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 8px;
+  background: #f8fbfa;
+  border: 1px solid #e0e9e6;
+}
+
+.segment-speaker {
+  color: var(--primary);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.segment-text {
+  line-height: 1.45;
+}
+
+.speaker-form,
+.analysis-controls {
+  display: grid;
+  gap: 12px;
+}
+
+.speaker-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fbfdfc;
+}
+
+.speaker-row input[type="checkbox"] {
+  width: 22px;
+  min-height: 22px;
+}
+
+.speaker-label-fields {
+  display: grid;
+  gap: 7px;
+}
+
+.analysis-output {
+  min-height: 160px;
+  max-height: 48vh;
+  overflow: auto;
+  margin: 14px 0 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fbfa;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
+.hidden {
+  display: none !important;
+}
+
+@media (min-width: 760px) {
+  .app-shell {
+    padding: 24px;
+  }
+
+  .connection-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    gap: 20px;
+    align-items: end;
+  }
+
+  .connection-panel .section-head {
+    margin-bottom: 0;
+  }
+
+  .field-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .content-grid {
+    grid-template-columns: minmax(260px, 0.38fr) minmax(0, 0.62fr);
+    align-items: start;
+  }
+
+  .lessons-panel,
+  .lesson-detail {
+    min-height: 620px;
+  }
+}
+
+@media (max-width: 440px) {
+  .field-grid,
+  .input-action,
+  .recording-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .timer {
+    text-align: left;
+  }
+}

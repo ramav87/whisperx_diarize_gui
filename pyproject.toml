@@ -9,18 +9,30 @@ description = "Simple Tkinter GUI for WhisperX transcription + diarization with 
 authors = [
   { name = "Rama Vasudevan" },
 ]
-readme = "README.md"
-requires-python = ">=3.9"
+readme = "README.MD"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 
 dependencies = [
   "whisperx",
-  "torch",
-  "torchaudio",
+  "openai-whisper; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "mlx-whisper; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "torch>=2.8,<2.9",
+  "torchaudio>=2.8,<2.9",
+  "torchvision>=0.23,<0.24",
+  "numpy>=2.0.2,<2.1.0",
+  "pandas>=2.2.3,<2.3.0",
   "sounddevice",
   "soundfile",
-  "pyannote.audio",
+  "customtkinter",
+  "pillow",
+  "pyannote.audio<4",
+  "huggingface-hub>=0.34.0,<1.0",
   "pyperclip",
+  "requests",
+  "fastapi",
+  "uvicorn[standard]",
+  "python-multipart",
 ]
 
 [project.urls]
@@ -29,6 +41,7 @@ Repository = "https://example.com/diarize-gui.git"
 
 [project.scripts]
 diarize-gui = "diarize_gui.gui:main"
+diarize-server = "diarize_gui.api:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

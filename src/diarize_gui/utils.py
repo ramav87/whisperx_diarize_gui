@@ -1,19 +1,67 @@
 """
-Utility functions for device selection and timestamp formatting.
+Utility functions for hardware detection, timestamp formatting, and config helpers.
 """
 
-import torch
+import base64
+import os
+import platform
+import sys
+from typing import Dict, Optional
+
+
+EXTERNAL_OLLAMA_MODELS_DIR = "/Volumes/XTRM-P/AI-models/DiarizeApp/models"
+
+
+def ollama_models_dir() -> str:
+    """Return the configured model store, preferring the mounted XTRM drive."""
+    configured = os.environ.get("OLLAMA_MODELS")
+    if configured:
+        return os.path.expanduser(configured)
+    external_parent = os.path.dirname(EXTERNAL_OLLAMA_MODELS_DIR)
+    if os.path.isdir(external_parent):
+        return EXTERNAL_OLLAMA_MODELS_DIR
+    return os.path.expanduser("~/.local/share/diarize-gui/ollama-models")
 
 
 def detect_device() -> str:
     """
-    Choose best available device for WhisperX: cuda > cpu.
-    (We deliberately do NOT return 'mps' because WhisperX
-    does not support it and will raise 'unsupported device mps'.)
+    Choose the best device for the current runtime.
+    WhisperX paths still prefer cuda > cpu, while Apple Silicon
+    specific backends can separately use MPS when supported.
     """
+    import torch
+
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+def is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def is_apple_silicon() -> bool:
+    return is_macos() and platform.machine().lower() in {"arm64", "aarch64"}
+
+
+def detect_processing_platform() -> str:
+    """
+    Returns one of: 'apple_silicon', 'mac_intel', 'other'.
+    """
+    if is_apple_silicon():
+        return "apple_silicon"
+    if is_macos():
+        return "mac_intel"
+    return "other"
+
+
+def default_asr_backend() -> str:
+    """
+    Runtime default for transcription backend.
+    """
+    if is_apple_silicon():
+        return "auto"
+    return "whisperx"
 
 
 def format_timestamp(seconds: float) -> str:
@@ -32,8 +80,6 @@ def format_timestamp(seconds: float) -> str:
     s = s % 60
 
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-import base64
 
 _OBFUSCATION_PREFIX = "obf:v1:"
 
@@ -61,7 +107,6 @@ def deobfuscate_secret(value: str) -> str:
     except Exception:
         return ""
 
-from typing import Dict, Optional
 
 # ==============================
 # OpenAI pricing (USD per 1M tokens)
@@ -83,6 +128,18 @@ OPENAI_PRICING_PER_1M = {
     "gpt-5.2": {
         "input": 1.75,
         "output": 14.00,
+    },
+    "gpt-5.4": {
+        "input": 2.50,
+        "output": 15.00,
+    },
+    "gpt-5.4-mini": {
+        "input": 0.75,
+        "output": 4.50,
+    },
+    "gpt-5.5": {
+        "input": 5.00,
+        "output": 30.00,
     },
 }
 

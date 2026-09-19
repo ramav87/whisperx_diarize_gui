@@ -1,2 +1,3 @@
 [console_scripts]
 diarize-gui = diarize_gui.gui:main
+diarize-server = diarize_gui.api:main

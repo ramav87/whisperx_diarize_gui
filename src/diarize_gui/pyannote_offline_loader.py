@@ -2,7 +2,13 @@ import os
 import sys
 import yaml
 import tempfile
-from pyannote.audio import Pipeline
+
+
+# Pyannote 3.x checkpoints require full Lightning checkpoint loading. PyTorch
+# 2.6+ defaults torch.load to weights_only=True, which rejects these trusted
+# local Pyannote checkpoints unless this compatibility flag is set first.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
 
 def get_resource_base_path():
     """
@@ -25,16 +31,29 @@ def get_model_dir():
     Locate the folder containing config.yaml and bin files for Pyannote.
     """
     base_path = get_resource_base_path()
-    
+
+    candidates = [
+        os.path.join(base_path, "models", "pyannote-3.1"),
+        os.path.join(base_path, "models", "pyannote"),
+        os.path.join(base_path, "pyannote-3.1"),
+        os.path.join(base_path, "pyannote"),
+    ]
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
     if getattr(sys, 'frozen', False):
         # In the App Bundle, build_app.sh puts pyannote inside 'models'
-        # .../Contents/MacOS/models/pyannote
-        return os.path.join(base_path, "models", "pyannote")
+        # .../Contents/MacOS/models/pyannote or pyannote-3.1
+        return candidates[1]
     else:
         # In Dev Mode, it is directly in 'resources/pyannote'
-        return os.path.join(base_path, "pyannote")
+        return candidates[-1]
 
 def load_offline_pipeline():
+    from pyannote.audio import Pipeline
+
     model_dir = get_model_dir()
     config_path = os.path.join(model_dir, "config.yaml")
 
@@ -56,19 +75,23 @@ def load_offline_pipeline():
     params = config.get("pipeline", {}).get("params", {})
 
     def make_absolute(rel_path):
-        # Turn "./segmentation.bin" into "/Users/.../segmentation.bin"
-        filename = os.path.basename(rel_path) 
-        return os.path.join(model_dir, filename)
+        return os.path.abspath(os.path.join(model_dir, rel_path))
+
+    def local_model_config(rel_path):
+        path = make_absolute(str(rel_path))
+        if os.path.isdir(path):
+            return {"checkpoint": os.path.join(path, "pytorch_model.bin")}
+        return path
 
     if "segmentation" in params:
         # Only fix if it looks like a relative path
         if str(params["segmentation"]).startswith("."):
-            params["segmentation"] = make_absolute(params["segmentation"])
+            params["segmentation"] = local_model_config(params["segmentation"])
             print(f"Patched segmentation path: {params['segmentation']}")
 
     if "embedding" in params:
         if str(params["embedding"]).startswith("."):
-            params["embedding"] = make_absolute(params["embedding"])
+            params["embedding"] = local_model_config(params["embedding"])
             print(f"Patched embedding path: {params['embedding']}")
 
     # 3. Write to a temporary file
@@ -88,5 +111,31 @@ def load_offline_pipeline():
         if os.path.exists(tmp_config_path):
             try:
                 os.remove(tmp_config_path)
-            except:
+            except OSError:
                 pass
+
+
+def load_huggingface_pipeline():
+    from pyannote.audio import Pipeline
+
+    model_id = os.environ.get("DIARIZE_PYANNOTE_MODEL", "pyannote/speaker-diarization-3.1")
+    token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "Offline Pyannote config was not found and no HuggingFace token is configured. "
+            "Set HUGGINGFACE_TOKEN in the service environment or install resources/pyannote/config.yaml."
+        )
+
+    print(f"Loading Pyannote pipeline from HuggingFace: {model_id}")
+    try:
+        return Pipeline.from_pretrained(model_id, use_auth_token=token)
+    except TypeError:
+        return Pipeline.from_pretrained(model_id, token=token)
+
+
+def load_pyannote_pipeline():
+    model_dir = get_model_dir()
+    config_path = os.path.join(model_dir, "config.yaml")
+    if os.path.exists(config_path):
+        return load_offline_pipeline()
+    return load_huggingface_pipeline()

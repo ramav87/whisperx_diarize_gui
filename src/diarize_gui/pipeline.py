@@ -1,22 +1,119 @@
+from __future__ import annotations
+
 import os
 import sys
+import shutil
 import json
 import re
-from typing import Callable, Optional, List
+import time
+from typing import Callable, Optional, List, Any
 from datetime import datetime
 import numpy as np
 import pandas as pd
 import soundfile as sf
-import whisperx
-from pyannote.audio import Pipeline
 import requests
-from .utils import detect_device, format_timestamp
-from .pyannote_offline_loader import load_offline_pipeline  # <--- ADD THIS
+from .utils import detect_device, format_timestamp, is_apple_silicon, ollama_models_dir
+from .audio_tools import preprocess_audio_mono_16k
+from .processing_backends import (
+    assign_speakers_by_overlap,
+    prepare_transcript_segments,
+    resolve_asr_backend,
+    resolve_diarization_backend,
+    single_speaker_diarization_from_segments,
+)
+from .metrics.context_adjusted import build_context_metrics
 
 StatusCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
 TIME_PATTERN = re.compile(r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\.(?P<ms>\d{3})")
-DEFAULT_MAX_CHARS = 20000
+DEFAULT_MAX_CHARS = 120000
+DEFAULT_OLLAMA_ANALYSIS_MODEL = "gemma4:e4b"
+DEFAULT_OLLAMA_AI_METRICS_MAX_CHARS = 120000
+DEFAULT_OPENAI_AI_METRICS_MAX_CHARS = 120000
+DEFAULT_OLLAMA_CONTEXT_TOKENS = 49152
+AI_METRICS_SCHEMA_VERSION = 2
+AI_METRICS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "grammar_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "topics": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5},
+        "golden_words": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        "corrections": {"type": "integer", "minimum": 0},
+        "feedback": {"type": "string"},
+        "topic_difficulty": {"type": "number", "minimum": 1, "maximum": 5},
+        "idea_density": {"type": "number", "minimum": 1, "maximum": 5},
+        "abstraction_level": {"type": "number", "minimum": 1, "maximum": 10},
+        "cognitive_branching": {"type": "number", "minimum": 1, "maximum": 10},
+        "technical_density": {"type": "number", "minimum": 1, "maximum": 10},
+        "discourse_depth": {"type": "number", "minimum": 1, "maximum": 10},
+        "lexical_retrieval_pressure": {"type": "number", "minimum": 1, "maximum": 10},
+        "topic_tags": {"type": "array", "items": {"type": "string"}},
+        "context_notes": {"type": "string"},
+        "self_repair_observations": {"type": "string"},
+        "cefr_estimate": {"type": "string"},
+        "cefr_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "error_counts": {
+            "type": "object",
+            "additionalProperties": {"type": "integer", "minimum": 0},
+        },
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "original": {"type": "string"},
+                    "correction": {"type": "string"},
+                    "explanation": {"type": "string"},
+                },
+                "required": ["category", "original", "correction"],
+            },
+            "maxItems": 12,
+        },
+        "strengths": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        "priority_goals": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        "communicative_effectiveness": {"type": "number", "minimum": 0, "maximum": 100},
+        "accuracy_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "complexity_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "lexical_range_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "recurring_patterns": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "estimated_count": {"type": "integer", "minimum": 1},
+                    "learner_example": {"type": "string"},
+                    "better_form": {"type": "string"},
+                    "practice_rule": {"type": "string"},
+                },
+                "required": ["category", "pattern", "learner_example", "better_form"],
+            },
+            "maxItems": 6,
+        },
+        "successful_self_repairs": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        "next_session_plan": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string"},
+                    "exercise": {"type": "string"},
+                    "success_criterion": {"type": "string"},
+                },
+                "required": ["goal", "exercise", "success_criterion"],
+            },
+            "maxItems": 3,
+        },
+        "analysis_limitations": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+    },
+    "required": [
+        "grammar_score", "topics", "golden_words", "corrections", "feedback",
+        "topic_difficulty", "idea_density", "abstraction_level", "cognitive_branching",
+        "technical_density", "discourse_depth", "lexical_retrieval_pressure",
+    ],
+}
 
 def parse_time_to_seconds(t: str) -> float:
     """
@@ -34,7 +131,7 @@ def parse_time_to_seconds(t: str) -> float:
 
 class DiarizationPipelineRunner:
     """
-    Encapsulates the WhisperX + diarization pipeline.
+    Encapsulates transcription + diarization with hardware-aware backend routing.
     """
 
     def __init__(
@@ -47,9 +144,40 @@ class DiarizationPipelineRunner:
 
         # store last run info for exports
         self.last_result = None
+        self.last_raw_result = None
         self.last_audio_path = None
+        self.last_preprocessed_audio_path = None
         self.last_output_dir = None
         self.last_diar_df: Optional[pd.DataFrame] = None
+        self.last_processing_meta: dict[str, Any] = {}
+        self.last_ai_metrics_error: Optional[str] = None
+
+    @staticmethod
+    def _normalize_golden_words(value) -> List[str]:
+        """
+        Coerce model output into a clean, unique list of up to 3 strings.
+        """
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            items = [value]
+        elif isinstance(value, list):
+            items = value
+        else:
+            return []
+
+        cleaned: List[str] = []
+        seen = set()
+        for item in items:
+            text = re.sub(r"\s+", " ", str(item)).strip(" \t\r\n-•*")
+            if not text or text in seen:
+                continue
+            cleaned.append(text)
+            seen.add(text)
+            if len(cleaned) >= 3:
+                break
+        return cleaned
 
     def _set_status(self, text: str):
         if self.status_callback:
@@ -61,6 +189,11 @@ class DiarizationPipelineRunner:
         """
         if self.progress_callback:
             self.progress_callback(value)
+
+    def _set_step(self, step: int, total: int, text: str, progress: Optional[float] = None):
+        self._set_status(f"Step {step}/{total}: {text}")
+        if progress is not None:
+            self._set_progress(progress)
 
     def _build_transcript_text(self, include_speaker: bool = True) -> str:
         if not self.last_result or "segments" not in self.last_result:
@@ -114,9 +247,17 @@ class DiarizationPipelineRunner:
             raise ValueError("No segments could be parsed from TXT file.")
 
         self.last_result = {"segments": segments}
+        self.last_raw_result = {"segments": segments}
         self.last_diar_df = None
         self.last_audio_path = None
+        self.last_preprocessed_audio_path = None
         self.last_output_dir = os.path.dirname(txt_path)
+        self.last_processing_meta = {
+            "asr_backend": "txt_import",
+            "diarization_backend": None,
+            "word_timestamps_available": False,
+            "notes": ["Loaded from existing TXT transcript."],
+        }
 
         self._set_status("Loaded segments from TXT")
         self._set_progress(100)
@@ -132,15 +273,97 @@ class DiarizationPipelineRunner:
             print(f"Saved AI metrics to: {path}")
         except Exception as e:
             print(f"Error saving JSON to {path}: {e}")
+
+    @staticmethod
+    def _normalize_grammar_score(score):
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            return score
+
+        if 0 < value <= 10:
+            value *= 10
+
+        value = float(max(0, min(100, value)))
+        return int(value) if value.is_integer() else value
+
+    @staticmethod
+    def _validate_ai_metrics(data):
+        if not isinstance(data, dict):
+            raise ValueError("AI metrics response is not a JSON object.")
+
+        for key in AI_METRICS_SCHEMA["required"]:
+            if key not in data:
+                raise ValueError(f"AI metrics response is missing required field: {key}")
+
+        ranges = {
+            "grammar_score": (0, 100),
+            "topic_difficulty": (1, 5),
+            "idea_density": (1, 5),
+            "abstraction_level": (1, 10),
+            "cognitive_branching": (1, 10),
+            "technical_density": (1, 10),
+            "discourse_depth": (1, 10),
+            "lexical_retrieval_pressure": (1, 10),
+        }
+        for key, (low, high) in ranges.items():
+            value = data.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"AI metrics field {key} must be numeric.")
+            if not low <= float(value) <= high:
+                raise ValueError(f"AI metrics field {key} must be between {low} and {high}.")
+
+        if not isinstance(data.get("topics"), list):
+            raise ValueError("AI metrics field topics must be a list.")
+        if not isinstance(data.get("golden_words"), list):
+            raise ValueError("AI metrics field golden_words must be a list.")
+        if isinstance(data.get("corrections"), bool) or not isinstance(data.get("corrections"), int):
+            raise ValueError("AI metrics field corrections must be an integer.")
+        return data
+
+    def _compute_lesson_raw_wpm(self, lesson_dir, segments=None):
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        try:
+            if segments is None:
+                with open(os.path.join(lesson_dir, "segments.json"), "r", encoding="utf-8") as f:
+                    segments = json.load(f) or []
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f) or {}
+        except Exception:
+            return None
+
+        student_ids = set(meta.get("student_speakers", []))
+        words = 0
+        seconds = 0.0
+        for seg in segments or []:
+            if not isinstance(seg, dict):
+                continue
+            spk = seg.get("speaker", "UNKNOWN")
+            is_student = (spk in student_ids) or (not student_ids and "01" in str(spk))
+            if not is_student:
+                continue
+            try:
+                start = float(seg.get("start", 0))
+                end = float(seg.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            seconds += max(0.0, end - start)
+            words += len(str(seg.get("text", "")).strip().split())
+        return (words / (seconds / 60.0)) if seconds > 10 else None
             
-    def compute_ai_metrics(self, lesson_dir, model="llama3.2", mode="ollama"):
-        """
-        Robustly computes metrics. 
-        Attempts strict JSON parsing first, falls back to text scraping if model refuses JSON.
-        """
+    def compute_ai_metrics(
+        self,
+        lesson_dir,
+        model=DEFAULT_OLLAMA_ANALYSIS_MODEL,
+        mode="ollama",
+        api_key=None,
+        api_url=None,
+    ):
+        """Compute validated, versioned learner metrics without fabricated fallbacks."""
+        self.last_ai_metrics_error = None
         # --- NEW: Ensure Model Exists before we start ---
         if mode == "ollama":
-            self._ensure_model_exists(model)
+            self._ensure_model_exists(model, api_url=api_url)
         # ------------------------------------------------
         import json
         import re
@@ -151,31 +374,110 @@ class DiarizationPipelineRunner:
         output_path = os.path.join(lesson_dir, "ai_stats.json")
         
         text_content = ""
+        raw_wpm = None
+        meta = {}
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+            except Exception:
+                meta = {}
+        speaker_labels = meta.get("speaker_labels") if isinstance(meta.get("speaker_labels"), dict) else {}
+        student_speakers = [
+            str(speaker)
+            for speaker in (meta.get("student_speakers") or [])
+            if str(speaker).strip()
+        ]
+        speaker_scope = "explicit" if student_speakers else "unresolved"
         if os.path.exists(seg_path):
             try:
                 with open(seg_path, 'r', encoding='utf-8') as f:
                     segs = json.load(f)
+                if not student_speakers:
+                    inferred = sorted(
+                        {
+                            str(segment.get("speaker"))
+                            for segment in segs
+                            if isinstance(segment, dict) and "01" in str(segment.get("speaker", ""))
+                        }
+                    )
+                    if inferred:
+                        student_speakers = inferred
+                        speaker_scope = "inferred_speaker_01"
                 for s in segs:
-                    text_content += f"{s.get('speaker', 'Unknown')}: {s.get('text', '')}\n"
-            except: pass
+                    speaker = str(s.get("speaker", "Unknown"))
+                    label = str(speaker_labels.get(speaker) or speaker)
+                    text_content += f"{label} ({speaker}): {s.get('text', '')}\n"
+                raw_wpm = self._compute_lesson_raw_wpm(lesson_dir, segs)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
         
         if not text_content and os.path.exists(transcript_path):
             with open(transcript_path, 'r', encoding='utf-8') as f:
                 text_content = f.read()
 
-        if not text_content: return False
-        if len(text_content) > 8000: text_content = text_content[:8000]
+        if not text_content:
+            self.last_ai_metrics_error = "No transcript text found for AI analysis."
+            return False
+        analysis_max_chars = (
+            DEFAULT_OPENAI_AI_METRICS_MAX_CHARS
+            if mode == "openai"
+            else DEFAULT_OLLAMA_AI_METRICS_MAX_CHARS
+        )
 
         # 2. Strict Prompt
+        scope_line = ""
+        if student_speakers:
+            scope_line = (
+                "Evaluate only these learner/student speaker IDs: "
+                f"{', '.join(student_speakers)}.\n"
+                "Use tutor/teacher lines only as conversation context, not as learner errors.\n\n"
+            )
         prompt = (
-            "Analyze this language lesson. Identify the Student's mistakes.\n"
+            "Analyze this language lesson for longitudinal language-learning progress. "
+            "Identify recurring patterns and support claims with transcript evidence.\n"
+            f"{scope_line}"
             "Respond with a strict JSON object using these keys:\n"
-            "grammar_score (0-100), topics (list of 3 strings), golden_words (list of 3 complex words), corrections (int), feedback (string).\n\n"
+            "grammar_score (0-100), topics (list of 3 strings), golden_words (list of 3 complex words), corrections (int), feedback (string), "
+            "topic_difficulty (number 1-5), idea_density (number 1-5), abstraction_level (number 1-10), "
+            "cognitive_branching (number 1-10), technical_density (number 1-10), discourse_depth (number 1-10), "
+            "lexical_retrieval_pressure (number 1-10), topic_tags (list of short strings), context_notes (short string), "
+            "self_repair_observations (short string).\n\n"
+            "Treat CEFR as a secondary, approximate summary rather than the main result. Also return: "
+            "cefr_estimate and cefr_confidence (0-1); communicative_effectiveness, accuracy_score, "
+            "complexity_score, and lexical_range_score (all 0-100); error_counts grouped by linguistic category; "
+            "evidence examples with exact learner quotes; strengths; priority_goals; recurring_patterns with category, "
+            "pattern, estimated_count, learner_example, better_form, and practice_rule; successful_self_repairs; "
+            "and a next_session_plan containing up to three goal/exercise/success_criterion objects. "
+            "Use analysis_limitations to flag uncertain speaker attribution, likely transcription errors, or evidence that "
+            "is too sparse to support a claim. Never assess pronunciation or prosody from transcript text.\n\n"
+            "Coaching rules:\n"
+            "- Prefer two or three high-impact repeated patterns over a long list of isolated mistakes.\n"
+            "- Separate communication success from grammatical accuracy; a learner may communicate effectively with errors.\n"
+            "- Count a pattern only when the transcript supports it, and copy learner evidence exactly.\n"
+            "- Do not treat tutor wording as a learner error. Reward successful self-correction and sustained explanation.\n"
+            "- Make each next-session exercise concrete enough for a tutor to use immediately.\n\n"
+            "Context rubric:\n"
+            "topic_difficulty: 1=daily life/simple narration, 2=familiar concrete topic, 3=opinion or explanation, "
+            "4=abstract argument, 5=technical, political, scientific, financial, philosophical, or highly abstract argument.\n"
+            "idea_density: 1=simple narration with low conceptual density, 2=concrete personal topic, 3=opinion with reasons, "
+            "4=abstract argument with multiple clauses, 5=dense technical/political/scientific explanation.\n"
+            "abstraction_level: 1=concrete events, 5=generalized explanation, 10=epistemic/theoretical/speculative reasoning.\n"
+            "cognitive_branching: 1=linear narration, 5=causal chains or comparisons, 10=nested hypotheticals/counterarguments/hedging.\n"
+            "technical_density: 1=everyday vocabulary, 5=some domain vocabulary, 10=specialized technical/scientific/business terminology.\n"
+            "discourse_depth: 1=short answers, 5=sustained explanation, 10=multi-step argument with evidence, tradeoffs, and synthesis.\n"
+            "lexical_retrieval_pressure: 1=rehearsed familiar domain, 5=some on-the-fly searching, 10=frequent specialized concept construction.\n"
+            "Do not grade the learner's intelligence or opinions. Focus only on linguistic and cognitive load.\n\n"
             "IMPORTANT FORMATTING:\n"
             "- 'golden_words' must be in the format: \"SpanishWord (EnglishTranslation)\"\n"
             "- Example: [\"desafortunadamente (unfortunately)\", \"hipótesis (hypothesis)\"]\n\n"
             "Example JSON:\n"
-            "{\"grammar_score\": 75, \"topics\": [\"Food\", \"Travel\"], \"golden_words\": [\"exquisito (exquisite)\", \"viaje (journey)\"], \"corrections\": 4, \"feedback\": \"Watch your past tense.\"}\n\n"
+            "{\"grammar_score\": 75, \"topics\": [\"Food\", \"Travel\"], \"golden_words\": [\"exquisito (exquisite)\", \"viaje (journey)\"], "
+            "\"corrections\": 4, \"feedback\": \"Watch your past tense.\", \"topic_difficulty\": 3, \"idea_density\": 3, "
+            "\"abstraction_level\": 4, \"cognitive_branching\": 4, \"technical_density\": 2, \"discourse_depth\": 4, \"lexical_retrieval_pressure\": 3, "
+            "\"topic_tags\": [\"travel\", \"food\"], \"context_notes\": \"Familiar concrete topics with some explanation.\", "
+            "\"self_repair_observations\": \"Occasional restarts.\"}\n\n"
             "JSON ONLY. NO MARKDOWN."
         )
 
@@ -185,13 +487,23 @@ class DiarizationPipelineRunner:
                 user_prompt=prompt,
                 model=model,
                 provider=mode,
-                external_text=text_content 
+                api_key=api_key,
+                api_url=api_url,
+                max_chars=analysis_max_chars,
+                external_text=text_content,
+                response_format=AI_METRICS_SCHEMA if mode == "ollama" else None,
+                context_tokens=DEFAULT_OLLAMA_CONTEXT_TOKENS if mode == "ollama" else None,
             )
             
             # --- CRITICAL FIX START ---
             # Check if the LLM call actually failed before trying to parse
+            if not isinstance(raw_response, str) or not raw_response.strip():
+                self.last_ai_metrics_error = "Invalid structured AI metrics: empty model response"
+                print(self.last_ai_metrics_error)
+                return False
             if raw_response.startswith("Error:"):
                 print(f"LLM Analysis Failed for {lesson_dir}: {raw_response}")
+                self.last_ai_metrics_error = raw_response
                 return False  # Return False so we don't save a garbage file
             # --- CRITICAL FIX END ---
             
@@ -203,52 +515,60 @@ class DiarizationPipelineRunner:
                 if start != -1 and end != 0:
                     json_str = clean[start:end]
                     data = json.loads(json_str)
+                    if "grammar_score" in data:
+                        data["grammar_score"] = self._normalize_grammar_score(data.get("grammar_score"))
+                    self._validate_ai_metrics(data)
+                    data["golden_words"] = self._normalize_golden_words(data.get("golden_words"))
+                    data["context_metrics"] = build_context_metrics(
+                        raw_grammar_score=data.get("grammar_score"),
+                        raw_wpm=raw_wpm,
+                        topic_difficulty=data.get("topic_difficulty"),
+                        idea_density=data.get("idea_density"),
+                        abstraction_level=data.get("abstraction_level"),
+                        cognitive_branching=data.get("cognitive_branching"),
+                        technical_density=data.get("technical_density"),
+                        discourse_depth=data.get("discourse_depth"),
+                        lexical_retrieval_pressure=data.get("lexical_retrieval_pressure"),
+                        notes=data.get("context_notes"),
+                    )
+                    data["llm_provider"] = mode
+                    data["llm_model"] = model
+                    data["analysis_scope"] = {
+                        "student_speakers": student_speakers,
+                        "speaker_labels": speaker_labels,
+                        "speaker_scope": speaker_scope,
+                    }
+                    transcript_chars = len(text_content)
+                    chars_used = min(transcript_chars, analysis_max_chars)
+                    data["analysis_schema_version"] = AI_METRICS_SCHEMA_VERSION
+                    data["analysis_provenance"] = {
+                        "provider": mode,
+                        "model": model,
+                        "transcript_chars": transcript_chars,
+                        "transcript_chars_used": chars_used,
+                        "transcript_coverage": chars_used / transcript_chars if transcript_chars else 0,
+                        "student_scope": speaker_scope,
+                        "structured_output": mode == "ollama",
+                    }
                     self._save_json(data, output_path)
                     return True
-            except:
-                print("JSON parsing failed, attempting text scrape...")
-
-            # --- STRATEGY B: Scrape Text (Fallback) ---
-            # ... (Rest of your fallback logic remains the same) ...
-            
-            fallback_data = {
-                "grammar_score": 70,
-                "topics": ["General Conversation"],
-                "golden_words": [],
-                "corrections": 0,
-                "feedback": "Keep practicing!"
-            }
-            
-            # ... (Regex matching code) ...
-            
-            score_match = re.search(r"Score:?\**\s*(\d+)", raw_response, re.IGNORECASE)
-            if score_match: fallback_data["grammar_score"] = int(score_match.group(1))
-
-            words_section = re.search(r"Golden Words:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
-            if words_section:
-                words = re.findall(r"-\s*\*?([^\n]+)", words_section.group(1))
-                if words: 
-                    clean_words = [w.replace('*', '').strip() for w in words]
-                    fallback_data["golden_words"] = clean_words[:3]
-
-            corr_section = re.search(r"Corrections:?(.*?)(?:\n\n|\n[A-Z])", raw_response, re.DOTALL | re.IGNORECASE)
-            if corr_section:
-                count = corr_section.group(1).count("\n-")
-                if count > 0: fallback_data["corrections"] = count
-
-            self._save_json(fallback_data, output_path)
-            return True
+                raise ValueError("model response did not contain a JSON object")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self.last_ai_metrics_error = f"Invalid structured AI metrics: {exc}"
+                print(self.last_ai_metrics_error)
+                return False
 
         except Exception as e:
             print(f"Error computing AI metrics: {e}")
+            self.last_ai_metrics_error = str(e)
             return False
 
-    def _ensure_model_exists(self, model_name: str):
+    def _ensure_model_exists(self, model_name: str, api_url: Optional[str] = None):
         """
         Checks if the Ollama model exists. If not, downloads it automatically.
         """
         import subprocess
-        
+
         # 1. Setup Paths & Env (Same as your GUI logic)
         if getattr(sys, 'frozen', False):
             base_path = os.path.dirname(os.path.abspath(sys.executable))
@@ -263,15 +583,28 @@ class DiarizationPipelineRunner:
         ollama_bin = os.path.join(base_path, "deps", "ollama")
         if not os.path.exists(ollama_bin):
             ollama_bin = os.path.join(base_path, "ollama")
-            
+
         if not os.path.exists(ollama_bin):
-            print(f"WARNING: Could not find Ollama binary at {ollama_bin} to check for model.")
+            ollama_bin = shutil.which("ollama")
+
+        if not ollama_bin:
+            print("WARNING: Could not find Ollama binary to check for model.")
             return
 
         # Setup Env
         env = os.environ.copy()
-        env["OLLAMA_MODELS"] = os.path.expanduser("~/Library/Application Support/DiarizeApp/models")
-        env["OLLAMA_HOST"] = "127.0.0.1:11435"
+        env["OLLAMA_MODELS"] = ollama_models_dir()
+        if api_url:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(api_url)
+            env["OLLAMA_HOST"] = parsed.netloc or "127.0.0.1:11435"
+        else:
+            env["OLLAMA_HOST"] = "127.0.0.1:11435"
+
+        if not self._wait_for_ollama_ready(ollama_bin, env):
+            print("WARNING: Ollama server is not ready yet; skipping auto-download.")
+            return
 
         # 2. Check if model exists
         try:
@@ -280,25 +613,122 @@ class DiarizationPipelineRunner:
                 [ollama_bin, "list"], 
                 env=env, 
                 capture_output=True, 
-                text=True
+                text=True,
+                timeout=30,
             )
+
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()
+                stdout = (result.stdout or "").strip()
+                print(f"Failed to list Ollama models (exit {result.returncode}).")
+                if stdout:
+                    print(f"stdout: {stdout}")
+                if stderr:
+                    print(f"stderr: {stderr}")
+                return
             
             if model_name not in result.stdout:
                 print(f"Model '{model_name}' not found. Downloading automatically... (This may take time)")
                 self._set_status(f"Downloading AI model ({model_name})...")
                 
                 # Run Pull
-                subprocess.run(
+                pull_result = subprocess.run(
                     [ollama_bin, "pull", model_name], 
                     env=env, 
-                    check=True
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
                 )
+                if pull_result.returncode != 0:
+                    stderr = (pull_result.stderr or "").strip()
+                    stdout = (pull_result.stdout or "").strip()
+                    print(f"Failed to download model '{model_name}' (exit {pull_result.returncode}).")
+                    if stdout:
+                        print(f"stdout: {stdout}")
+                    if stderr:
+                        print(f"stderr: {stderr}")
+                    return
+
                 print(f"Model '{model_name}' downloaded successfully.")
             else:
                 print(f"Model '{model_name}' is ready.")
 
         except Exception as e:
             print(f"Failed to auto-download model: {e}")
+
+    def _wait_for_ollama_ready(self, ollama_bin: str, env: dict, timeout_s: int = 30) -> bool:
+        """
+        Wait until the bundled Ollama server responds to `ollama list`.
+        """
+        import subprocess
+
+        deadline = time.time() + timeout_s
+        last_error = None
+        while time.time() < deadline:
+            try:
+                result = subprocess.run(
+                    [ollama_bin, "list"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    return True
+
+                stderr = (result.stderr or "").strip()
+                stdout = (result.stdout or "").strip()
+                last_error = stderr or stdout or f"exit {result.returncode}"
+            except Exception as e:
+                last_error = str(e)
+
+            time.sleep(0.5)
+
+        print(f"WARNING: Ollama server at {env.get('OLLAMA_HOST')} was not ready after {timeout_s}s: {last_error}")
+        return False
+
+    def _current_runtime_flags(self) -> dict:
+        return {
+            "apple_silicon": is_apple_silicon(),
+        }
+
+    def _build_processing_notes(self, meta: dict) -> List[str]:
+        notes = []
+        for key in ("notes", "warnings", "limitations"):
+            value = meta.get(key)
+            if isinstance(value, list):
+                notes.extend([str(v) for v in value if v])
+            elif isinstance(value, str) and value:
+                notes.append(value)
+        return notes
+
+    def _speaker_labels_from_result(self, result: dict) -> List[str]:
+        speakers = []
+        for seg in result.get("segments", []) if result else []:
+            speaker = seg.get("speaker")
+            if speaker and speaker not in speakers:
+                speakers.append(speaker)
+        return speakers
+
+    def _segments_to_text(
+        self,
+        segments: List[dict],
+        *,
+        include_speaker: bool = True,
+        highlight_low_confidence: bool = False,
+    ) -> str:
+        lines: List[str] = []
+        for seg in segments or []:
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+
+            speaker = seg.get("speaker", "")
+            label = f"{speaker}: " if include_speaker and speaker else ""
+            if highlight_low_confidence and seg.get("low_confidence"):
+                label = "[LOW] " + label
+            lines.append(label + text)
+        return "\n".join(lines)
 
     def process_audio(
         self,
@@ -309,121 +739,233 @@ class DiarizationPipelineRunner:
         num_speakers: Optional[int] = None,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
-       
-        ):
+        backend: str = "auto",
+        diarization_backend: str = "auto",
+        apple_compute_preference: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ):
         """
-        Run transcription + alignment + diarization on the given audio file.
+        Run transcription + diarization on the given audio file.
         """
-        
-        # REMOVED: The check for hf_token
-        
+
         self.last_audio_path = audio_path
         self.last_output_dir = output_dir
         self.last_result = None
         self.last_diar_df = None
+        self.last_preprocessed_audio_path = None
+        self.last_processing_meta = {}
 
-        self._set_status("Detecting device...")
-        self._set_progress(5)
-        device = detect_device()
-        compute_type = "int8" if device == "cpu" else "float16"
+        total_steps = 8
 
-        self._set_status(f"Loading WhisperX model ({model_size}) on {device}...")
-        self._set_progress(15)
-        model = whisperx.load_model(
-            model_size, device=device, compute_type=compute_type
-        )
+        self._set_step(1, total_steps, "Preparing audio...", 5)
+        cache_dir = os.path.join(output_dir, ".cache")
+        preprocess = preprocess_audio_mono_16k(audio_path, cache_dir)
+        self.last_preprocessed_audio_path = preprocess.normalized_path
 
-        self._set_status("Loading audio...")
-        self._set_progress(25)
-        audio = whisperx.load_audio(audio_path)
+        self._set_step(2, total_steps, "Selecting ASR and diarization backends...", 12)
+        asr_backend, asr_resolution = resolve_asr_backend(backend)
+        diar_backend, diar_resolution = resolve_diarization_backend(diarization_backend)
 
-        self._set_status("Transcribing...")
-        self._set_progress(50)
-        result = model.transcribe(audio, language=language, task="transcribe")
+        if batch_size is None:
+            preset = (apple_compute_preference or "balanced").strip().lower()
+            batch_size = {"memory_saver": 1, "balanced": 2, "quality": 4}.get(preset, 2)
 
-        self._set_status("Loading alignment model...")
-        self._set_progress(60)
-        align_model, metadata = whisperx.load_align_model(
-            language_code=result["language"], device=device
-        )
+        device_hint = detect_device()
+        asr_config = {
+            "device": device_hint,
+            "compute_type": "int8" if device_hint == "cpu" else "float16",
+            "batch_size": batch_size,
+            "apple_compute_preference": apple_compute_preference,
+            "status_callback": lambda text: self._set_step(3, total_steps, text),
+            "progress_callback": self._set_progress,
+        }
 
-        self._set_status("Aligning words...")
-        self._set_progress(70)
-        result = whisperx.align(
-            result["segments"],
-            align_model,
-            metadata,
-            audio,
-            device,
-            return_char_alignments=False,
-        )
-
-        # --- CHANGED: Use Offline Loader ---
-        self._set_status("Running diarization (offline model)...")
-        self._set_progress(85)
-
-        # Use the helper we wrote to load local files
-        try:
-            diar_pipeline = load_offline_pipeline()
-        except Exception as e:
-            raise RuntimeError(f"Failed to load offline Pyannote model: {e}")
-
-        # Run inference
-        # new:
-        kwargs = {}
-        if num_speakers:
-            kwargs["num_speakers"] = int(num_speakers)
-        if min_speakers:
-            kwargs["min_speakers"] = int(min_speakers)
-        if max_speakers:
-            kwargs["max_speakers"] = int(max_speakers)
-
-        try:
-            annotation = diar_pipeline(audio_path, **kwargs)
-        except TypeError:
-            # If the loaded pipeline doesn't accept these kwargs for some reason,
-            # fall back gracefully.
-            annotation = diar_pipeline(audio_path)
-        # -----------------------------------
-
-        segments = []
-        for segment, _, speaker in annotation.itertracks(yield_label=True):
-            segments.append(
-                {
-                    "start": float(segment.start),
-                    "end": float(segment.end),
-                    "speaker": speaker,
-                }
+        self._set_step(3, total_steps, f"Preparing ASR backend ({asr_resolution['selected']})...", 15)
+        if asr_resolution.get("fallback"):
+            self._set_step(
+                3,
+                total_steps,
+                f"ASR fallback active: {asr_resolution['selected']} (requested {asr_resolution['requested']})",
             )
 
-        diarize_df = pd.DataFrame(segments)
+        model_requested = model_size
+        model_used = model_size
+        model_fallback = None
+        try:
+            asr_result = asr_backend.transcribe(
+                preprocess.normalized_path,
+                model_size=model_requested,
+                language=language,
+                config=asr_config,
+            )
+        except Exception as first_error:
+            if model_requested == "large-v3":
+                model_used = "turbo"
+                model_fallback = "turbo"
+                self._set_step(3, total_steps, "large-v3 failed; retrying with turbo...", 18)
+                try:
+                    asr_result = asr_backend.transcribe(
+                        preprocess.normalized_path,
+                        model_size=model_used,
+                        language=language,
+                        config=asr_config,
+                    )
+                except Exception:
+                    raise first_error
+            else:
+                raise
 
-        self._set_status("Assigning speakers to words/segments...")
-        result = whisperx.assign_word_speakers(diarize_df, result)
+        self._set_step(4, total_steps, "ASR complete; starting diarization...", 84)
 
+        try:
+            diar_segments, diar_meta = diar_backend.diarize(
+                preprocess.normalized_path,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                config={
+                    "device": "cpu" if is_apple_silicon() else device_hint,
+                    "asr_segments": asr_result.segments,
+                },
+            )
+        except Exception as diar_error:
+            diar_segments = single_speaker_diarization_from_segments(asr_result.segments)
+            diar_resolution["fallback"] = "single_speaker"
+            diar_meta = {
+                "backend": "single_speaker_fallback",
+                "device": "none",
+                "error": str(diar_error),
+                "notes": [
+                    "Configured diarization backend failed, so transcript segments were labeled as a single speaker.",
+                ],
+            }
+            self._set_step(
+                4,
+                total_steps,
+                "Diarization unavailable; continuing with single speaker labels...",
+                86,
+            )
+        diarize_df = pd.DataFrame(diar_segments)
+
+        self._set_step(5, total_steps, "Cleaning transcript segments...", 88)
+        cleaned_segments, raw_segments = prepare_transcript_segments(asr_result.segments)
+        self._set_step(6, total_steps, "Assigning speakers to transcript...", 91)
+        result_segments = assign_speakers_by_overlap(cleaned_segments, diar_segments)
+        raw_segments_with_speakers = assign_speakers_by_overlap(raw_segments, diar_segments)
+
+        raw_result = {
+            "segments": raw_segments_with_speakers,
+            "language": asr_result.language,
+            "metadata": {
+                "transcription": {
+                    "backend": asr_result.backend,
+                    "device": asr_result.device,
+                    "compute_type": asr_result.compute_type,
+                    "requested_backend": asr_resolution["requested"],
+                    "selected_backend": asr_resolution["selected"],
+                    "fallback_backend": asr_resolution.get("fallback"),
+                    "model_requested": model_requested,
+                    "model_used": model_used,
+                    "model_fallback": model_fallback,
+                    "word_timestamps_available": asr_result.word_timestamps_available,
+                    "notes": asr_result.metadata,
+                },
+                "diarization": {
+                    "backend": diar_meta.get("backend", diar_backend.name),
+                    "device": diar_meta.get("device", "cpu"),
+                    "requested_backend": diar_resolution["requested"],
+                    "selected_backend": diar_resolution["selected"],
+                    "fallback_backend": diar_resolution.get("fallback"),
+                    "notes": diar_meta,
+                },
+                "audio": {
+                    "source_path": audio_path,
+                    "normalized_path": preprocess.normalized_path,
+                    "already_normalized": preprocess.already_normalized,
+                    "reused_cache": preprocess.reused_cache,
+                    "sample_rate": preprocess.sample_rate,
+                    "channels": preprocess.channels,
+                },
+            },
+        }
+
+        result = {
+            "segments": result_segments,
+            "language": asr_result.language,
+            "metadata": raw_result["metadata"],
+        }
+
+        self.last_raw_result = raw_result
         self.last_result = result
         self.last_diar_df = diarize_df
+        self.last_processing_meta = {
+            "backend": asr_resolution["selected"],
+            "backend_requested": asr_resolution["requested"],
+            "backend_fallback": asr_resolution.get("fallback"),
+            "device": asr_result.device,
+            "compute_type": asr_result.compute_type,
+            "model_size": model_requested,
+            "model_used": model_used,
+            "model_fallback": model_fallback,
+            "language": language,
+            "batch_size": batch_size,
+            "apple_compute_preference": apple_compute_preference,
+            "word_timestamps_available": asr_result.word_timestamps_available,
+            "diarization_backend": diar_resolution["selected"],
+            "diarization_backend_requested": diar_resolution["requested"],
+            "diarization_backend_fallback": diar_resolution.get("fallback"),
+            "apple_silicon": is_apple_silicon(),
+            "preprocessed_audio_path": preprocess.normalized_path,
+            "preprocess_reused_cache": preprocess.reused_cache,
+            "preprocess_already_normalized": preprocess.already_normalized,
+        }
 
-        self._set_status("Saving output files...")
-        self._set_progress(95)
+        self._set_step(7, total_steps, "Saving output files...", 95)
         os.makedirs(output_dir, exist_ok=True)
         basename = os.path.splitext(os.path.basename(audio_path))[0]
         txt_path = os.path.join(output_dir, f"{basename}_diarized.txt")
         json_path = os.path.join(output_dir, f"{basename}_diarized.json")
 
-        with open(txt_path, "w", encoding="utf-8") as f:
-            for seg in result.get("segments", []):
-                speaker = seg.get("speaker", "UNKNOWN")
-                start = format_timestamp(seg.get("start"))
-                end = format_timestamp(seg.get("end"))
-                text = seg.get("text", "").strip()
-                f.write(f"[{speaker} {start} - {end}] {text}\n")
+        raw_txt_path = os.path.join(output_dir, f"{basename}_diarized_raw.txt")
+        raw_json_path = os.path.join(output_dir, f"{basename}_diarized_raw.json")
+        cleaned_txt_path = os.path.join(output_dir, f"{basename}_diarized_cleaned.txt")
+        artifact_path = os.path.join(output_dir, f"{basename}_transcript_artifact.json")
+        highlighted_path = os.path.join(output_dir, f"{basename}_diarized_highlighted.txt")
 
+        raw_txt = self._segments_to_text(raw_segments_with_speakers, include_speaker=True)
+        cleaned_txt = self._segments_to_text(result_segments, include_speaker=True)
+        highlighted_txt = self._segments_to_text(result_segments, include_speaker=True, highlight_low_confidence=True)
+
+        with open(raw_txt_path, "w", encoding="utf-8") as f:
+            f.write(raw_txt + ("\n" if raw_txt else ""))
+        with open(cleaned_txt_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_txt + ("\n" if cleaned_txt else ""))
+        with open(highlighted_path, "w", encoding="utf-8") as f:
+            f.write(highlighted_txt + ("\n" if highlighted_txt else ""))
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_txt + ("\n" if cleaned_txt else ""))
+
+        with open(raw_json_path, "w", encoding="utf-8") as f:
+            json.dump(raw_result, f, ensure_ascii=False, indent=2)
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
+        with open(artifact_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "settings": self.last_processing_meta,
+                    "audio": raw_result["metadata"]["audio"],
+                    "raw_transcript": raw_txt,
+                    "cleaned_transcript": cleaned_txt,
+                    "highlighted_transcript": highlighted_txt,
+                    "raw_result": raw_result,
+                    "cleaned_result": result,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
 
-        self._set_status("Done")
-        self._set_progress(100)
+        self._set_step(8, total_steps, "Done", 100)
         return txt_path, json_path
 
     def get_transcript_text(
@@ -471,25 +1013,37 @@ class DiarizationPipelineRunner:
         base_url = api_url.rsplit("/api/", 1)[0]
         tags_url = f"{base_url}/api/tags"
 
+        # Give the bundled server a short grace period to come up.
+        deadline = time.time() + 15
+        last_error = None
+        while time.time() < deadline:
+            try:
+                resp = requests.get(tags_url, timeout=3)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    available_models = [m.get("name", "") for m in data.get("models", [])]
+
+                    # Simple check: exact match or match before colon
+                    # e.g. "mistral" matches "mistral:latest"
+                    for avail in available_models:
+                        if avail == model_name:
+                            return True
+                        if ":" in avail and avail.split(":")[0] == model_name:
+                            return True
+                    return False
+
+                last_error = f"HTTP {resp.status_code}"
+            except Exception as e:
+                last_error = str(e)
+
+            time.sleep(0.5)
+
         try:
-            resp = requests.get(tags_url, timeout=3)
-            if resp.status_code != 200:
-                return False
-            data = resp.json()
-            # data['models'] is a list of dicts: [{'name': 'mistral:latest', ...}, ...]
-            available_models = [m.get("name", "") for m in data.get("models", [])]
-            
-            # Simple check: exact match or match before colon
-            # e.g. "mistral" matches "mistral:latest"
-            for avail in available_models:
-                if avail == model_name:
-                    return True
-                if ":" in avail and avail.split(":")[0] == model_name:
-                    return True
-            return False
+            print(f"WARNING: Ollama tags endpoint was not reachable: {last_error}")
         except Exception:
             # If Ollama is down or network error, assume False
             return False
+        return False
 
     def analyze_with_llm(
         self,
@@ -499,8 +1053,10 @@ class DiarizationPipelineRunner:
         api_key: Optional[str] = None,
         provider: str = "ollama",
         speakers: Optional[List[str]] = None,
-        max_chars: int = 25000,
+        max_chars: int = DEFAULT_MAX_CHARS,
         external_text: Optional[str] = None,
+        response_format: Optional[dict] = None,
+        context_tokens: Optional[int] = None,
     ) -> str:
         if not user_prompt.strip():
             raise ValueError("Prompt is empty.")
@@ -528,20 +1084,27 @@ class DiarizationPipelineRunner:
 
         if provider == "openai":
             from .openai_provider import OpenAIProvider
-            client = OpenAIProvider(api_key=api_key, model=model or "gpt-4o")
+            client = OpenAIProvider(api_key=api_key, model=model or "gpt-5.4")
             self._set_status(f"Calling OpenAI ({client.model})...")
             self._set_progress(50)
             return client.analyze(combined_prompt)
             
         elif provider == "ollama":
             target_url = api_url or "http://127.0.0.1:11435/api/generate"
-            target_model = model or "llama3.2"
+            target_model = model or DEFAULT_OLLAMA_ANALYSIS_MODEL
 
             payload = {
                 "model": target_model,
                 "prompt": combined_prompt,
                 "stream": False,
+                "options": {
+                    "temperature": 0,
+                    "seed": 42,
+                    "num_ctx": int(context_tokens or DEFAULT_OLLAMA_CONTEXT_TOKENS),
+                },
             }
+            if response_format:
+                payload["format"] = response_format
 
             self._set_status(f"Calling Ollama ({target_model})...")
             
@@ -552,7 +1115,7 @@ class DiarizationPipelineRunner:
                 # Custom Error Handling for 404 (Model Not Found)
                 if resp.status_code == 404:
                     print(f"ERROR: Ollama returned 404. It likely cannot find model '{target_model}' or the URL '{target_url}' is wrong.")
-                    return "Error: Model not found. Please run 'ollama pull llama3.2' in terminal."
+                    return f"Error: Model not found. Please run 'ollama pull {target_model}' in terminal."
                     
                 resp.raise_for_status()
                 data = resp.json()
@@ -579,7 +1142,9 @@ class DiarizationPipelineRunner:
         """
         meta_path = os.path.join(lesson_dir, "meta.json")
         seg_path = os.path.join(lesson_dir, "segments.json")
+        raw_seg_path = os.path.join(lesson_dir, "segments_raw.json")
         diar_path = os.path.join(lesson_dir, "diarization.json")
+        artifact_path = os.path.join(lesson_dir, "transcript_artifact.json")
 
         if not os.path.isfile(seg_path):
             raise FileNotFoundError(f"Missing segments.json in {lesson_dir}")
@@ -590,12 +1155,34 @@ class DiarizationPipelineRunner:
         # segments.json is a list of segments; pipeline expects {"segments": [...]}
         self.last_result = {"segments": segments}
         self.last_output_dir = lesson_dir
+        self.last_raw_result = self.last_result
+
+        if os.path.isfile(raw_seg_path):
+            try:
+                with open(raw_seg_path, "r", encoding="utf-8") as f:
+                    raw_segments = json.load(f) or []
+                self.last_raw_result = {"segments": raw_segments}
+            except Exception:
+                pass
 
         # Load meta (optional)
         meta = {}
         if os.path.isfile(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f) or {}
+        if os.path.isfile(artifact_path):
+            try:
+                with open(artifact_path, "r", encoding="utf-8") as f:
+                    artifact = json.load(f) or {}
+                if artifact.get("settings"):
+                    self.last_processing_meta = artifact["settings"]
+            except Exception:
+                artifact = {}
+        if not self.last_processing_meta:
+            self.last_processing_meta = meta.get("processing", meta.get("backend_info", {})) or {
+                "backend": meta.get("asr_backend"),
+                "diarization_backend": meta.get("diarization_backend"),
+            }
 
         # Option (2): use original audio path from meta, but only if it still exists
         # Support multiple historical key names to be robust:
@@ -609,6 +1196,16 @@ class DiarizationPipelineRunner:
             self.last_audio_path = audio_path
         else:
             self.last_audio_path = None
+
+        normalized_audio_path = (
+            meta.get("normalized_audio_path")
+            or meta.get("cached_audio_path")
+            or os.path.join(lesson_dir, "normalized_audio.wav")
+        )
+        if normalized_audio_path and os.path.isfile(normalized_audio_path):
+            self.last_preprocessed_audio_path = normalized_audio_path
+        else:
+            self.last_preprocessed_audio_path = None
 
         # diarization df optional (needed for speaker WAV export)
         if os.path.isfile(diar_path):
@@ -671,24 +1268,66 @@ class DiarizationPipelineRunner:
 
         os.makedirs(lesson_dir, exist_ok=True)
 
-        # 1) transcript.txt (human-readable)
-        transcript_path = os.path.join(lesson_dir, "transcript.txt")
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            f.write(self.get_transcript_text(include_speaker=True))
+        raw_segments = (self.last_raw_result or self.last_result or {}).get("segments", [])
+        cleaned_segments = (self.last_result or {}).get("segments", [])
 
-        # 2) segments.json (canonical for future features)
+        raw_segments_clean = []
+        for seg in raw_segments:
+            raw_segments_clean.append(
+                {
+                    "start": float(seg.get("start") or 0.0),
+                    "end": float(seg.get("end") or 0.0),
+                    "speaker": seg.get("speaker") or "UNKNOWN",
+                    "text": (seg.get("raw_text") or seg.get("text") or "").strip(),
+                    "confidence": float(seg.get("confidence") or 0.0) if seg.get("confidence") is not None else None,
+                    "low_confidence": bool(seg.get("low_confidence", False)),
+                    "confidence_reasons": seg.get("confidence_reasons", []),
+                }
+            )
+
         segments_clean = []
-        for seg in self.last_result["segments"]:
+        for seg in cleaned_segments:
             segments_clean.append(
                 {
                     "start": float(seg.get("start") or 0.0),
                     "end": float(seg.get("end") or 0.0),
                     "speaker": seg.get("speaker") or "UNKNOWN",
                     "text": (seg.get("text") or "").strip(),
+                    "raw_text": (seg.get("raw_text") or "").strip() or None,
+                    "cleaned_text": (seg.get("cleaned_text") or seg.get("text") or "").strip(),
+                    "confidence": float(seg.get("confidence") or 0.0) if seg.get("confidence") is not None else None,
+                    "low_confidence": bool(seg.get("low_confidence", False)),
+                    "confidence_reasons": seg.get("confidence_reasons", []),
+                    "cleanup_applied": bool(seg.get("cleanup_applied", False)),
                 }
             )
 
+        raw_transcript = self._segments_to_text(raw_segments, include_speaker=True)
+        cleaned_transcript = self._segments_to_text(cleaned_segments, include_speaker=True)
+        highlighted_transcript = self._segments_to_text(
+            cleaned_segments,
+            include_speaker=True,
+            highlight_low_confidence=True,
+        )
+
+        transcript_raw_path = os.path.join(lesson_dir, "transcript_raw.txt")
+        transcript_cleaned_path = os.path.join(lesson_dir, "transcript_cleaned.txt")
+        transcript_highlighted_path = os.path.join(lesson_dir, "transcript_cleaned_highlighted.txt")
+        transcript_path = os.path.join(lesson_dir, "transcript.txt")
+        segments_raw_path = os.path.join(lesson_dir, "segments_raw.json")
         segments_path = os.path.join(lesson_dir, "segments.json")
+
+        with open(transcript_raw_path, "w", encoding="utf-8") as f:
+            f.write(raw_transcript)
+        with open(transcript_cleaned_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_transcript)
+        with open(transcript_highlighted_path, "w", encoding="utf-8") as f:
+            f.write(highlighted_transcript)
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_transcript)
+
+        with open(segments_raw_path, "w", encoding="utf-8") as f:
+            json.dump(raw_segments_clean, f, ensure_ascii=False, indent=2)
         with open(segments_path, "w", encoding="utf-8") as f:
             json.dump(segments_clean, f, ensure_ascii=False, indent=2)
 
@@ -715,6 +1354,12 @@ class DiarizationPipelineRunner:
             if not os.path.isfile(dst):
                 shutil.copy2(self.last_audio_path, dst)
 
+        normalized_audio_path = None
+        if self.last_preprocessed_audio_path and os.path.isfile(self.last_preprocessed_audio_path):
+            normalized_audio_path = os.path.join(lesson_dir, "normalized_audio.wav")
+            if not os.path.isfile(normalized_audio_path):
+                shutil.copy2(self.last_preprocessed_audio_path, normalized_audio_path)
+
         # 4) meta.json
         meta = {
             "processed_at": datetime.now().isoformat(timespec="seconds"),
@@ -731,10 +1376,35 @@ class DiarizationPipelineRunner:
             "contextual": contextual,
             "llm_provider": llm_provider,
             "llm_model": llm_model,
+            "raw_transcript_file": "transcript_raw.txt",
+            "cleaned_transcript_file": "transcript_cleaned.txt",
+            "highlighted_transcript_file": "transcript_cleaned_highlighted.txt",
+            "raw_segments_file": "segments_raw.json",
+            "asr_backend": self.last_processing_meta.get("backend"),
+            "asr_backend_requested": self.last_processing_meta.get("backend_requested"),
+            "asr_backend_fallback": self.last_processing_meta.get("backend_fallback"),
+            "diarization_backend": self.last_processing_meta.get("diarization_backend"),
+            "diarization_backend_requested": self.last_processing_meta.get("diarization_backend_requested"),
+            "diarization_backend_fallback": self.last_processing_meta.get("diarization_backend_fallback"),
+            "device": self.last_processing_meta.get("device"),
+            "compute_type": self.last_processing_meta.get("compute_type"),
+            "batch_size": self.last_processing_meta.get("batch_size"),
+            "apple_compute_preference": self.last_processing_meta.get("apple_compute_preference"),
+            "word_timestamps_available": self.last_processing_meta.get("word_timestamps_available"),
+            "apple_silicon": self.last_processing_meta.get("apple_silicon"),
+            "preprocess_reused_cache": self.last_processing_meta.get("preprocess_reused_cache"),
+            "preprocess_already_normalized": self.last_processing_meta.get("preprocess_already_normalized"),
+            "normalized_audio_path": normalized_audio_path,
+            "processing": self.last_processing_meta,
             "files": {
                 "transcript": "transcript.txt",
+                "transcript_raw": "transcript_raw.txt",
+                "transcript_cleaned": "transcript_cleaned.txt",
                 "segments": "segments.json",
+                "segments_raw": "segments_raw.json",
                 "diarization": "diarization.json" if diar_path else None,
+                "normalized_audio": "normalized_audio.wav" if normalized_audio_path else None,
+                "transcript_artifact": "transcript_artifact.json",
             },
         }
         if extra_meta:
@@ -744,42 +1414,38 @@ class DiarizationPipelineRunner:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
+        artifact_path = os.path.join(lesson_dir, "transcript_artifact.json")
+        with open(artifact_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "settings": {
+                        "asr_backend": self.last_processing_meta.get("backend"),
+                        "asr_backend_requested": self.last_processing_meta.get("backend_requested"),
+                        "asr_backend_fallback": self.last_processing_meta.get("backend_fallback"),
+                        "diarization_backend": self.last_processing_meta.get("diarization_backend"),
+                        "diarization_backend_requested": self.last_processing_meta.get("diarization_backend_requested"),
+                        "diarization_backend_fallback": self.last_processing_meta.get("diarization_backend_fallback"),
+                        "device": self.last_processing_meta.get("device"),
+                        "compute_type": self.last_processing_meta.get("compute_type"),
+                        "model_size": whisper_model_size,
+                        "language": language,
+                        "batch_size": self.last_processing_meta.get("batch_size"),
+                        "apple_compute_preference": self.last_processing_meta.get("apple_compute_preference"),
+                        "apple_silicon": self.last_processing_meta.get("apple_silicon"),
+                    },
+                    "raw_transcript": raw_transcript,
+                    "cleaned_transcript": cleaned_transcript,
+                    "highlighted_transcript": highlighted_transcript,
+                    "raw_segments": raw_segments_clean,
+                    "cleaned_segments": segments_clean,
+                    "duration_sec": self._lesson_duration_sec(),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
         return meta
-
-    def load_lesson_artifacts(self, lesson_dir: str):
-        """
-        Restore last_result/last_diar_df/last_audio_path from a lesson folder.
-        Enables export_srt/export_txt and export_speaker_audios (if audio path exists).
-        """
-        meta_path = os.path.join(lesson_dir, "meta.json")
-        seg_path = os.path.join(lesson_dir, "segments.json")
-        diar_path = os.path.join(lesson_dir, "diarization.json")
-
-        if not os.path.isfile(seg_path):
-            raise FileNotFoundError(f"Missing segments.json in {lesson_dir}")
-
-        with open(seg_path, "r", encoding="utf-8") as f:
-            segments = json.load(f)
-
-        self.last_result = {"segments": segments}
-        self.last_output_dir = lesson_dir
-
-        # optional meta
-        if os.path.isfile(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            self.last_audio_path = meta.get("source_audio_path")
-        else:
-            self.last_audio_path = None
-
-        # diarization df optional
-        if os.path.isfile(diar_path):
-            with open(diar_path, "r", encoding="utf-8") as f:
-                diar = json.load(f)
-            self.last_diar_df = pd.DataFrame(diar)
-        else:
-            self.last_diar_df = None
-
 
     def export_txt(self, txt_path: str):
         if not self.last_result or "segments" not in self.last_result:
@@ -838,8 +1504,10 @@ class DiarizationPipelineRunner:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        audio = whisperx.load_audio(self.last_audio_path)
-        sr = 16000
+        audio_source = self.last_preprocessed_audio_path if self.last_preprocessed_audio_path else self.last_audio_path
+        audio, sr = sf.read(audio_source, dtype="float32", always_2d=False)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
 
         basename = os.path.splitext(os.path.basename(self.last_audio_path))[0]
 

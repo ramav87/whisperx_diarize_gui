@@ -1,0 +1,9 @@
+{
+  "name": "Diarize",
+  "short_name": "Diarize",
+  "start_url": "/app/",
+  "display": "standalone",
+  "background_color": "#f4f7f2",
+  "theme_color": "#13251d",
+  "description": "Record, process, review, and analyze diarized language lessons."
+}
