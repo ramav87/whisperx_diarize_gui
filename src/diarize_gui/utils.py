@@ -3,12 +3,9 @@ Utility functions for hardware detection, timestamp formatting, and config helpe
 """
 
 import base64
-import os
 import platform
 import sys
 from typing import Dict, Optional
-
-import torch
 
 
 def detect_device() -> str:
@@ -17,6 +14,8 @@ def detect_device() -> str:
     WhisperX paths still prefer cuda > cpu, while Apple Silicon
     specific backends can separately use MPS when supported.
     """
+    import torch
+
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
@@ -93,7 +92,6 @@ def deobfuscate_secret(value: str) -> str:
     except Exception:
         return ""
 
-from typing import Dict, Optional
 
 # ==============================
 # OpenAI pricing (USD per 1M tokens)

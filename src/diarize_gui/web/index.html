@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#13251d">
+    <title>Diarize</title>
+    <link rel="manifest" href="./manifest.webmanifest">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Diarize Server</p>
+        <h1>Lessons</h1>
+      </div>
+      <button id="refreshLessons" class="iconButton" type="button" title="Refresh lessons">Refresh</button>
+    </header>
+
+    <main class="layout">
+      <section class="panel capturePanel" aria-labelledby="captureTitle">
+        <div class="panelHeader">
+          <div>
+            <p class="eyebrow">Capture</p>
+            <h2 id="captureTitle">New lesson</h2>
+          </div>
+          <span id="healthBadge" class="badge">Checking</span>
+        </div>
+
+        <label class="field">
+          <span>Server</span>
+          <input id="serverUrl" type="url" inputmode="url" autocomplete="url" placeholder="Same origin">
+        </label>
+
+        <div class="gridTwo">
+          <label class="field">
+            <span>Profile</span>
+            <input id="profile" type="text" value="test">
+          </label>
+          <label class="field">
+            <span>Language</span>
+            <input id="language" type="text" value="es" maxlength="8">
+          </label>
+        </div>
+
+        <div class="gridTwo">
+          <label class="field">
+            <span>Whisper model</span>
+            <select id="modelSize">
+              <option value="small">small</option>
+              <option value="medium">medium</option>
+              <option value="large-v3" selected>large-v3</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Speakers</span>
+            <input id="numSpeakers" type="number" min="1" max="10" placeholder="auto">
+          </label>
+        </div>
+
+        <div class="recordBox">
+          <button id="recordButton" class="primaryButton" type="button">Record</button>
+          <button id="stopButton" class="secondaryButton" type="button" disabled>Stop</button>
+          <span id="recordTimer" class="timer">00:00</span>
+        </div>
+
+        <label class="fileDrop">
+          <span>Choose audio or video</span>
+          <input id="fileInput" type="file" accept="audio/*,video/*">
+        </label>
+
+        <button id="uploadButton" class="primaryButton fullWidth" type="button" disabled>Upload and process</button>
+
+        <div id="jobBox" class="jobBox hidden">
+          <div class="progressTrack"><div id="jobProgress" class="progressFill"></div></div>
+          <p id="jobMessage">Queued</p>
+        </div>
+      </section>
+
+      <section class="panel lessonsPanel" aria-labelledby="lessonsTitle">
+        <div class="panelHeader">
+          <div>
+            <p class="eyebrow">Library</p>
+            <h2 id="lessonsTitle">Recent lessons</h2>
+          </div>
+        </div>
+        <div id="lessonsList" class="lessonsList"></div>
+      </section>
+
+      <section class="panel detailPanel" aria-labelledby="detailTitle">
+        <div class="panelHeader">
+          <div>
+            <p class="eyebrow">Review</p>
+            <h2 id="detailTitle">Select a lesson</h2>
+          </div>
+          <button id="analyzeButton" class="secondaryButton" type="button" disabled>Analyze</button>
+        </div>
+
+        <div id="speakerEditor" class="speakerEditor hidden"></div>
+        <div id="statsBox" class="statsBox hidden"></div>
+        <div id="segmentsList" class="segmentsList"></div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>

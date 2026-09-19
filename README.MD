@@ -42,10 +42,57 @@ export DIARIZE_SERVER_DATA_DIR=/srv/diarize-server
 Initial API endpoints:
 
 - `GET /api/health`
+- `GET /api/capabilities`
+- `GET /api/profiles`
+- `POST /api/profiles`
+- `GET /api/profiles/{profile_id}`
+- `PUT /api/profiles/{profile_id}`
+- `PATCH /api/profiles/{profile_id}`
+- `GET /api/profiles/{profile_id}/dashboard`
+- `GET /api/profiles/{profile_id}/lessons`
+- `POST /api/profiles/{profile_id}/jobs` with multipart field `audio`
 - `POST /api/jobs` with multipart field `audio`
+- `GET /api/jobs`
 - `GET /api/jobs/{job_id}`
 - `GET /api/lessons`
 - `GET /api/lessons/{lesson_id}`
+- `GET /api/lessons/{lesson_id}/artifacts`
+- `GET /api/lessons/{lesson_id}/artifacts/{artifact_name}`
+- `GET /api/lessons/{lesson_id}/exports/transcript?variant=cleaned|raw|highlighted&format=txt|json`
+- `GET /api/lessons/{lesson_id}/exports/analysis?format=txt|json`
+- `GET /api/lessons/{lesson_id}/context`
+- `PATCH /api/lessons/{lesson_id}/context`
+- `PATCH /api/lessons/{lesson_id}/speakers`
+- `POST /api/lessons/{lesson_id}/analysis-jobs`
+- `GET /api/analysis-jobs`
+- `GET /api/analysis-jobs/{job_id}`
+
+Processing and analysis jobs are persisted under the server data directory so
+clients can recover completed job status after reconnecting. Jobs that were
+queued or running during a server restart are marked failed with an interruption
+message rather than remaining stuck.
+
+Profiles are first-class server records under the server data directory. New
+clients should create jobs and read history through profile-scoped routes such
+as `POST /api/profiles/{profile_id}/jobs` and
+`GET /api/profiles/{profile_id}/lessons`. Lessons still store their `profile`
+id in metadata, and `GET /api/lessons?profile=...` remains available as a
+compatibility route. There is intentionally no authentication yet; future hosted
+deployments should treat profiles as user-owned resources behind auth rather
+than globally trusted names.
+
+The Mac GUI defaults to server-backed processing. It uploads audio to the local
+`diarize-server`, polls the API job, then mirrors the completed lesson artifacts
+back into the selected local profile so existing desktop dashboard/history/export
+features continue to work. The processing settings still expose `Use server API`
+as an escape hatch for direct local processing when needed.
+The profile picker and History view are server-first: profiles are listed and
+created through the API, and history reads `GET /api/profiles/{profile_id}/lessons`
+before falling back to older local profile folders.
+When the GUI starts, it also starts a localhost server automatically at
+`http://127.0.0.1:8000` unless one is already running. Set
+`DIARIZE_GUI_START_SERVER=0` to disable this, or set `DIARIZE_GUI_SERVER_PORT`
+to use another local port.
 
 ## Mobile web frontend
 
@@ -213,21 +260,80 @@ On Apple Silicon Macs, the app now prefers a Mac-native ASR path by default:
 
 The diarization stage stays separate from ASR.
 
-- The standard diarization path remains `pyannote`.
-- In this app, pyannote is treated as a CPU stage by default on Apple Silicon.
-- A future Apple-native diarization hook is exposed behind `diarization_backend = speakerkit_future`, but the current standard path still uses pyannote.
+- `diarization_backend = auto` selects FluidAudio on Apple Silicon when its bundled helper is available.
+- FluidAudio uses its offline Core ML pipeline and requests Apple Neural Engine compute.
+- Pyannote remains the cross-platform fallback and runs as a CPU stage on Apple Silicon in this app.
+- `single_speaker` skips speaker separation when speaker labels are unnecessary.
 
 Audio is normalized to mono 16 kHz once and cached so ASR and diarization can reuse the same preprocessed WAV without repeating ffmpeg work.
 
 Recommended Apple Silicon settings:
 
 - `backend = auto`
-- `diarization_backend = pyannote`
+- `diarization_backend = auto`
 - `apple_compute_preference = balanced`
 - `batch_size = 1` or `2` on smaller MacBooks
 
 Notes:
 
 - `faster-whisper` / `CTranslate2` remains the non-Mac default path and does not use MPS.
+- The first FluidAudio run downloads and compiles its Core ML models; later runs reuse the local model cache.
 - Word timestamps are preserved when the backend supports them; otherwise the app keeps segment timestamps and records that limitation in the lesson metadata.
 - Bundled pyannote diarization will prefer a `pyannote-3.1` directory if you provide one later; otherwise it falls back to the existing `pyannote` bundle.
+
+## Compare Whisper vs Gemma transcription
+
+Use the comparison script to run the app's existing ASR path against a chunked
+Gemma audio transcription path on the same lesson audio:
+
+```bash
+python -m diarize_gui.compare_transcription_pipelines /path/to/lesson.wav \
+  --existing-backend auto \
+  --whisper-model small \
+  --gemma-model google/gemma-3n-E4B-it \
+  --gemma-device mps \
+  --output-dir /tmp/lesson-transcription-comparison
+```
+
+The Gemma path splits the normalized lesson audio into 30 second WAV chunks,
+transcribes each chunk with an audio-capable local/Hugging Face Gemma checkpoint,
+then writes side-by-side transcripts, segment JSON, timing, realtime factors, and
+rough text agreement metrics to `transcription_comparison.json`.
+
+By default, the comparison runner starts each transcription backend in a separate
+Python process. This avoids native library collisions between MLX, Torch, and
+other model runtimes on macOS. Use `--in-process` only when debugging the script
+itself.
+
+The Gemma runner is optional and imports `transformers` only when that path runs.
+If you only want to time the existing app ASR path first, add `--skip-gemma`.
+If you only want a low-risk Gemma smoke test, skip Whisper and run one short
+chunk first:
+
+```bash
+python -m diarize_gui.compare_transcription_pipelines /path/to/lesson.wav \
+  --skip-existing \
+  --gemma-model google/gemma-3n-E2B-it \
+  --gemma-device cpu \
+  --gemma-chunk-seconds 10 \
+  --gemma-max-chunks 1 \
+  --gemma-max-new-tokens 96 \
+  --output-dir /tmp/lesson-gemma-smoke
+```
+
+To compare both ASR paths on the same short slice before processing a full
+lesson, use `--clip-start-seconds` and `--clip-max-seconds`:
+
+```bash
+python -m diarize_gui.compare_transcription_pipelines /path/to/lesson.wav \
+  --existing-backend auto \
+  --whisper-model small \
+  --gemma-model google/gemma-3n-E2B-it \
+  --gemma-local-files-only \
+  --gemma-device cpu \
+  --clip-start-seconds 0 \
+  --clip-max-seconds 30 \
+  --gemma-chunk-seconds 10 \
+  --gemma-max-new-tokens 96 \
+  --output-dir /tmp/lesson-whisper-vs-gemma-30s
+```

@@ -4,12 +4,13 @@ import re
 import threading
 from datetime import datetime, timedelta
 from collections import defaultdict
-import tkinter as tk
+from urllib.parse import quote
 import customtkinter as ctk
 import matplotlib.pyplot as plt
 import matplotlib
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
+import requests
 from .theme import AppTheme
 from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL
 from .lesson_selection import select_all_incomplete_ai_lesson_dirs, select_pending_ai_lesson_dirs
@@ -65,11 +66,12 @@ class DashboardToolTip:
 
 
 class DashboardFrame(ctk.CTkFrame):
-    def __init__(self, master, profile_name, profile_dir, pipeline=None, **kwargs):
+    def __init__(self, master, profile_name, profile_dir, pipeline=None, server_url=None, **kwargs):
         super().__init__(master, **kwargs)
         self.profile_name = str(profile_name) if profile_name else "Student"
         self.profile_dir = profile_dir
         self.pipeline = pipeline 
+        self.server_url = server_url.rstrip("/") if isinstance(server_url, str) and server_url.strip() else None
         self.current_lesson_dir = None
         
         # Colors
@@ -116,7 +118,7 @@ class DashboardFrame(ctk.CTkFrame):
 
         self.profile_pill = ctk.CTkLabel(
             self.header_frame,
-            text="LIVE PROFILE",
+            text="SERVER PROFILE" if self.server_url else "LOCAL PROFILE",
             font=("Roboto", 10, "bold"),
             text_color=AppTheme.BTN_TEXT_ON_BLUE,
             fg_color=self.color_primary,
@@ -265,6 +267,10 @@ class DashboardFrame(ctk.CTkFrame):
         if lesson_dir is not None:
             self.current_lesson_dir = lesson_dir
         self.refresh_data()
+
+    def set_server_url(self, server_url):
+        self.server_url = server_url.rstrip("/") if isinstance(server_url, str) and server_url.strip() else None
+        self.profile_pill.configure(text="SERVER PROFILE" if self.server_url else "LOCAL PROFILE")
 
     def _create_kpi_card(self, parent, title, value, color=None):
         frame = ctk.CTkFrame(
@@ -432,13 +438,13 @@ class DashboardFrame(ctk.CTkFrame):
         dt_obj = None
         if "recorded_at" in meta and meta["recorded_at"]:
             try: dt_obj = datetime.fromisoformat(meta["recorded_at"])
-            except: pass
+            except (TypeError, ValueError): pass
         if not dt_obj and "created_at" in meta:
             try: dt_obj = datetime.fromisoformat(meta["created_at"])
-            except: pass
+            except (TypeError, ValueError): pass
         if not dt_obj:
             try: dt_obj = datetime.strptime(lesson_id.split("_")[0], "%Y%m%d")
-            except: pass
+            except (TypeError, ValueError): pass
         return dt_obj
 
     def _practice_hours_by_lesson(self, lessons_dir):
@@ -470,6 +476,8 @@ class DashboardFrame(ctk.CTkFrame):
         return practice_hours
 
     def refresh_data(self):
+        if self._refresh_from_server_dashboard():
+            return
         if not self.profile_dir or not os.path.exists(self.profile_dir): return
 
         lessons_dir = os.path.join(self.profile_dir, "lessons")
@@ -529,7 +537,7 @@ class DashboardFrame(ctk.CTkFrame):
                             golden_words_all.extend(
                                 str(w).strip() for w in golden_words if str(w).strip()
                             )
-                    except: pass
+                    except (OSError, TypeError, ValueError, json.JSONDecodeError): pass
 
                 # --- Identity Logic ---
                 student_ids = set()
@@ -622,47 +630,26 @@ class DashboardFrame(ctk.CTkFrame):
             except Exception as e:
                 print(f"Skipping {lesson_id}: {e}")
 
-        # --- UPDATE UI CARDS ---
+        summary = {
+            "lesson_count": len(os.listdir(lessons_dir)) if os.path.isdir(lessons_dir) else 0,
+            "total_hours": total_recording_sec / 3600.0,
+            "student_speaking_pct": (student_speaking_sec / total_recording_sec * 100) if total_recording_sec else 0,
+            "global_wpm": (student_total_words / (student_speaking_sec / 60)) if student_speaking_sec > 30 else 0,
+            "student_total_words": student_total_words,
+            "avg_latency_sec": (total_latency_sum / total_latency_count) if total_latency_count else 0.0,
+            "max_turn_duration_sec": max_turn_duration,
+            "average_grammar_score": None,
+            "automaticity_gap": compute_automaticity_gap(sorted(context_sessions, key=lambda x: x["date"]), window=10),
+            "golden_words": [],
+        }
+
         if not has_data:
             self.card_total_time.value_label.configure(text="0.0")
             return
-
-        total_hours = total_recording_sec / 3600.0
-        pct = (student_speaking_sec / total_recording_sec * 100) if total_recording_sec else 0
-        wpm_global = (student_total_words / (student_speaking_sec/60)) if student_speaking_sec > 30 else 0
-        avg_latency = (total_latency_sum / total_latency_count) if total_latency_count else 0.0
-        
-        self.card_total_time.value_label.configure(text=f"{total_hours:.1f}")
-        self.card_student_pct.value_label.configure(text=f"{pct:.1f}%")
-        self.card_wpm.value_label.configure(text=f"{wpm_global:.0f}")
-        self.card_words.value_label.configure(text=f"{student_total_words:,}")
-        self.card_latency.value_label.configure(text=f"{avg_latency:.2f}s")
-        self.card_max_turn.value_label.configure(text=f"{max_turn_duration:.1f}s")
-
-        # --- UPDATE AI CARDS ---
         if all_grammar_scores:
-            # Calculate Average
             scores_only = [x[1] for x in all_grammar_scores]
-            avg_gram = sum(scores_only) / len(scores_only)
-            self.card_grammar.value_label.configure(text=f"{avg_gram:.0f}/100")
-        else:
-            self.card_grammar.value_label.configure(text="--")
-
-        auto_gap = compute_automaticity_gap(sorted(context_sessions, key=lambda x: x["date"]), window=10)
-        if auto_gap["automaticity_gap"] is not None:
-            self.card_auto_gap.value_label.configure(
-                text=(
-                    f"{auto_gap['automaticity_gap']:.1f} pts\n"
-                    f"W {auto_gap['warm_session_count']} / C {auto_gap['cold_session_count']}"
-                )
-            )
-        else:
-            self.card_auto_gap.value_label.configure(
-                text=f"--\nW {auto_gap['warm_session_count']} / C {auto_gap['cold_session_count']}"
-            )
-
+            summary["average_grammar_score"] = sum(scores_only) / len(scores_only)
         if golden_words_all:
-            # Show last 3 unique words
             unique_gold = []
             seen = set()
             for w in reversed(golden_words_all):
@@ -670,21 +657,136 @@ class DashboardFrame(ctk.CTkFrame):
                     unique_gold.append(w)
                     seen.add(w)
                 if len(unique_gold) >= 3: break
+            summary["golden_words"] = unique_gold
 
-            for idx, lbl in enumerate(self.golden_word_labels):
-                if idx < len(unique_gold):
-                    lbl.configure(text=unique_gold[idx])
-                else:
-                    lbl.configure(text="--")
+        payload = {
+            "summary": summary,
+            "trends": {
+                "activity": [{"month": month, "student_words": words} for month, words in student_words_by_month.items()],
+                "fluency": [
+                    {"date": dt_obj.isoformat(), "raw_wpm": wpm, "avg_latency_sec": latency}
+                    for dt_obj, wpm, latency in fluency_trend
+                ],
+                "grammar": [
+                    {"date": dt_obj.isoformat(), "grammar_score": score}
+                    for dt_obj, score in all_grammar_scores
+                ],
+                "context": [
+                    {"date": dt_obj.isoformat(), "context_metrics": context}
+                    for dt_obj, context in context_trend
+                ],
+            },
+        }
+        self._render_dashboard_payload(payload)
+
+    def _refresh_from_server_dashboard(self):
+        if not self.server_url or not self.profile_name:
+            return False
+        try:
+            profile = quote(self.profile_name, safe="")
+            response = requests.get(f"{self.server_url}/api/profiles/{profile}/dashboard", timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return False
+            self.profile_pill.configure(text="SERVER PROFILE")
+            self.status_lbl.configure(text="")
+            self._render_dashboard_payload(payload)
+            return True
+        except Exception as e:
+            print(f"[WARN] Could not refresh dashboard from server: {e}")
+            self.profile_pill.configure(text="LOCAL FALLBACK")
+            return False
+
+    def _render_dashboard_payload(self, payload):
+        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+        trends = payload.get("trends") if isinstance(payload.get("trends"), dict) else {}
+
+        total_hours = self._number_or_zero(summary.get("total_hours"))
+        pct = self._number_or_zero(summary.get("student_speaking_pct"))
+        wpm_global = self._number_or_zero(summary.get("global_wpm"))
+        student_total_words = int(self._number_or_zero(summary.get("student_total_words")))
+        avg_latency = self._number_or_zero(summary.get("avg_latency_sec"))
+        max_turn_duration = self._number_or_zero(summary.get("max_turn_duration_sec"))
+
+        self.card_total_time.value_label.configure(text=f"{total_hours:.1f}")
+        self.card_student_pct.value_label.configure(text=f"{pct:.1f}%")
+        self.card_wpm.value_label.configure(text=f"{wpm_global:.0f}")
+        self.card_words.value_label.configure(text=f"{student_total_words:,}")
+        self.card_latency.value_label.configure(text=f"{avg_latency:.2f}s")
+        self.card_max_turn.value_label.configure(text=f"{max_turn_duration:.1f}s")
+
+        avg_grammar = self._number_or_none(summary.get("average_grammar_score"))
+        self.card_grammar.value_label.configure(text=f"{avg_grammar:.0f}/100" if avg_grammar is not None else "--")
+
+        auto_gap = summary.get("automaticity_gap") if isinstance(summary.get("automaticity_gap"), dict) else {}
+        warm_count = int(self._number_or_zero(auto_gap.get("warm_session_count")))
+        cold_count = int(self._number_or_zero(auto_gap.get("cold_session_count")))
+        gap = self._number_or_none(auto_gap.get("automaticity_gap"))
+        if gap is not None:
+            self.card_auto_gap.value_label.configure(text=f"{gap:.1f} pts\nW {warm_count} / C {cold_count}")
         else:
-            for lbl in self.golden_word_labels:
-                lbl.configure(text="No Analysis")
+            self.card_auto_gap.value_label.configure(text=f"--\nW {warm_count} / C {cold_count}")
 
-        # --- PLOTS (In Tabs) ---
+        golden_words = summary.get("golden_words") if isinstance(summary.get("golden_words"), list) else []
+        for idx, lbl in enumerate(self.golden_word_labels):
+            if idx < len(golden_words):
+                lbl.configure(text=str(golden_words[idx]))
+            else:
+                lbl.configure(text="No Analysis" if not golden_words else "--")
+
+        student_words_by_month = {
+            str(item.get("month")): int(self._number_or_zero(item.get("student_words")))
+        for item in (trends.get("activity") or [])
+            if isinstance(item, dict) and item.get("month")
+        }
+        fluency_trend = []
+        for item in (trends.get("fluency") or []):
+            if not isinstance(item, dict):
+                continue
+            dt_obj = self._parse_iso_datetime(item.get("date"))
+            raw_wpm = self._number_or_none(item.get("raw_wpm"))
+            if dt_obj and raw_wpm is not None:
+                fluency_trend.append((dt_obj, raw_wpm, self._number_or_zero(item.get("avg_latency_sec"))))
+        grammar_scores = []
+        for item in (trends.get("grammar") or []):
+            if not isinstance(item, dict):
+                continue
+            dt_obj = self._parse_iso_datetime(item.get("date"))
+            score = self._number_or_none(item.get("grammar_score"))
+            if dt_obj and score is not None:
+                grammar_scores.append((dt_obj, score))
+        context_trend = []
+        for item in (trends.get("context") or []):
+            if not isinstance(item, dict):
+                continue
+            dt_obj = self._parse_iso_datetime(item.get("date"))
+            context = item.get("context_metrics")
+            if dt_obj and isinstance(context, dict):
+                context_trend.append((dt_obj, context))
+
         self._plot_activity(student_words_by_month, self.tab_activity)
         self._plot_fluency(fluency_trend, self.tab_fluency)
-        self._plot_grammar(all_grammar_scores, self.tab_grammar)
+        self._plot_grammar(grammar_scores, self.tab_grammar)
         self._plot_context_metrics(context_trend, self.tab_context)
+
+    def _parse_iso_datetime(self, value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+
+    def _number_or_none(self, value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _number_or_zero(self, value):
+        parsed = self._number_or_none(value)
+        return parsed if parsed is not None else 0.0
 
     # --- PLOT FUNCTIONS ---
 
@@ -697,7 +799,7 @@ class DashboardFrame(ctk.CTkFrame):
         labels = []
         for k in sorted_keys:
             try: labels.append(datetime.strptime(k, "%Y-%m").strftime("%b"))
-            except: labels.append(str(k))
+            except (TypeError, ValueError): labels.append(str(k))
 
         fig, ax = plt.subplots(figsize=(5, 3.5), dpi=100)
         fig.patch.set_facecolor(self.bg_figure)

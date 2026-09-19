@@ -27,6 +27,9 @@ tmp_ret = collect_all('torchaudio'); datas += tmp_ret[0]; binaries += tmp_ret[1]
 tmp_ret = collect_all('lightning_fabric'); datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('pytorch_lightning'); datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('speechbrain'); datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('fastapi'); datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('starlette'); datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('uvicorn'); datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 hiddenimports += [
     'scipy.special.cython_special', 

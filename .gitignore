@@ -13,9 +13,11 @@ __pycache__/
 resources/ollama
 resources/pyannote/
 resources/ffmpeg/
+resources/fluidaudiocli
 
 # --- IDE & OS Metadata ---
 .DS_Store
+._*
 .vscode/
 .idea/
 

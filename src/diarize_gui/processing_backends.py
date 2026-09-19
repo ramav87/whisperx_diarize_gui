@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from .runtime_warnings import suppress_pyannote_version_check_prints
 from .utils import detect_device, is_apple_silicon
 
 
@@ -72,8 +77,8 @@ def _model_name_for_mlx(model_size: str) -> str:
     if size.startswith("mlx-community/"):
         return size
     if size.startswith("whisper-"):
-        return f"mlx-community/{size}"
-    return f"mlx-community/whisper-{size}"
+        return f"mlx-community/{size}" if size.endswith("-mlx") else f"mlx-community/{size}-mlx"
+    return f"mlx-community/whisper-{size}" if size.endswith("-mlx") else f"mlx-community/whisper-{size}-mlx"
 
 
 FILLER_WORDS = {
@@ -381,6 +386,7 @@ class WhisperXBackend(ASRBackendBase):
         language: Optional[str],
         config: Optional[dict] = None,
     ) -> ASRRunResult:
+        suppress_pyannote_version_check_prints()
         _patch_pyannote_token_alias()
         whisperx = _safe_import("whisperx")
         if whisperx is None:
@@ -548,7 +554,10 @@ class MLXWhisperBackend(ASRBackendBase):
 
 def resolve_asr_backend(preferred: str) -> Tuple[ASRBackendBase, Dict[str, Any]]:
     """
-    Returns (backend_instance, resolution_meta).
+    Resolve an ASR backend and return ``(backend, resolution_metadata)``.
+
+    On Apple Silicon, ``auto`` prefers MLX, then openai-whisper on MPS,
+    and finally WhisperX. Other platforms retain WhisperX as the default.
     """
     preferred = (preferred or "auto").strip().lower()
     resolution: Dict[str, Any] = {
@@ -589,16 +598,15 @@ def resolve_asr_backend(preferred: str) -> Tuple[ASRBackendBase, Dict[str, Any]]
         preferred = "whisperx"
 
     if not _available(preferred):
-        if on_apple and preferred == "mlx" and _available("whisper_mps"):
-            resolution["fallback"] = "whisper_mps"
-            resolution["notes"].append("MLX Whisper was unavailable, so the app fell back to openai-whisper on MPS/CPU.")
-            preferred = "whisper_mps"
-        elif _available("whisperx"):
-            resolution["fallback"] = "whisperx"
-            resolution["notes"].append("Requested backend was unavailable, so the app fell back to WhisperX.")
-            preferred = "whisperx"
-        else:
+        fallback_order = ["mlx", "whisper_mps", "whisperx"] if on_apple else ["whisperx"]
+        fallback = next((name for name in fallback_order if name != preferred and _available(name)), None)
+        if fallback is None:
             raise RuntimeError("No supported ASR backend is installed.")
+        resolution["fallback"] = fallback
+        resolution["notes"].append(
+            f"Requested backend '{preferred}' was unavailable, so the app selected '{fallback}'."
+        )
+        preferred = fallback
 
     resolution["selected"] = preferred
     return backend_map[preferred], resolution
@@ -633,6 +641,7 @@ class PyannoteDiarizationBackend(DiarizationBackendBase):
     ) -> Tuple[List[dict], Dict[str, Any]]:
         from .pyannote_offline_loader import load_pyannote_pipeline
 
+        suppress_pyannote_version_check_prints()
         pipeline = load_pyannote_pipeline()
         kwargs: Dict[str, Any] = {}
         if num_speakers:
@@ -666,8 +675,41 @@ class PyannoteDiarizationBackend(DiarizationBackendBase):
         }
 
 
-class SpeakerKitFutureBackend(DiarizationBackendBase):
-    name = "speakerkit_future"
+def find_fluidaudio_binary() -> Optional[str]:
+    """Locate the optional Apple-native FluidAudio CLI helper."""
+    configured = os.environ.get("DIARIZE_FLUIDAUDIO_BIN")
+    candidates = [configured] if configured else []
+
+    try:
+        from .pyannote_offline_loader import get_resource_base_path
+
+        resource_base = get_resource_base_path()
+        candidates.extend(
+            [
+                os.path.join(resource_base, "fluidaudiocli"),
+                os.path.join(resource_base, "deps", "fluidaudiocli"),
+            ]
+        )
+    except Exception:
+        pass
+
+    discovered = shutil.which("fluidaudiocli")
+    if discovered:
+        candidates.append(discovered)
+
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return os.path.abspath(candidate)
+    return None
+
+
+class FluidAudioDiarizationBackend(DiarizationBackendBase):
+    """Apple-native offline diarization using FluidAudio/Core ML."""
+
+    name = "fluidaudio"
+
+    def __init__(self, *, fallback_to_pyannote: bool = False):
+        self.fallback_to_pyannote = fallback_to_pyannote
 
     def diarize(
         self,
@@ -678,9 +720,93 @@ class SpeakerKitFutureBackend(DiarizationBackendBase):
         max_speakers: Optional[int] = None,
         config: Optional[dict] = None,
     ) -> Tuple[List[dict], Dict[str, Any]]:
-        raise NotImplementedError(
-            "SpeakerKit integration is not enabled yet. Use pyannote for now and plug in a future Apple-native backend later."
-        )
+        try:
+            return self._diarize_native(
+                audio_path,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+            )
+        except Exception as exc:
+            if not self.fallback_to_pyannote:
+                raise
+            segments, metadata = PyannoteDiarizationBackend().diarize(
+                audio_path,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                config=config,
+            )
+            metadata = dict(metadata)
+            metadata["fallback_backend"] = "pyannote"
+            metadata.setdefault("notes", []).append(f"FluidAudio failed; used Pyannote: {exc}")
+            return segments, metadata
+
+    def _diarize_native(
+        self,
+        audio_path: str,
+        *,
+        num_speakers: Optional[int],
+        min_speakers: Optional[int],
+        max_speakers: Optional[int],
+    ) -> Tuple[List[dict], Dict[str, Any]]:
+        binary = find_fluidaudio_binary()
+        if not binary:
+            raise FileNotFoundError(
+                "FluidAudio helper not found. Set DIARIZE_FLUIDAUDIO_BIN or install resources/fluidaudiocli."
+            )
+
+        fd, output_path = tempfile.mkstemp(prefix="diarize-fluid-", suffix=".json")
+        os.close(fd)
+        command = [
+            binary,
+            "process",
+            os.path.abspath(audio_path),
+            "--mode",
+            "offline",
+            "--compute-units",
+            "ane",
+            "--output",
+            output_path,
+        ]
+        if num_speakers:
+            command.extend(["--num-speakers", str(int(num_speakers))])
+        else:
+            if min_speakers:
+                command.extend(["--min-speakers", str(int(min_speakers))])
+            if max_speakers:
+                command.extend(["--max-speakers", str(int(max_speakers))])
+
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=900, check=False)
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "unknown FluidAudio error").strip()
+                raise RuntimeError(f"FluidAudio exited with status {completed.returncode}: {detail}")
+            with open(output_path, "r", encoding="utf-8") as handle:
+                result = json.load(handle)
+        finally:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+        segments = [
+            {
+                "start": float(item.get("startTimeSeconds", 0.0)),
+                "end": float(item.get("endTimeSeconds", 0.0)),
+                "speaker": str(item.get("speakerId", "UNKNOWN")),
+            }
+            for item in result.get("segments", [])
+        ]
+        return segments, {
+            "backend": self.name,
+            "device": "apple_neural_engine",
+            "processing_time_seconds": result.get("processingTimeSeconds"),
+            "real_time_factor": result.get("realTimeFactor"),
+            "speaker_count": result.get("speakerCount"),
+            "timings": result.get("timings"),
+            "notes": ["FluidAudio offline diarization ran locally with Core ML/ANE."],
+        }
 
 
 class SingleSpeakerDiarizationBackend(DiarizationBackendBase):
@@ -706,22 +832,36 @@ class SingleSpeakerDiarizationBackend(DiarizationBackendBase):
 
 
 def resolve_diarization_backend(preferred: str) -> Tuple[DiarizationBackendBase, Dict[str, Any]]:
-    preferred = (preferred or "pyannote").strip().lower()
+    """Resolve diarization with Apple-native Auto selection and safe fallbacks."""
+    preferred = (preferred or "auto").strip().lower()
     meta = {"requested": preferred, "selected": None, "fallback": None, "notes": []}
 
+    if preferred == "auto":
+        if is_apple_silicon() and find_fluidaudio_binary():
+            meta["selected"] = "fluidaudio"
+            meta["notes"].append("Apple Silicon detected; selected FluidAudio/Core ML diarization.")
+            return FluidAudioDiarizationBackend(fallback_to_pyannote=True), meta
+        preferred = "pyannote"
+        meta["notes"].append("FluidAudio is unavailable; selected Pyannote.")
+
     if preferred == "speakerkit_future":
-        meta["notes"].append("SpeakerKit is reserved as a future Apple-native diarization hook.")
+        meta["notes"].append("The retired SpeakerKit placeholder was migrated to Pyannote.")
         meta["fallback"] = "pyannote"
         preferred = "pyannote"
 
     backend_map = {
+        "fluidaudio": FluidAudioDiarizationBackend(),
         "pyannote": PyannoteDiarizationBackend(),
         "single_speaker": SingleSpeakerDiarizationBackend(),
-        "speakerkit_future": SpeakerKitFutureBackend(),
     }
 
     if preferred not in backend_map:
         meta["notes"].append(f"Unknown diarization backend '{preferred}', falling back to pyannote.")
+        preferred = "pyannote"
+
+    if preferred == "fluidaudio" and not find_fluidaudio_binary():
+        meta["notes"].append("FluidAudio helper is unavailable, so the app fell back to Pyannote.")
+        meta["fallback"] = "pyannote"
         preferred = "pyannote"
 
     meta["selected"] = preferred

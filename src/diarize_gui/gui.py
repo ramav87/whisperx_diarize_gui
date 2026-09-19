@@ -1,4 +1,10 @@
 import os
+
+# Some macOS conda/PyPI mixes load more than one OpenMP runtime through the
+# audio/ML stack. Set this before importing torch/whisper/pyannote paths so the
+# GUI keeps running instead of aborting during model startup.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import sys
 import threading
 import subprocess
@@ -6,7 +12,6 @@ import shutil
 import json
 import re
 from datetime import datetime
-import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
@@ -14,6 +19,8 @@ import stat
 import math
 import time
 from urllib.request import urlopen
+from urllib.parse import quote
+import requests
 from .dashboard import DashboardFrame
 from .theme import AppTheme
 from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL
@@ -21,6 +28,7 @@ from .metrics.context_adjusted import (
     build_context_metrics,
     interpretation_for_context_metrics,
 )
+from .local_server import default_local_server_url, start_local_server_if_enabled
 
 # Import backend logic
 from .utils import obfuscate_secret, deobfuscate_secret, estimate_openai_cost
@@ -569,7 +577,7 @@ class DiarizationApp:
         ToolTip(
             spk_lbl,
             "Set the expected number of speakers for diarization.\n"
-            "• Auto: WhisperX decides (may over-split).\n"
+            "• Auto: the selected diarization backend estimates the count.\n"
             "• 2 is recommended for tutor/student lessons."
         )
         spk_lbl.configure(cursor="question_arrow")
@@ -666,14 +674,14 @@ class DiarizationApp:
         diar_label.pack(side="left", padx=(0, 8))
         ToolTip(
             diar_label,
-            "Pyannote remains the default. SpeakerKit is a future Apple-native hook."
+            "Auto uses FluidAudio/Core ML on Apple Silicon when available, with Pyannote fallback."
         )
 
-        self.diar_backend_var = ctk.StringVar(value=self.profile_config.get("diarization_backend", "pyannote"))
+        self.diar_backend_var = ctk.StringVar(value=self.profile_config.get("diarization_backend", "auto"))
         self.diar_backend_menu = ctk.CTkOptionMenu(
             backend_row,
             variable=self.diar_backend_var,
-            values=["pyannote", "speakerkit_future"],
+            values=["auto", "fluidaudio", "pyannote", "single_speaker"],
             width=160,
             fg_color=AppTheme.BG_ELEVATED,
             text_color=AppTheme.TEXT_PRIMARY,
@@ -719,6 +727,33 @@ class DiarizationApp:
             button_color=AppTheme.BORDER_DIVIDER
         )
         self.batch_size_menu.pack(side="left")
+
+        server_row = ctk.CTkFrame(settings_body, fg_color="transparent")
+        server_row.pack(fill="x", pady=(10, 0))
+
+        self.server_processing_var = ctk.BooleanVar(value=bool(self.profile_config.get("server_processing_enabled", True)))
+        self.server_processing_cb = ctk.CTkCheckBox(
+            server_row,
+            text="Use server API",
+            variable=self.server_processing_var,
+            text_color=AppTheme.TEXT_PRIMARY,
+            hover_color=AppTheme.BTN_PRIMARY,
+        )
+        self.server_processing_cb.pack(side="left", padx=(0, 10))
+        ToolTip(
+            self.server_processing_cb,
+            "Send transcription and diarization to diarize-server, then mirror the lesson back into this profile.",
+        )
+
+        self.server_url_var = ctk.StringVar(value=self.profile_config.get("server_url", default_local_server_url()))
+        self.server_url_entry = ctk.CTkEntry(
+            server_row,
+            textvariable=self.server_url_var,
+            placeholder_text="http://server:8000",
+            fg_color=AppTheme.BG_ELEVATED,
+            text_color=AppTheme.TEXT_PRIMARY,
+        )
+        self.server_url_entry.pack(side="left", fill="x", expand=True)
 
         # 4. ACTION CARD (Run + Progress + Status)
         self.action_card = ctk.CTkFrame(parent, fg_color=AppTheme.BG_CARD)
@@ -1045,9 +1080,9 @@ class DiarizationApp:
 
         # recorder may not exist or may not be recording
         try:
-            rms, peak = self.recorder.get_level()  # <-- adapt name if different
+            rms, _peak = self.recorder.get_level()
         except Exception:
-            rms, peak = 0.0, 0.0
+            rms, _peak = 0.0, 0.0
 
         # Map RMS (0..1) to progress bar (0..1)
         level = max(0.0, min(1.0, rms * 4.0))  # scale so normal speech shows up
@@ -1080,6 +1115,119 @@ class DiarizationApp:
                 pass
         except Exception as e:
             messagebox.showerror("Error", f"Could not save profile config: {e}")
+        self._save_server_profile_settings(cfg)
+
+    def _server_profile_settings_from_config(self, cfg: dict) -> dict:
+        server_owned_keys = {
+            "whisper_model_size",
+            "language",
+            "contextual",
+            "asr_backend",
+            "diarization_backend",
+            "apple_compute_preference",
+            "batch_size",
+            "llm_provider",
+            "ollama_model",
+            "openai_model",
+            "analysis_lang",
+        }
+        return {key: cfg[key] for key in server_owned_keys if key in cfg}
+
+    def _server_request_json(self, method: str, path: str, payload=None, timeout: int = 10):
+        server_url = self._server_base_url()
+        url = f"{server_url}{path}"
+        if method == "GET":
+            response = requests.get(url, timeout=timeout)
+        elif method == "POST":
+            response = requests.post(url, json=payload or {}, timeout=timeout)
+        elif method == "PATCH":
+            response = requests.patch(url, json=payload or {}, timeout=timeout)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        response.raise_for_status()
+        return response.json()
+
+    def _save_server_profile_settings(self, cfg: dict):
+        if not self.profile_name:
+            return
+        try:
+            settings = self._server_profile_settings_from_config(cfg or {})
+            self._server_request_json(
+                "PATCH",
+                f"/api/profiles/{quote(self.profile_name, safe='')}",
+                {"display_name": self.profile_name, "settings": settings},
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"[WARN] Could not sync profile settings to server: {e}")
+
+    def _load_server_profiles(self):
+        try:
+            body = self._server_request_json("GET", "/api/profiles", timeout=8)
+            profiles = body.get("profiles", [])
+            if isinstance(profiles, list):
+                return sorted(
+                    [
+                        {
+                            "id": str(item.get("id") or ""),
+                            "display_name": str(item.get("display_name") or item.get("id") or ""),
+                            "settings": item.get("settings") if isinstance(item.get("settings"), dict) else {},
+                        }
+                        for item in profiles
+                        if isinstance(item, dict) and item.get("id")
+                    ],
+                    key=lambda item: item["display_name"].lower(),
+                )
+        except Exception as e:
+            print(f"[WARN] Could not load server profiles: {e}")
+        return None
+
+    def _create_server_profile(self, name: str):
+        payload = {
+            "id": name,
+            "display_name": name,
+            "settings": self._server_profile_settings_from_config(self.profile_config or {}),
+        }
+        try:
+            body = self._server_request_json("POST", "/api/profiles", payload, timeout=8)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 409:
+                body = self._server_request_json("GET", f"/api/profiles/{quote(name, safe='')}", timeout=8)
+            else:
+                raise
+        return body.get("id") or name
+
+    def _load_server_profile_config(self, profile_id: str) -> dict:
+        body = self._server_request_json("GET", f"/api/profiles/{quote(profile_id, safe='')}", timeout=8)
+        settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
+        return dict(settings)
+
+    def _activate_profile(self, profile_id: str, server_settings=None):
+        self.profile_name = profile_id
+        self.profile_label.configure(text=f"Profile: {profile_id}")
+        local_cfg = self._load_profile_config()
+        merged_cfg = dict(local_cfg)
+        if server_settings is None:
+            try:
+                server_settings = self._load_server_profile_config(profile_id)
+            except Exception as e:
+                print(f"[WARN] Could not load server profile settings: {e}")
+                server_settings = {}
+        if isinstance(server_settings, dict):
+            merged_cfg.update(server_settings)
+        self.profile_config = merged_cfg
+        self._apply_profile_config_to_controls()
+
+        if self.dashboard:
+            self.dashboard.destroy()
+        self.dashboard = DashboardFrame(
+            self.dashboard_scroll,
+            profile_name=self.profile_name,
+            profile_dir=self._profile_dir(),
+            pipeline=self.pipeline,
+            server_url=self._server_base_url(),
+        )
+        self.dashboard.pack(fill="both", expand=True)
 
     def _apply_profile_config_to_controls(self):
         cfg = self.profile_config or {}
@@ -1091,6 +1239,8 @@ class DiarizationApp:
             ("diar_backend_var", "diarization_backend"),
             ("apple_compute_var", "apple_compute_preference"),
             ("batch_size_var", "batch_size"),
+            ("server_processing_var", "server_processing_enabled"),
+            ("server_url_var", "server_url"),
         ):
             if not hasattr(self, attr):
                 continue
@@ -1100,7 +1250,7 @@ class DiarizationApp:
                 if value is not None:
                     if key == "batch_size":
                         widget_var.set(str(value))
-                    elif key == "contextual":
+                    elif key in {"contextual", "server_processing_enabled"}:
                         widget_var.set(bool(value))
                     else:
                         widget_var.set(value)
@@ -1351,11 +1501,18 @@ class DiarizationApp:
     # --- PROFILE MANAGEMENT ---
 
     def _load_existing_profiles(self):
+        server_profiles = self._load_server_profiles()
+        if server_profiles is not None:
+            return server_profiles
+
         base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
         profiles_dir = os.path.join(base_dir, "profiles")
         if not os.path.isdir(profiles_dir):
             return []
-        return sorted([n for n in os.listdir(profiles_dir) if os.path.isdir(os.path.join(profiles_dir, n))])
+        return [
+            {"id": name, "display_name": name, "settings": {}}
+            for name in sorted([n for n in os.listdir(profiles_dir) if os.path.isdir(os.path.join(profiles_dir, n))])
+        ]
 
     def _prompt_profile_on_startup(self):
         existing = self._load_existing_profiles()
@@ -1371,31 +1528,14 @@ class DiarizationApp:
         scroll.pack(fill="both", expand=True, padx=20, pady=10)
 
         # Helper to set and close
-        def select_and_close(name):
-            self.profile_name = name
-            self.profile_label.configure(text=f"Profile: {name}")
-            self.profile_config = self._load_profile_config()
-            self._apply_profile_config_to_controls()
-            
-            # --- ADD THIS BLOCK ---
-            # Reload Dashboard
-            if self.dashboard:
-                self.dashboard.destroy()
-            
-            self.dashboard = DashboardFrame(
-                self.dashboard_scroll, 
-                profile_name=self.profile_name, 
-                profile_dir=self._profile_dir(),
-                pipeline=self.pipeline  
-            )
-            self.dashboard.pack(fill="both", expand=True)
-            # ----------------------
-
+        def select_and_close(profile):
+            self._activate_profile(profile["id"], profile.get("settings"))
             win.destroy()
 
-        for name in existing:
-            btn = ctk.CTkButton(scroll, text=name, fg_color="transparent", border_width=1, 
-                                command=lambda n=name: select_and_close(n))
+        for profile in existing:
+            label = profile.get("display_name") or profile.get("id")
+            btn = ctk.CTkButton(scroll, text=label, fg_color="transparent", border_width=1,
+                                command=lambda p=profile: select_and_close(p))
             btn.pack(fill="x", pady=2)
 
         ctk.CTkLabel(win, text="Or create new:").pack(pady=(10,0))
@@ -1405,7 +1545,12 @@ class DiarizationApp:
         def create_new():
             name = entry.get().strip()
             if name:
-                select_and_close(name)
+                try:
+                    profile_id = self._create_server_profile(name)
+                    settings = self._load_server_profile_config(profile_id)
+                    select_and_close({"id": profile_id, "display_name": name, "settings": settings})
+                except Exception as e:
+                    messagebox.showerror("Profile", f"Could not create server profile: {e}")
 
         ctk.CTkButton(win, text="Create & Start", command=create_new).pack(pady=10)
         win.wait_window() # Block until done
@@ -1414,10 +1559,11 @@ class DiarizationApp:
         dialog = ctk.CTkInputDialog(text="Enter new profile name:", title="New Profile")
         name = dialog.get_input()
         if name and name.strip():
-            self.profile_name = name.strip()
-            self.profile_label.configure(text=f"Profile: {self.profile_name}")
-            self.profile_config = self._load_profile_config()
-            self._apply_profile_config_to_controls()
+            try:
+                profile_id = self._create_server_profile(name.strip())
+                self._activate_profile(profile_id)
+            except Exception as e:
+                messagebox.showerror("Profile", f"Could not create or select server profile: {e}")
     
     # --- BATCH IMPORT LOGIC ---
     def run_batch_import(self):
@@ -1533,7 +1679,7 @@ class DiarizationApp:
                         ts = stat.st_birthtime
                     else:
                         ts = stat.st_mtime
-                except:
+                except OSError:
                     ts = os.path.getmtime(audio_path)
                 
                 dt_obj = datetime.fromtimestamp(ts)
@@ -1555,7 +1701,7 @@ class DiarizationApp:
                     language=language,         # <--- Use arg
                     num_speakers=num_speakers,  # <--- Use arg
                     backend=self.backend_var.get() if hasattr(self, "backend_var") else "auto",
-                    diarization_backend=self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                    diarization_backend=self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
                     apple_compute_preference=self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else None,
                     batch_size=int(self.batch_size_var.get()) if hasattr(self, "batch_size_var") and str(self.batch_size_var.get()).isdigit() else None,
                 )
@@ -1571,7 +1717,7 @@ class DiarizationApp:
                         "recorded_at": dt_obj.isoformat(),
                         "batch_imported": True,
                         "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
-                        "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                        "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
                     }
                 )
                 
@@ -1662,6 +1808,10 @@ class DiarizationApp:
 
     def _run_pipeline_thread(self):
         try:
+            if getattr(self, "server_processing_var", None) is not None and self.server_processing_var.get():
+                self._run_server_pipeline_thread()
+                return
+
             lang = self.lang_var.get()
             lang_code = LANGUAGE_MAP.get(lang)
             exp = self.exp_spk_var.get() if hasattr(self, "exp_spk_var") else "Auto"
@@ -1674,7 +1824,7 @@ class DiarizationApp:
                 language=lang_code,
                 num_speakers=num_speakers,
                 backend=self.backend_var.get() if hasattr(self, "backend_var") else "auto",
-                diarization_backend=self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                diarization_backend=self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
                 apple_compute_preference=self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else None,
                 batch_size=int(self.batch_size_var.get()) if hasattr(self, "batch_size_var") and str(self.batch_size_var.get()).isdigit() else None,
             )
@@ -1693,7 +1843,7 @@ class DiarizationApp:
                             "language": self.lang_var.get(),
                             "contextual": self.context_var.get(),
                             "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
-                            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
                             "apple_compute_preference": self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else "balanced",
                             "batch_size": self.batch_size_var.get() if hasattr(self, "batch_size_var") else "2",
                         }
@@ -1709,7 +1859,7 @@ class DiarizationApp:
                         extra_meta={
                             "recorded_at": self.recorder.recorded_at_time,
                             "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
-                            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
                         }
                     )
                     self.master.after(0, self._enforce_speaker_assignment_after_save)
@@ -1722,6 +1872,147 @@ class DiarizationApp:
             self.master.after(0, lambda: messagebox.showerror("Error", info))
         finally:
             self.master.after(0, lambda: self.run_btn.configure(state="normal", text="RUN PROCESSING"))
+
+    def _server_base_url(self):
+        value = self.server_url_var.get().strip() if hasattr(self, "server_url_var") else ""
+        return (value or default_local_server_url()).rstrip("/")
+
+    def _run_server_pipeline_thread(self):
+        lang = self.lang_var.get()
+        lang_code = LANGUAGE_MAP.get(lang)
+        exp = self.exp_spk_var.get() if hasattr(self, "exp_spk_var") else "Auto"
+        num_speakers = None if exp == "Auto" else int(exp)
+        batch_size = int(self.batch_size_var.get()) if hasattr(self, "batch_size_var") and str(self.batch_size_var.get()).isdigit() else None
+        server_url = self._server_base_url()
+
+        self._set_status("Uploading to server...")
+        self._set_progress(2)
+        self._ensure_server_profile(server_url)
+
+        data = {
+            "model_size": self.model_var.get(),
+            "backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+        }
+        if lang_code:
+            data["language"] = lang_code
+        if num_speakers is not None:
+            data["num_speakers"] = str(num_speakers)
+        if batch_size is not None:
+            data["batch_size"] = str(batch_size)
+
+        profile = quote(self.profile_name or "default", safe="")
+        with open(self.audio_path, "rb") as audio_file:
+            response = requests.post(
+                f"{server_url}/api/profiles/{profile}/jobs",
+                data=data,
+                files={"audio": (os.path.basename(self.audio_path), audio_file, "application/octet-stream")},
+                timeout=120,
+            )
+        response.raise_for_status()
+        job = response.json()
+        job_id = job["id"]
+
+        while True:
+            polled = requests.get(f"{server_url}/api/jobs/{job_id}", timeout=30)
+            polled.raise_for_status()
+            job = polled.json()
+            status = job.get("status", "unknown")
+            message = job.get("message") or status
+            progress = float(job.get("progress") or 0)
+            self._set_status(f"Server: {message}")
+            self._set_progress(progress)
+            if status == "succeeded":
+                break
+            if status == "failed":
+                raise RuntimeError(job.get("error") or "Server processing failed")
+            time.sleep(1.5)
+
+        lesson_id = job.get("lesson_id") or (job.get("result") or {}).get("lesson_id")
+        if not lesson_id:
+            raise RuntimeError("Server job completed without a lesson id.")
+
+        self._set_status("Downloading server lesson...")
+        self.current_lesson_dir = self._new_lesson_dir()
+        if not self.current_lesson_dir:
+            raise RuntimeError("Could not create local lesson mirror.")
+        self._mirror_server_lesson(server_url, lesson_id, self.current_lesson_dir)
+        self.pipeline.load_lesson_artifacts(self.current_lesson_dir)
+
+        cfg = self._load_profile_config()
+        cfg.update(
+            {
+                "server_processing_enabled": True,
+                "server_url": server_url,
+                "whisper_model_size": self.model_var.get(),
+                "language": self.lang_var.get(),
+                "contextual": self.context_var.get(),
+                "asr_backend": data["backend"],
+                "diarization_backend": data["diarization_backend"],
+                "apple_compute_preference": self.apple_compute_var.get() if hasattr(self, "apple_compute_var") else "balanced",
+                "batch_size": self.batch_size_var.get() if hasattr(self, "batch_size_var") else "2",
+            }
+        )
+        self._save_profile_config(cfg)
+        self.profile_config = cfg
+        self.has_result = True
+        self.output_dir = self.current_lesson_dir
+        self.master.after(0, lambda: self.output_label.configure(text=os.path.basename(self.current_lesson_dir)))
+        self.master.after(0, self._enable_export_buttons)
+        self.master.after(0, self._enforce_speaker_assignment_after_save)
+        self.master.after(0, lambda: messagebox.showinfo("Done", "Server processing complete."))
+        self._set_status("Complete")
+
+    def _ensure_server_profile(self, server_url: str):
+        profile = self.profile_name or "default"
+        settings = {
+            "whisper_model_size": self.model_var.get() if hasattr(self, "model_var") else "large-v3",
+            "language": self.lang_var.get() if hasattr(self, "lang_var") else "Auto-Detect",
+            "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
+            "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
+            "batch_size": self.batch_size_var.get() if hasattr(self, "batch_size_var") else "2",
+        }
+        response = requests.put(
+            f"{server_url}/api/profiles/{quote(profile, safe='')}",
+            json={"display_name": profile, "settings": settings},
+            timeout=30,
+        )
+        response.raise_for_status()
+
+    def _mirror_server_lesson(self, server_url: str, lesson_id: str, lesson_dir: str):
+        encoded_lesson = quote(lesson_id, safe="")
+        lesson = requests.get(f"{server_url}/api/lessons/{encoded_lesson}", timeout=60)
+        lesson.raise_for_status()
+        lesson_body = lesson.json()
+        artifacts = lesson_body.get("artifacts") or []
+        os.makedirs(lesson_dir, exist_ok=True)
+        for artifact in artifacts:
+            name = artifact.get("name")
+            filename = artifact.get("filename")
+            if not name or not filename:
+                continue
+            res = requests.get(
+                f"{server_url}/api/lessons/{encoded_lesson}/artifacts/{quote(name, safe='')}",
+                timeout=120,
+            )
+            if res.status_code == 404:
+                continue
+            res.raise_for_status()
+            with open(os.path.join(lesson_dir, filename), "wb") as f:
+                f.write(res.content)
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        meta = {}
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+            except Exception:
+                meta = {}
+        meta["server_url"] = server_url
+        meta["server_lesson_id"] = lesson_id
+        meta["mirrored_from_server_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
             
 
     def load_diarized_txt(self):
@@ -1746,7 +2037,7 @@ class DiarizationApp:
                             contextual=None,
                             extra_meta={
                                 "asr_backend": self.backend_var.get() if hasattr(self, "backend_var") else "auto",
-                                "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "pyannote",
+                                "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
                             },
                         )
                         self.master.after(0, self._enforce_speaker_assignment_after_save)
@@ -1758,35 +2049,94 @@ class DiarizationApp:
 
     # --- HISTORY VIEW ---
 
+    def _server_profile_lessons(self):
+        if not self.profile_name:
+            return None
+        try:
+            body = self._server_request_json(
+                "GET",
+                f"/api/profiles/{quote(self.profile_name, safe='')}/lessons",
+                timeout=12,
+            )
+            lessons = body.get("lessons", [])
+            if isinstance(lessons, list):
+                return lessons
+        except Exception as e:
+            print(f"[WARN] Could not load server history: {e}")
+        return None
+
+    def _local_lesson_dir_for_id(self, lesson_id: str) -> str:
+        base = self._profile_lessons_dir()
+        if not base:
+            base = os.path.join(self._profile_base_dir(), "profiles", self.profile_name or "default", "lessons")
+        return os.path.join(base, lesson_id)
+
+    def _ensure_history_item_local(self, item: dict) -> str:
+        lesson_dir = item.get("lesson_dir")
+        if lesson_dir and os.path.isdir(lesson_dir):
+            return lesson_dir
+
+        server_lesson_id = item.get("server_lesson_id") or item.get("lesson_id")
+        if not server_lesson_id:
+            raise RuntimeError("History item has no lesson id.")
+
+        lesson_dir = self._local_lesson_dir_for_id(server_lesson_id)
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        if not os.path.isfile(meta_path):
+            self._mirror_server_lesson(self._server_base_url(), server_lesson_id, lesson_dir)
+        return lesson_dir
+
+    def _load_history_item(self, item: dict):
+        try:
+            self._load_lesson_into_app(self._ensure_history_item_local(item))
+        except Exception as e:
+            messagebox.showerror("History", str(e))
+
+    def _open_history_item_detail(self, item: dict):
+        try:
+            self._open_lesson_detail(self._ensure_history_item_local(item))
+        except Exception as e:
+            messagebox.showerror("History", str(e))
+
     def view_history(self):
         if not self.profile_name:
             messagebox.showerror("Error", "No profile selected.")
             return
 
-        base_dir = os.path.expanduser("~/.whisperx_diarize_gui")
-        lesson_dir = os.path.join(base_dir, "profiles", self.profile_name, "lessons")
-        
-        if not os.path.isdir(lesson_dir):
+        server_lessons = self._server_profile_lessons()
+        if server_lessons is not None:
+            lessons = [
+                {
+                    "lesson_id": item.get("id"),
+                    "server_lesson_id": item.get("id"),
+                    "meta": item,
+                }
+                for item in server_lessons
+                if isinstance(item, dict) and item.get("id")
+            ]
+        else:
+            lesson_dir = self._profile_lessons_dir()
+            lessons = []
+            if lesson_dir and os.path.isdir(lesson_dir):
+                for entry in os.listdir(lesson_dir):
+                    path = os.path.join(lesson_dir, entry)
+                    meta_path = os.path.join(path, "meta.json")
+                    if os.path.isdir(path) and os.path.isfile(meta_path):
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                meta = json.load(f) or {}
+                            lessons.append({"lesson_id": entry, "lesson_dir": path, "meta": meta})
+                        except Exception:
+                            pass
+
+        if not lessons:
             messagebox.showinfo("History", "No history found for this profile.")
             return
-
-        # Load lessons from artifact folders: lessons/<lesson_id>/meta.json
-        lessons = []
-        for entry in os.listdir(lesson_dir):
-            path = os.path.join(lesson_dir, entry)
-            meta_path = os.path.join(path, "meta.json")
-            if os.path.isdir(path) and os.path.isfile(meta_path):
-                try:
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f) or {}
-                    lessons.append({"lesson_id": entry, "lesson_dir": path, "meta": meta})
-                except Exception:
-                    pass
 
         # Sort newest first (prefer created_at; fallback to folder name)
         def _sort_key(x):
             meta = x.get("meta", {}) or {}
-            return meta.get("created_at") or x.get("lesson_id") or ""
+            return meta.get("recorded_at") or meta.get("processed_at") or meta.get("created_at") or x.get("lesson_id") or ""
 
         lessons.sort(key=_sort_key, reverse=True)
 
@@ -1803,7 +2153,6 @@ class DiarizationApp:
         for item in lessons:
             meta = item.get("meta", {}) or {}
             lesson_id = item.get("lesson_id", "???")
-            ldir = item.get("lesson_dir")
 
             ts = meta.get("recorded_at") or meta.get("processed_at") or meta.get("created_at") or lesson_id
             provider = meta.get("llm_provider", meta.get("provider", "—"))
@@ -1832,14 +2181,14 @@ class DiarizationApp:
             )
             lbl.pack(side="left", padx=10, pady=8)
 
-            btn_view = ctk.CTkButton(card,text="View", width=70, command=lambda d=ldir: self._open_lesson_detail(d))
+            btn_view = ctk.CTkButton(card, text="View", width=70, command=lambda i=item: self._open_history_item_detail(i))
             btn_view.pack(side="right", padx=(6, 10), pady=10)
 
             btn = ctk.CTkButton(
-            card,
-            text="Load",
-            width=60,
-            command=lambda d=ldir: self._load_lesson_into_app(d)
+                card,
+                text="Load",
+                width=60,
+                command=lambda i=item: self._load_history_item(i)
             )
 
             btn.pack(side="right", padx=10, pady=10)
@@ -1878,7 +2227,7 @@ class DiarizationApp:
 
     def _load_lesson_into_app(self, lesson_dir: str):
         try:
-            meta = self.pipeline.load_lesson_artifacts(lesson_dir)
+            self.pipeline.load_lesson_artifacts(lesson_dir)
 
             self.current_lesson_dir = lesson_dir
             self.output_dir = lesson_dir
@@ -2973,6 +3322,7 @@ class DiarizationApp:
             try:
                 segments_path = os.path.join(lesson_dir, "segments.json")
                 transcript_path = os.path.join(lesson_dir, "transcript.txt")
+                transcript_raw_path = os.path.join(lesson_dir, "transcript_raw.txt")
                 transcript_cleaned_path = os.path.join(lesson_dir, "transcript_cleaned.txt")
                 transcript_highlighted_path = os.path.join(lesson_dir, "transcript_cleaned_highlighted.txt")
                 artifact_path = os.path.join(lesson_dir, "transcript_artifact.json")
@@ -3026,6 +3376,9 @@ class DiarizationApp:
                 if os.path.isfile(transcript_cleaned_path):
                     with open(transcript_cleaned_path, "w", encoding="utf-8") as f:
                         f.write(cleaned_text + ("\n" if cleaned_text else ""))
+                if os.path.isfile(transcript_raw_path):
+                    with open(transcript_raw_path, "w", encoding="utf-8") as f:
+                        f.write(raw_text + ("\n" if raw_text else ""))
                 if os.path.isfile(transcript_highlighted_path):
                     with open(transcript_highlighted_path, "w", encoding="utf-8") as f:
                         f.write(highlighted_text + ("\n" if highlighted_text else ""))
@@ -3173,12 +3526,16 @@ class DiarizationApp:
 
 
 def main():
+    local_server = start_local_server_if_enabled()
     root = ctk.CTk()
     app = DiarizationApp(root)
     
     def on_closing():
         # 1. Stop Ollama
         app._cleanup_ollama()
+
+        if local_server:
+            local_server.stop()
         
         # 2. Force Matplotlib to close all charts
         try:

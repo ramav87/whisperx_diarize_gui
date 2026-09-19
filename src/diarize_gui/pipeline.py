@@ -260,14 +260,31 @@ class DiarizationPipelineRunner:
         
         text_content = ""
         raw_wpm = None
+        meta = {}
+        meta_path = os.path.join(lesson_dir, "meta.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+            except Exception:
+                meta = {}
+        speaker_labels = meta.get("speaker_labels") if isinstance(meta.get("speaker_labels"), dict) else {}
+        student_speakers = [
+            str(speaker)
+            for speaker in (meta.get("student_speakers") or [])
+            if str(speaker).strip()
+        ]
         if os.path.exists(seg_path):
             try:
                 with open(seg_path, 'r', encoding='utf-8') as f:
                     segs = json.load(f)
                 for s in segs:
-                    text_content += f"{s.get('speaker', 'Unknown')}: {s.get('text', '')}\n"
+                    speaker = str(s.get("speaker", "Unknown"))
+                    label = str(speaker_labels.get(speaker) or speaker)
+                    text_content += f"{label} ({speaker}): {s.get('text', '')}\n"
                 raw_wpm = self._compute_lesson_raw_wpm(lesson_dir, segs)
-            except: pass
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
         
         if not text_content and os.path.exists(transcript_path):
             with open(transcript_path, 'r', encoding='utf-8') as f:
@@ -283,8 +300,16 @@ class DiarizationPipelineRunner:
         )
 
         # 2. Strict Prompt
+        scope_line = ""
+        if student_speakers:
+            scope_line = (
+                "Evaluate only these learner/student speaker IDs: "
+                f"{', '.join(student_speakers)}.\n"
+                "Use tutor/teacher lines only as conversation context, not as learner errors.\n\n"
+            )
         prompt = (
             "Analyze this language lesson. Identify the Student's mistakes.\n"
+            f"{scope_line}"
             "Respond with a strict JSON object using these keys:\n"
             "grammar_score (0-100), topics (list of 3 strings), golden_words (list of 3 complex words), corrections (int), feedback (string), "
             "topic_difficulty (number 1-5), idea_density (number 1-5), abstraction_level (number 1-10), "
@@ -359,9 +384,13 @@ class DiarizationPipelineRunner:
                     )
                     data["llm_provider"] = mode
                     data["llm_model"] = model
+                    data["analysis_scope"] = {
+                        "student_speakers": student_speakers,
+                        "speaker_labels": speaker_labels,
+                    }
                     self._save_json(data, output_path)
                     return True
-            except:
+            except (TypeError, ValueError, json.JSONDecodeError):
                 print("JSON parsing failed, attempting text scrape...")
 
             # --- STRATEGY B: Scrape Text (Fallback) ---
@@ -376,6 +405,10 @@ class DiarizationPipelineRunner:
                 "context_metrics": build_context_metrics(raw_grammar_score=70, raw_wpm=raw_wpm),
                 "llm_provider": mode,
                 "llm_model": model,
+                "analysis_scope": {
+                    "student_speakers": student_speakers,
+                    "speaker_labels": speaker_labels,
+                },
             }
             
             # ... (Regex matching code) ...
@@ -573,7 +606,7 @@ class DiarizationPipelineRunner:
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
         backend: str = "auto",
-        diarization_backend: str = "pyannote",
+        diarization_backend: str = "auto",
         apple_compute_preference: Optional[str] = None,
         batch_size: Optional[int] = None,
     ):

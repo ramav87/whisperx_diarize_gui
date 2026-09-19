@@ -17,6 +17,13 @@ mkdir -p "$BASE_DIR/deps"
 cp resources/ollama "$BASE_DIR/deps/ollama"
 chmod +x "$BASE_DIR/deps/ollama"
 
+# --- A2. Copy FluidAudio Apple-native diarization helper when available ---
+if [ -f resources/fluidaudiocli ]; then
+    echo "Injecting FluidAudio diarization helper..."
+    cp resources/fluidaudiocli "$BASE_DIR/deps/fluidaudiocli"
+    chmod +x "$BASE_DIR/deps/fluidaudiocli"
+fi
+
 # --- B. Copy Pyannote Models (New) ---
 echo "Injecting Pyannote models..."
 # Create the parent 'models' folder

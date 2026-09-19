@@ -111,7 +111,7 @@ def load_offline_pipeline():
         if os.path.exists(tmp_config_path):
             try:
                 os.remove(tmp_config_path)
-            except:
+            except OSError:
                 pass
 
 

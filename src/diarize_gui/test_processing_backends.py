@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -7,16 +8,39 @@ from unittest.mock import patch
 from diarize_gui.pipeline import DiarizationPipelineRunner
 from diarize_gui.processing_backends import (
     ASRRunResult,
+    FluidAudioDiarizationBackend,
+    _model_name_for_mlx,
     assign_speakers_by_overlap,
     clean_transcript_text,
     prepare_transcript_segments,
     resolve_asr_backend,
+    resolve_diarization_backend,
     single_speaker_diarization_from_segments,
 )
 
 
 class ProcessingBackendTests(unittest.TestCase):
+    def test_mlx_whisper_model_names_use_existing_hf_repos(self):
+        self.assertEqual(_model_name_for_mlx("small"), "mlx-community/whisper-small-mlx")
+        self.assertEqual(_model_name_for_mlx("whisper-small"), "mlx-community/whisper-small-mlx")
+        self.assertEqual(_model_name_for_mlx("mlx-community/whisper-small-mlx"), "mlx-community/whisper-small-mlx")
+
     def test_auto_prefers_mlx_on_apple_silicon(self):
+        with patch("diarize_gui.processing_backends.is_apple_silicon", return_value=True), patch(
+            "diarize_gui.processing_backends._safe_import"
+        ) as safe_import:
+            def _fake_import(name):
+                if name in {"mlx_whisper", "whisperx", "whisper"}:
+                    return object()
+                return None
+
+            safe_import.side_effect = _fake_import
+            backend, meta = resolve_asr_backend("auto")
+
+        self.assertEqual(backend.name, "mlx")
+        self.assertEqual(meta["selected"], "mlx")
+
+    def test_mlx_can_still_be_selected_explicitly_on_apple_silicon(self):
         with patch("diarize_gui.processing_backends.is_apple_silicon", return_value=True), patch(
             "diarize_gui.processing_backends._safe_import"
         ) as safe_import:
@@ -26,10 +50,45 @@ class ProcessingBackendTests(unittest.TestCase):
                 return None
 
             safe_import.side_effect = _fake_import
-            backend, meta = resolve_asr_backend("auto")
+            backend, meta = resolve_asr_backend("mlx")
 
         self.assertEqual(backend.name, "mlx")
         self.assertEqual(meta["selected"], "mlx")
+
+    def test_unavailable_explicit_mlx_uses_next_apple_backend(self):
+        with patch("diarize_gui.processing_backends.is_apple_silicon", return_value=True), patch(
+            "diarize_gui.processing_backends._safe_import"
+        ) as safe_import:
+            safe_import.side_effect = lambda name: object() if name in {"whisper", "whisperx"} else None
+            backend, meta = resolve_asr_backend("mlx")
+
+        self.assertEqual(backend.name, "whisper_mps")
+        self.assertEqual(meta["fallback"], "whisper_mps")
+
+    def test_auto_prefers_openai_whisper_when_mlx_unavailable(self):
+        with patch("diarize_gui.processing_backends.is_apple_silicon", return_value=True), patch(
+            "diarize_gui.processing_backends._safe_import"
+        ) as safe_import:
+            def _fake_import(name):
+                if name in {"whisperx", "whisper"}:
+                    return object()
+                return None
+
+            safe_import.side_effect = _fake_import
+            backend, meta = resolve_asr_backend("auto")
+
+        self.assertEqual(backend.name, "whisper_mps")
+        self.assertEqual(meta["selected"], "whisper_mps")
+
+    def test_auto_falls_back_to_whisperx_when_apple_backends_are_unavailable(self):
+        with patch("diarize_gui.processing_backends.is_apple_silicon", return_value=True), patch(
+            "diarize_gui.processing_backends._safe_import"
+        ) as safe_import:
+            safe_import.side_effect = lambda name: object() if name == "whisperx" else None
+            backend, meta = resolve_asr_backend("auto")
+
+        self.assertEqual(backend.name, "whisperx")
+        self.assertEqual(meta["selected"], "whisperx")
 
     def test_auto_prefers_whisperx_on_non_apple(self):
         with patch("diarize_gui.processing_backends.is_apple_silicon", return_value=False), patch(
@@ -98,6 +157,40 @@ class ProcessingBackendTests(unittest.TestCase):
                 {"start": 2.5, "end": 4.0, "speaker": "SPEAKER_00"},
             ],
         )
+
+    def test_diarization_auto_prefers_fluidaudio_on_apple(self):
+        with patch("diarize_gui.processing_backends.is_apple_silicon", return_value=True), patch(
+            "diarize_gui.processing_backends.find_fluidaudio_binary", return_value="/tmp/fluidaudiocli"
+        ):
+            backend, meta = resolve_diarization_backend("auto")
+
+        self.assertEqual(backend.name, "fluidaudio")
+        self.assertEqual(meta["selected"], "fluidaudio")
+
+    def test_fluidaudio_output_is_normalized(self):
+        payload = {
+            "processingTimeSeconds": 1.2,
+            "realTimeFactor": 250.0,
+            "speakerCount": 2,
+            "segments": [
+                {"startTimeSeconds": 0.0, "endTimeSeconds": 1.5, "speakerId": "S1"},
+                {"startTimeSeconds": 1.5, "endTimeSeconds": 3.0, "speakerId": "S2"},
+            ],
+        }
+
+        def fake_run(command, **kwargs):
+            output_path = command[command.index("--output") + 1]
+            Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("diarize_gui.processing_backends.find_fluidaudio_binary", return_value="/tmp/fluid"), patch(
+            "diarize_gui.processing_backends.subprocess.run", side_effect=fake_run
+        ):
+            segments, meta = FluidAudioDiarizationBackend().diarize("lesson.wav", num_speakers=2)
+
+        self.assertEqual(segments[0], {"start": 0.0, "end": 1.5, "speaker": "S1"})
+        self.assertEqual(meta["device"], "apple_neural_engine")
+        self.assertEqual(meta["speaker_count"], 2)
 
     def test_pipeline_falls_back_when_diarization_backend_fails(self):
         class FakeAsrBackend:

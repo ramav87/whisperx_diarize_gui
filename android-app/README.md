@@ -7,12 +7,19 @@ Native Android client for the `diarize-server` API.
 - Connect to a LAN `diarize-server` URL.
 - Request microphone permission.
 - Record audio as M4A with Android `MediaRecorder`.
-- Upload the recording to `POST /api/jobs`.
+- Pick an existing audio file from Android's document picker.
+- Select server processing settings, including ASR backend, diarization backend,
+  model size, language, speaker count, and batch size.
+- Upload the recording to `POST /api/profiles/{profile_id}/jobs`.
 - Poll job progress with `GET /api/jobs/{job_id}`.
+- Recover persisted server job state after reconnecting.
 - Refresh and open lessons from `GET /api/lessons`.
-- Show transcript segments from `GET /api/lessons/{lesson_id}`.
+- Show transcript segments from `GET /api/lessons/{lesson_id}` and view
+  cleaned/raw/highlighted transcript exports.
 - Save speaker labels and student speaker selection.
-- Trigger lesson AI analysis.
+- Trigger durable lesson AI analysis jobs and poll progress.
+- View and edit server-backed context metrics.
+- Share cleaned/raw/highlighted transcripts, segment JSON, and analysis exports.
 
 ## Run
 

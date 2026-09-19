@@ -1,7 +1,9 @@
 whisperx
-torch<2.7
-torchaudio<2.7
-torchvision<0.22
+torch<2.9,>=2.8
+torchaudio<2.9,>=2.8
+torchvision<0.24,>=0.23
+numpy<2.1.0,>=2.0.2
+pandas<2.3.0,>=2.2.3
 sounddevice
 soundfile
 customtkinter
@@ -9,6 +11,7 @@ pillow
 pyannote.audio<4
 huggingface-hub<1.0,>=0.34.0
 pyperclip
+requests
 fastapi
 uvicorn[standard]
 python-multipart

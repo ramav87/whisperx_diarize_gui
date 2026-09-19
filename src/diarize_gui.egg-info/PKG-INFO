@@ -11,9 +11,11 @@ Description-Content-Type: text/markdown
 Requires-Dist: whisperx
 Requires-Dist: openai-whisper; platform_system == "Darwin" and platform_machine == "arm64"
 Requires-Dist: mlx-whisper; platform_system == "Darwin" and platform_machine == "arm64"
-Requires-Dist: torch<2.7
-Requires-Dist: torchaudio<2.7
-Requires-Dist: torchvision<0.22
+Requires-Dist: torch<2.9,>=2.8
+Requires-Dist: torchaudio<2.9,>=2.8
+Requires-Dist: torchvision<0.24,>=0.23
+Requires-Dist: numpy<2.1.0,>=2.0.2
+Requires-Dist: pandas<2.3.0,>=2.2.3
 Requires-Dist: sounddevice
 Requires-Dist: soundfile
 Requires-Dist: customtkinter
@@ -21,6 +23,7 @@ Requires-Dist: pillow
 Requires-Dist: pyannote.audio<4
 Requires-Dist: huggingface-hub<1.0,>=0.34.0
 Requires-Dist: pyperclip
+Requires-Dist: requests
 Requires-Dist: fastapi
 Requires-Dist: uvicorn[standard]
 Requires-Dist: python-multipart
@@ -69,10 +72,108 @@ export DIARIZE_SERVER_DATA_DIR=/srv/diarize-server
 Initial API endpoints:
 
 - `GET /api/health`
+- `GET /api/capabilities`
+- `GET /api/profiles`
+- `POST /api/profiles`
+- `GET /api/profiles/{profile_id}`
+- `PUT /api/profiles/{profile_id}`
+- `PATCH /api/profiles/{profile_id}`
+- `GET /api/profiles/{profile_id}/dashboard`
+- `GET /api/profiles/{profile_id}/lessons`
+- `POST /api/profiles/{profile_id}/jobs` with multipart field `audio`
 - `POST /api/jobs` with multipart field `audio`
+- `GET /api/jobs`
 - `GET /api/jobs/{job_id}`
 - `GET /api/lessons`
 - `GET /api/lessons/{lesson_id}`
+- `GET /api/lessons/{lesson_id}/artifacts`
+- `GET /api/lessons/{lesson_id}/artifacts/{artifact_name}`
+- `GET /api/lessons/{lesson_id}/exports/transcript?variant=cleaned|raw|highlighted&format=txt|json`
+- `GET /api/lessons/{lesson_id}/exports/analysis?format=txt|json`
+- `GET /api/lessons/{lesson_id}/context`
+- `PATCH /api/lessons/{lesson_id}/context`
+- `PATCH /api/lessons/{lesson_id}/speakers`
+- `POST /api/lessons/{lesson_id}/analysis-jobs`
+- `GET /api/analysis-jobs`
+- `GET /api/analysis-jobs/{job_id}`
+
+Processing and analysis jobs are persisted under the server data directory so
+clients can recover completed job status after reconnecting. Jobs that were
+queued or running during a server restart are marked failed with an interruption
+message rather than remaining stuck.
+
+Profiles are first-class server records under the server data directory. New
+clients should create jobs and read history through profile-scoped routes such
+as `POST /api/profiles/{profile_id}/jobs` and
+`GET /api/profiles/{profile_id}/lessons`. Lessons still store their `profile`
+id in metadata, and `GET /api/lessons?profile=...` remains available as a
+compatibility route. There is intentionally no authentication yet; future hosted
+deployments should treat profiles as user-owned resources behind auth rather
+than globally trusted names.
+
+The Mac GUI defaults to server-backed processing. It uploads audio to the local
+`diarize-server`, polls the API job, then mirrors the completed lesson artifacts
+back into the selected local profile so existing desktop dashboard/history/export
+features continue to work. The processing settings still expose `Use server API`
+as an escape hatch for direct local processing when needed.
+The profile picker and History view are server-first: profiles are listed and
+created through the API, and history reads `GET /api/profiles/{profile_id}/lessons`
+before falling back to older local profile folders.
+When the GUI starts, it also starts a localhost server automatically at
+`http://127.0.0.1:8000` unless one is already running. Set
+`DIARIZE_GUI_START_SERVER=0` to disable this, or set `DIARIZE_GUI_SERVER_PORT`
+to use another local port.
+
+## Mobile web frontend
+
+This repo includes an initial mobile-first web frontend in `frontend/`. It is a
+static app, so it does not need a JavaScript build step.
+
+Start the processing server:
+
+```bash
+diarize-server
+```
+
+In another terminal, serve the frontend:
+
+```bash
+python3 -m http.server 5173 --directory frontend
+```
+
+Open `http://127.0.0.1:5173/` on the server machine, or open
+`http://SERVER_IP:5173/` from a phone or tablet on the same network. The UI can
+connect to `http://SERVER_IP:8000`, record or upload audio, track processing
+jobs, browse lessons, review speaker labels, and trigger AI analysis.
+
+## Native Android app
+
+The `android-app/` directory contains an initial native Android client. It uses
+Android's microphone APIs to record M4A audio directly on the tablet, uploads the
+recording to the existing `diarize-server` API, polls processing progress, and
+can browse lessons, review speaker labels, and trigger AI analysis.
+
+To run it:
+
+1. Start the processing server on this machine:
+
+   ```bash
+   diarize-server
+   ```
+
+2. Open `android-app/` in Android Studio.
+3. Let Android Studio sync Gradle.
+4. Run the app on the tablet.
+5. In the app, set the server URL to the server machine's LAN address, for
+   example:
+
+   ```text
+   http://192.168.1.160:8000
+   ```
+
+The app intentionally permits cleartext HTTP for LAN development through
+`network_security_config.xml`. Replace that with HTTPS before exposing the
+server outside a trusted local network.
 
 ## Linux server install
 
@@ -207,3 +308,60 @@ Notes:
 - `faster-whisper` / `CTranslate2` remains the non-Mac default path and does not use MPS.
 - Word timestamps are preserved when the backend supports them; otherwise the app keeps segment timestamps and records that limitation in the lesson metadata.
 - Bundled pyannote diarization will prefer a `pyannote-3.1` directory if you provide one later; otherwise it falls back to the existing `pyannote` bundle.
+
+## Compare Whisper vs Gemma transcription
+
+Use the comparison script to run the app's existing ASR path against a chunked
+Gemma audio transcription path on the same lesson audio:
+
+```bash
+python -m diarize_gui.compare_transcription_pipelines /path/to/lesson.wav \
+  --existing-backend auto \
+  --whisper-model small \
+  --gemma-model google/gemma-3n-E4B-it \
+  --gemma-device mps \
+  --output-dir /tmp/lesson-transcription-comparison
+```
+
+The Gemma path splits the normalized lesson audio into 30 second WAV chunks,
+transcribes each chunk with an audio-capable local/Hugging Face Gemma checkpoint,
+then writes side-by-side transcripts, segment JSON, timing, realtime factors, and
+rough text agreement metrics to `transcription_comparison.json`.
+
+By default, the comparison runner starts each transcription backend in a separate
+Python process. This avoids native library collisions between MLX, Torch, and
+other model runtimes on macOS. Use `--in-process` only when debugging the script
+itself.
+
+The Gemma runner is optional and imports `transformers` only when that path runs.
+If you only want to time the existing app ASR path first, add `--skip-gemma`.
+If you only want a low-risk Gemma smoke test, skip Whisper and run one short
+chunk first:
+
+```bash
+python -m diarize_gui.compare_transcription_pipelines /path/to/lesson.wav \
+  --skip-existing \
+  --gemma-model google/gemma-3n-E2B-it \
+  --gemma-device cpu \
+  --gemma-chunk-seconds 10 \
+  --gemma-max-chunks 1 \
+  --gemma-max-new-tokens 96 \
+  --output-dir /tmp/lesson-gemma-smoke
+```
+
+To compare both ASR paths on the same short slice before processing a full
+lesson, use `--clip-start-seconds` and `--clip-max-seconds`:
+
+```bash
+python -m diarize_gui.compare_transcription_pipelines /path/to/lesson.wav \
+  --existing-backend auto \
+  --whisper-model small \
+  --gemma-model google/gemma-3n-E2B-it \
+  --gemma-local-files-only \
+  --gemma-device cpu \
+  --clip-start-seconds 0 \
+  --clip-max-seconds 30 \
+  --gemma-chunk-seconds 10 \
+  --gemma-max-new-tokens 96 \
+  --output-dir /tmp/lesson-whisper-vs-gemma-30s
+```

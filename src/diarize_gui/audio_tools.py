@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
 
 import soundfile as sf
 

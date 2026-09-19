@@ -183,7 +183,7 @@ async function submitJob() {
   form.append("profile", els.profileInput.value.trim() || "default");
   form.append("model_size", els.modelSelect.value);
   form.append("backend", "auto");
-  form.append("diarization_backend", els.diarizationSelect.value || "pyannote");
+  form.append("diarization_backend", els.diarizationSelect.value || "auto");
   if (els.languageSelect.value) {
     form.append("language", els.languageSelect.value);
   }
