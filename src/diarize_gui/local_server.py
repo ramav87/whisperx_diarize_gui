@@ -85,7 +85,16 @@ def start_local_server_if_enabled() -> Optional[LocalServerHandle]:
         logger.exception("could not import server runtime")
         return None
 
-    config = uvicorn.Config(app, host=host, port=port, log_level=os.environ.get("DIARIZE_LOG_LEVEL", "warning").lower())
+    # uvloop can wedge while accepting requests when it runs in a secondary
+    # thread alongside Tk on macOS. The stdlib loop is stable for the embedded
+    # server; standalone deployments may still choose uvloop themselves.
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        loop="asyncio",
+        log_level=os.environ.get("DIARIZE_LOG_LEVEL", "warning").lower(),
+    )
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, name="diarize-local-server", daemon=True)
     thread.start()

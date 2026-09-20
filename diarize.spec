@@ -96,11 +96,13 @@ coll = COLLECT(
 
 app = BUNDLE(
     coll,
-    name='DiarizeApp.app',
+    name='Language Learning Mobile Assistant.app',
     icon='resources/icons/diarize.icns',
     bundle_identifier='com.rama.diarizegui',
-    version='0.1.0',
+    version='0.2.0',
     info_plist={
+        'CFBundleDisplayName': 'Language Learning Mobile Assistant',
+        'CFBundleName': 'Language Learning Mobile Assistant',
         'NSMicrophoneUsageDescription': 'This app needs access to the microphone to record audio for transcription.',
         'NSHighResolutionCapable': True,
         'NSPrincipalClass': 'NSApplication',

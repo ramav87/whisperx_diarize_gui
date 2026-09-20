@@ -18,6 +18,7 @@ from PIL import Image
 import stat
 import math
 import time
+import queue
 from urllib.request import urlopen
 from urllib.parse import quote
 import requests
@@ -56,7 +57,12 @@ def find_ollama_binary() -> str | None:
     else:
         base_path = get_resource_base_path()
 
+    # The standalone binary does not include Ollama's MLX runtime libraries.
+    # Prefer the official macOS app bundle when installed so MLX-native models
+    # (for example gemma4:12b-mlx) can load their dylibs and Metal resources.
+    mac_app_binary = "/Applications/Ollama.app/Contents/Resources/ollama"
     candidates = [
+        mac_app_binary if sys.platform == "darwin" else None,
         os.path.join(base_path, "deps", "ollama"),
         os.path.join(base_path, "ollama"),
         shutil.which("ollama"),
@@ -217,7 +223,7 @@ class DiarizationApp:
         self.current_lesson_dir = None
         self._assign_window_open = False
 
-        master.title("Diarize — Lesson Intelligence")
+        master.title("Language Learning Mobile Assistant")
         self._configure_main_window()
       
         # --- LOGIC INIT ---
@@ -226,6 +232,7 @@ class DiarizationApp:
         self.is_recording = False
         self.has_result = False
         self.profile_name = None
+        self._ui_queue = queue.SimpleQueue()
         
         self.recorder = AudioRecorder(on_status=self._set_status)
         self.pipeline = DiarizationPipelineRunner(
@@ -259,6 +266,7 @@ class DiarizationApp:
 
         # Set "Studio" as the parent for all existing UI elements
         self._build_ui(parent=self.studio_scroll)
+        self.master.after(25, self._drain_ui_queue)
         
         # Initialize Dashboard (empty until profile loads)
         self.dashboard = None
@@ -305,7 +313,7 @@ class DiarizationApp:
         self.icon_user = load_icon("user.png")
         self.icon_mic = load_icon("mic.png")
         self.icon_folder = load_icon("folder.png")
-        self.logo_mark = load_icon("diarize_logo.png", size=(150, 150))
+        self.logo_mark = load_icon("diarize_logo.png", size=(118, 118))
 
     def _build_ui(self, parent):
         def add_section_header(container, title, subtitle=None):
@@ -932,11 +940,25 @@ class DiarizationApp:
         )
         self.brand_panel.pack(fill="both", expand=True, pady=(8, 0))
         if self.logo_mark:
+            brand_lockup = ctk.CTkFrame(self.brand_panel, fg_color="transparent")
+            brand_lockup.place(relx=0.5, rely=0.5, anchor="center")
+            brand_text = ctk.CTkFrame(brand_lockup, fg_color="transparent")
+            brand_text.pack(side="left", padx=(0, 12))
             ctk.CTkLabel(
-                self.brand_panel,
-                text="",
-                image=self.logo_mark,
-            ).place(relx=0.92, rely=0.92, anchor="se")
+                brand_text,
+                text="Language Learning",
+                font=("Roboto", 18, "bold"),
+                text_color=AppTheme.TEXT_PRIMARY,
+                anchor="e",
+            ).pack(anchor="e")
+            ctk.CTkLabel(
+                brand_text,
+                text="Mobile Assistant",
+                font=("Roboto", 18, "bold"),
+                text_color=AppTheme.BTN_PRIMARY,
+                anchor="e",
+            ).pack(anchor="e", pady=(1, 0))
+            ctk.CTkLabel(brand_lockup, text="", image=self.logo_mark).pack(side="left")
 
         self._install_studio_button_tooltips()
         self._update_analyze_ui_state()
@@ -1177,7 +1199,15 @@ class DiarizationApp:
                 pass
         except Exception as e:
             messagebox.showerror("Error", f"Could not save profile config: {e}")
-        self._save_server_profile_settings(cfg)
+        # Never block Tk's event loop on an embedded-server request. Capture a
+        # plain-data snapshot so the worker never touches Tk variables.
+        settings_snapshot = dict(cfg or {})
+        threading.Thread(
+            target=self._save_server_profile_settings,
+            args=(settings_snapshot,),
+            name="profile-settings-sync",
+            daemon=True,
+        ).start()
 
     def _server_profile_settings_from_config(self, cfg: dict) -> dict:
         server_owned_keys = {
@@ -1218,7 +1248,7 @@ class DiarizationApp:
                 "PATCH",
                 f"/api/profiles/{quote(self.profile_name, safe='')}",
                 {"display_name": self.profile_name, "settings": settings},
-                timeout=5,
+                timeout=15,
             )
         except Exception as e:
             print(f"[WARN] Could not sync profile settings to server: {e}")
@@ -1325,11 +1355,30 @@ class DiarizationApp:
             self.ollama_process.wait()
 
     def _set_status(self, text):
-        self.status_label.configure(text=f"Status: {text}")
+        self._post_ui(lambda value=str(text): self.status_label.configure(text=f"Status: {value}"))
 
     def _set_progress(self, value):
-        # CTk progress bar is 0.0 to 1.0
-        self.progress_bar.set(float(value) / 100.0)
+        self._post_ui(lambda amount=float(value): self.progress_bar.set(amount / 100.0))
+
+    def _post_ui(self, callback):
+        """Run a callback on Tk's owning thread without calling Tk from workers."""
+        if threading.current_thread() is threading.main_thread():
+            callback()
+        else:
+            self._ui_queue.put(callback)
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                self._ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        except Exception as exc:
+            print(f"[WARN] UI callback failed: {exc}")
+        try:
+            self.master.after(25, self._drain_ui_queue)
+        except Exception:
+            pass
 
     def _refresh_dashboard_from_current_lesson(self):
         """
@@ -1865,7 +1914,7 @@ class DiarizationApp:
         # Finish
         self._set_status("Batch Import Complete")
         self._set_progress(100)
-        self.master.after(0, lambda: self._on_batch_finished(successful_lessons))
+        self._post_ui(lambda: self._on_batch_finished(successful_lessons))
 
     def _on_batch_finished(self, lessons):
         self.batch_btn.configure(state="normal")
@@ -1964,8 +2013,8 @@ class DiarizationApp:
                 batch_size=int(self.batch_size_var.get()) if hasattr(self, "batch_size_var") and str(self.batch_size_var.get()).isdigit() else None,
             )
             self.has_result = True
-            self.master.after(0, self._enable_export_buttons)
-            self.master.after(0, lambda: messagebox.showinfo("Done", "Processing Complete!"))
+            self._post_ui(self._enable_export_buttons)
+            self._post_ui(lambda: messagebox.showinfo("Done", "Processing Complete!"))
             self._set_status("Complete")
 
             try:
@@ -1997,16 +2046,16 @@ class DiarizationApp:
                             "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
                         }
                     )
-                    self.master.after(0, self._enforce_speaker_assignment_after_save)
+                    self._post_ui(self._enforce_speaker_assignment_after_save)
             except Exception as e:
                 print(f"[WARN] Failed to save lesson artifacts: {e}")
 
         except Exception as e:
             self._set_status("Error")
             info = str(e)
-            self.master.after(0, lambda: messagebox.showerror("Error", info))
+            self._post_ui(lambda: messagebox.showerror("Error", info))
         finally:
-            self.master.after(0, lambda: self.run_btn.configure(state="normal", text="RUN PROCESSING"))
+            self._post_ui(lambda: self.run_btn.configure(state="normal", text="RUN PROCESSING"))
 
     def _server_base_url(self):
         value = self.server_url_var.get().strip() if hasattr(self, "server_url_var") else ""
@@ -2092,10 +2141,10 @@ class DiarizationApp:
         self.profile_config = cfg
         self.has_result = True
         self.output_dir = self.current_lesson_dir
-        self.master.after(0, lambda: self.output_label.configure(text=os.path.basename(self.current_lesson_dir)))
-        self.master.after(0, self._enable_export_buttons)
-        self.master.after(0, self._enforce_speaker_assignment_after_save)
-        self.master.after(0, lambda: messagebox.showinfo("Done", "Server processing complete."))
+        self._post_ui(lambda: self.output_label.configure(text=os.path.basename(self.current_lesson_dir)))
+        self._post_ui(self._enable_export_buttons)
+        self._post_ui(self._enforce_speaker_assignment_after_save)
+        self._post_ui(lambda: messagebox.showinfo("Done", "Server processing complete."))
         self._set_status("Complete")
 
     def _ensure_server_profile(self, server_url: str):
@@ -2175,7 +2224,7 @@ class DiarizationApp:
                                 "diarization_backend": self.diar_backend_var.get() if hasattr(self, "diar_backend_var") else "auto",
                             },
                         )
-                        self.master.after(0, self._enforce_speaker_assignment_after_save)
+                        self._post_ui(self._enforce_speaker_assignment_after_save)
                 except Exception as e:
                     print(f"[WARN] Failed to save lesson artifacts from TXT: {e}")
 
@@ -2358,7 +2407,7 @@ class DiarizationApp:
 
         except Exception as e:
             msg = str(e)
-            self.master.after(0, lambda err=msg: messagebox.showerror("Error", err))
+            self._post_ui(lambda err=msg: messagebox.showerror("Error", err))
 
     def _load_lesson_into_app(self, lesson_dir: str):
         try:
@@ -2396,7 +2445,7 @@ class DiarizationApp:
                 )
         except Exception as e:
             msg = str(e)
-            self.master.after(0, lambda err=msg: messagebox.showerror("Load Failed", err))
+            self._post_ui(lambda err=msg: messagebox.showerror("Load Failed", err))
 
 
     def _open_lesson_detail(self, lesson_dir: str):
@@ -3099,13 +3148,13 @@ class DiarizationApp:
                         f"stdout:\n{result.stdout or ''}\n"
                         f"stderr:\n{result.stderr or ''}"
                     )
-                self.master.after(0, lambda: messagebox.showinfo("Success", "Model Installed!"))
+                self._post_ui(lambda: messagebox.showinfo("Success", "Model Installed!"))
             except Exception as e:
                 msg = str(e)
                 print(f"Download Error: {msg}")
-                self.master.after(0, lambda: messagebox.showerror("Error", f"Download failed: {msg}"))
+                self._post_ui(lambda: messagebox.showerror("Error", f"Download failed: {msg}"))
             finally:
-                self.master.after(0, dl_win.destroy)
+                self._post_ui(dl_win.destroy)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3147,7 +3196,7 @@ class DiarizationApp:
                 finally:
                     self._assign_window_open = False
 
-            self.master.after(0, _open)
+            self._post_ui(_open)
 
     def _run_analysis_thread(self, prompt, speakers, provider, model, openai_api_key=None):
         self._set_status("Analyzing...")
@@ -3161,6 +3210,9 @@ class DiarizationApp:
                 speakers=speakers,
             )
 
+            if not isinstance(res, str) or res.startswith("Error:"):
+                raise RuntimeError(res or "The local AI model returned an empty response.")
+
             analysis_text, ai_stats = self._split_analysis_response(res)
 
             # Ensure we have a lesson folder to attach analysis to
@@ -3171,9 +3223,9 @@ class DiarizationApp:
                     self.pipeline.save_lesson_artifacts(
                         self.current_lesson_dir,
                         profile_name=self.profile_name,
-                        whisper_model_size=self.model_var.get() if hasattr(self, "model_var") else None,
-                        language=self.lang_var.get() if hasattr(self, "lang_var") else None,
-                        contextual=self.context_var.get() if hasattr(self, "context_var") else None,
+                        whisper_model_size=self.profile_config.get("whisper_model_size"),
+                        language=self.profile_config.get("language"),
+                        contextual=self.profile_config.get("contextual"),
                     )
 
             # Write analysis.txt + patch meta.json
@@ -3200,14 +3252,14 @@ class DiarizationApp:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
 
             # Show result
-            self.master.after(0, lambda text=analysis_text: self._show_analysis_window(text))
-            self.master.after(0, self._refresh_dashboard_from_current_lesson)
+            self._post_ui(lambda text=analysis_text: self._show_analysis_window(text))
+            self._post_ui(self._refresh_dashboard_from_current_lesson)
             self._set_status("Analysis Done")
             self._set_progress(100)
 
         except Exception as e:
             msg = str(e)
-            self.master.after(0, lambda err=msg: messagebox.showerror("Analysis Failed", err))
+            self._post_ui(lambda err=msg: messagebox.showerror("Analysis Failed", err))
             self._set_status("Error")
 
 
@@ -3414,7 +3466,7 @@ class DiarizationApp:
             canonical_entry.pack(side="left", padx=(0, 6), fill="x", expand=True)
 
         # Initialize preview
-        self.master.after(0, update_preview)
+        self._post_ui(update_preview)
 
         # --- Bottom row: buttons ---
         bottom = ctk.CTkFrame(win)
@@ -3584,12 +3636,12 @@ class DiarizationApp:
             # Patch meta.json
             win.grab_release()
             win.destroy()
-            self.master.after(0, self._update_analyze_ui_state)
+            self._post_ui(self._update_analyze_ui_state)
 
         def do_cancel():
             # If you truly want to *insist*, you can remove Cancel entirely.
             # For now: allow cancel but keep gating active (buttons disabled until assigned).
-            self.master.after(0, self._update_analyze_ui_state)
+            self._post_ui(self._update_analyze_ui_state)
             win.grab_release()
             win.destroy()
 

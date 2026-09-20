@@ -2,7 +2,8 @@ import os
 import json
 import re
 import threading
-from datetime import datetime, timedelta
+import queue
+from datetime import date, datetime, timedelta
 from collections import Counter, defaultdict
 from urllib.parse import quote
 import customtkinter as ctk
@@ -11,6 +12,7 @@ import matplotlib
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.dates as mdates
 import requests
+from tkinter import messagebox
 from .theme import AppTheme
 from .pipeline import DEFAULT_OLLAMA_ANALYSIS_MODEL
 from .lesson_selection import select_all_incomplete_ai_lesson_dirs, select_pending_ai_lesson_dirs
@@ -74,6 +76,10 @@ class DashboardFrame(ctk.CTkFrame):
         self.pipeline = pipeline 
         self.server_url = server_url.rstrip("/") if isinstance(server_url, str) and server_url.strip() else None
         self.current_lesson_dir = None
+        self._ui_queue = queue.SimpleQueue()
+        self.goal_hours = 50.0
+        self.goal_deadline = "2027-12-31"
+        self._load_goal_settings()
         
         # Colors
         self.color_primary = AppTheme.BTN_PRIMARY
@@ -165,7 +171,7 @@ class DashboardFrame(ctk.CTkFrame):
             border_width=1,
             border_color=self.card_border,
         )
-        self.golden_panel.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 6))
+        self.golden_panel.grid(row=2, column=1, sticky="nsew", padx=(6, 12), pady=(0, 6))
         self.golden_panel.grid_columnconfigure(1, weight=1)
 
         self.golden_header = ctk.CTkLabel(
@@ -208,6 +214,59 @@ class DashboardFrame(ctk.CTkFrame):
             )
             lbl.grid(row=0, column=idx, sticky="ew", padx=4)
             self.golden_word_labels.append(lbl)
+
+        self.goal_panel = ctk.CTkFrame(
+            self,
+            fg_color=self.card_bg,
+            corner_radius=14,
+            border_width=1,
+            border_color=self.card_border,
+        )
+        self.goal_panel.grid(row=2, column=0, sticky="nsew", padx=(12, 6), pady=(0, 6))
+        self.goal_panel.grid_columnconfigure(0, weight=1)
+        goal_header = ctk.CTkFrame(self.goal_panel, fg_color="transparent")
+        goal_header.grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 0))
+        goal_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            goal_header,
+            text="Speaking Goal",
+            font=("Roboto", 12, "bold"),
+            text_color=self.color_student,
+        ).grid(row=0, column=0, sticky="w")
+        self.goal_edit_btn = ctk.CTkButton(
+            goal_header,
+            text="Edit",
+            width=58,
+            height=26,
+            fg_color="transparent",
+            border_width=1,
+            border_color=self.card_border,
+            command=self._open_goal_editor,
+        )
+        self.goal_edit_btn.grid(row=0, column=1, sticky="e")
+        self.goal_value_label = ctk.CTkLabel(
+            self.goal_panel,
+            text="0.0 / 50 hours",
+            font=("Roboto", 17, "bold"),
+            text_color=self.text_color,
+            anchor="w",
+        )
+        self.goal_value_label.grid(row=1, column=0, sticky="ew", padx=14, pady=(1, 1))
+        self.goal_progress = ctk.CTkProgressBar(
+            self.goal_panel,
+            height=8,
+            progress_color=self.color_student,
+        )
+        self.goal_progress.grid(row=2, column=0, sticky="ew", padx=14)
+        self.goal_progress.set(0)
+        self.goal_detail_label = ctk.CTkLabel(
+            self.goal_panel,
+            text="Set a target to calculate your weekly pace.",
+            font=("Roboto", 10),
+            text_color=self.card_subtext,
+            anchor="w",
+        )
+        self.goal_detail_label.grid(row=3, column=0, sticky="ew", padx=14, pady=(3, 8))
 
         # 3. Charts Area (Now Tabbed!)
         self.chart_tabs = ctk.CTkTabview(self)
@@ -255,6 +314,7 @@ class DashboardFrame(ctk.CTkFrame):
         self.status_lbl.pack(side="left", padx=10, fill="x", expand=True)
 
         self._install_tooltips()
+        self.after(25, self._drain_ui_queue)
 
         # Initial Load
         self.refresh_data()
@@ -274,6 +334,133 @@ class DashboardFrame(ctk.CTkFrame):
     def set_server_url(self, server_url):
         self.server_url = server_url.rstrip("/") if isinstance(server_url, str) and server_url.strip() else None
         self.profile_pill.configure(text="SERVER PROFILE" if self.server_url else "LOCAL PROFILE")
+
+    def _load_goal_settings(self):
+        """Load speaking-goal preferences, preferring the active server profile."""
+        settings = {}
+        config_path = os.path.join(self.profile_dir, "config.json") if self.profile_dir else None
+        if config_path and os.path.isfile(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as handle:
+                    local_config = json.load(handle) or {}
+                if isinstance(local_config, dict):
+                    settings.update(local_config)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if self.server_url:
+            try:
+                profile = quote(self.profile_name, safe="")
+                response = requests.get(f"{self.server_url}/api/profiles/{profile}", timeout=5)
+                response.raise_for_status()
+                body = response.json()
+                remote = body.get("settings") if isinstance(body, dict) else None
+                if isinstance(remote, dict):
+                    settings.update(remote)
+            except (requests.RequestException, TypeError, ValueError):
+                pass
+        try:
+            hours = float(settings.get("speaking_goal_hours", self.goal_hours))
+            if hours > 0:
+                self.goal_hours = hours
+        except (TypeError, ValueError):
+            pass
+        deadline = str(settings.get("speaking_goal_deadline", self.goal_deadline))
+        try:
+            datetime.strptime(deadline, "%Y-%m-%d")
+            self.goal_deadline = deadline
+        except ValueError:
+            pass
+
+    def _save_goal_settings(self):
+        """Persist the speaking goal locally and to the active server profile."""
+        values = {
+            "speaking_goal_hours": self.goal_hours,
+            "speaking_goal_deadline": self.goal_deadline,
+        }
+        if self.profile_dir:
+            os.makedirs(self.profile_dir, exist_ok=True)
+            config_path = os.path.join(self.profile_dir, "config.json")
+            config = {}
+            if os.path.isfile(config_path):
+                try:
+                    with open(config_path, "r", encoding="utf-8") as handle:
+                        config = json.load(handle) or {}
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    config = {}
+            if not isinstance(config, dict):
+                config = {}
+            config.update(values)
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(config, handle, indent=2)
+        if self.server_url:
+            profile = quote(self.profile_name, safe="")
+            response = requests.patch(
+                f"{self.server_url}/api/profiles/{profile}",
+                json={"settings": values},
+                timeout=10,
+            )
+            response.raise_for_status()
+
+    def _open_goal_editor(self):
+        """Open a compact editor for target hours and completion date."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Edit speaking goal")
+        dialog.geometry("390x245")
+        dialog.resizable(False, False)
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text="Speaking Goal", font=("Roboto", 20, "bold")).pack(pady=(18, 10))
+        body = ctk.CTkFrame(dialog, fg_color="transparent")
+        body.pack(fill="x", padx=24)
+        ctk.CTkLabel(body, text="Target learner speaking hours").grid(row=0, column=0, sticky="w", pady=5)
+        hours_entry = ctk.CTkEntry(body, width=120)
+        hours_entry.insert(0, f"{self.goal_hours:g}")
+        hours_entry.grid(row=0, column=1, sticky="e", pady=5)
+        ctk.CTkLabel(body, text="Deadline (YYYY-MM-DD)").grid(row=1, column=0, sticky="w", pady=5)
+        deadline_entry = ctk.CTkEntry(body, width=120)
+        deadline_entry.insert(0, self.goal_deadline)
+        deadline_entry.grid(row=1, column=1, sticky="e", pady=5)
+        body.grid_columnconfigure(0, weight=1)
+
+        def save():
+            try:
+                hours = float(hours_entry.get())
+                if hours <= 0:
+                    raise ValueError("Target hours must be greater than zero.")
+                deadline = deadline_entry.get().strip()
+                datetime.strptime(deadline, "%Y-%m-%d")
+                self.goal_hours = hours
+                self.goal_deadline = deadline
+                self._save_goal_settings()
+                self.refresh_data()
+                dialog.destroy()
+            except ValueError as exc:
+                messagebox.showerror("Invalid speaking goal", str(exc), parent=dialog)
+            except (OSError, requests.RequestException) as exc:
+                messagebox.showerror("Could not save goal", str(exc), parent=dialog)
+
+        ctk.CTkButton(dialog, text="Save Goal", command=save).pack(pady=18)
+
+    def _render_goal_progress(self, summary):
+        spoken_hours = max(0.0, self._number_or_zero(summary.get("student_speaking_sec")) / 3600.0)
+        target = max(0.01, self.goal_hours)
+        remaining = max(0.0, target - spoken_hours)
+        completion = min(1.0, spoken_hours / target)
+        self.goal_progress.set(completion)
+        self.goal_value_label.configure(text=f"{spoken_hours:.1f} / {target:g} hours ({completion:.0%})")
+        deadline = datetime.strptime(self.goal_deadline, "%Y-%m-%d").date()
+        days_left = max(0, (deadline - date.today()).days)
+        if remaining <= 0:
+            detail = f"Goal reached · target date {deadline.strftime('%b %Y')}"
+        elif days_left == 0:
+            detail = f"{remaining:.1f} hours remaining · deadline reached"
+        else:
+            minutes_per_week = remaining * 60.0 / (days_left / 7.0)
+            detail = (
+                f"{remaining:.1f} hours remaining · {minutes_per_week:.0f} min/week "
+                f"to {deadline.strftime('%b %Y')}"
+            )
+        self.goal_detail_label.configure(text=detail)
 
     def _create_kpi_card(self, parent, title, value, color=None):
         frame = ctk.CTkFrame(
@@ -350,6 +537,14 @@ class DashboardFrame(ctk.CTkFrame):
             self.golden_panel,
             "Recent target vocabulary from completed AI analyses, deduplicated from newest lessons backward.",
         )
+        self._add_tooltip(
+            self.goal_panel,
+            "Progress uses only time attributed to your learner speaker, not the full lesson duration.",
+        )
+        DashboardToolTip(
+            self.goal_edit_btn,
+            "Change your target speaking hours and deadline.",
+        )
         DashboardToolTip(
             self.refresh_btn,
             "Reload lesson files and redraw every dashboard metric and chart.",
@@ -385,6 +580,10 @@ class DashboardFrame(ctk.CTkFrame):
         self.ai_backfill_btn.configure(state="disabled", text="Backfilling...")
         
         def _thread_target():
+            if self.server_url:
+                self._run_server_ai_analysis(provider, model, api_key, scope)
+                return
+
             lessons_dir = os.path.join(self.profile_dir, "lessons")
             if not os.path.isdir(lessons_dir): return
 
@@ -392,14 +591,14 @@ class DashboardFrame(ctk.CTkFrame):
             
             total = len(to_process)
             if total == 0:
-                self.after(0, lambda: self._on_ai_finished(0, 0, scope))
+                self._post_ui(lambda: self._on_ai_finished(0, 0, scope))
                 return
 
             # Process loop
             processed = 0
             for i, path in enumerate(to_process):
                 msg = f"Analyzing {i+1}/{total}: {os.path.basename(path)}"
-                self.after(0, lambda m=msg: self.status_lbl.configure(text=m))
+                self._post_ui(lambda m=msg: self.status_lbl.configure(text=m))
                 
                 success = self.pipeline.compute_ai_metrics(path, model=model, mode=provider, api_key=api_key)
                 if success:
@@ -407,9 +606,108 @@ class DashboardFrame(ctk.CTkFrame):
                 else:
                     print(f"Skipping lesson {path} due to AI error.")
             
-            self.after(0, lambda: self._on_ai_finished(processed, total, scope))
+            self._post_ui(lambda: self._on_ai_finished(processed, total, scope))
 
         threading.Thread(target=_thread_target, daemon=True).start()
+
+    def _run_server_ai_analysis(self, provider, model, api_key, scope):
+        """Backfill the authoritative server lessons used by the dashboard."""
+        try:
+            profile = quote(self.profile_name, safe="")
+            response = requests.get(
+                f"{self.server_url}/api/profiles/{profile}/dashboard",
+                timeout=60,
+            )
+            response.raise_for_status()
+            lessons = response.json().get("lessons") or []
+            candidates = []
+            for lesson in lessons:
+                if not isinstance(lesson, dict) or not lesson.get("id"):
+                    continue
+                if lesson.get("analysis_complete"):
+                    if scope == "recent":
+                        break
+                    continue
+                candidates.append(lesson)
+
+            total = len(candidates)
+            if total == 0:
+                self._post_ui(lambda: self._on_ai_finished(0, 0, scope))
+                return
+
+            processed = 0
+            for index, lesson in enumerate(candidates, start=1):
+                lesson_id = str(lesson["id"])
+                message = f"Analyzing server lesson {index}/{total}: {lesson_id}"
+                self._post_ui(lambda text=message: self.status_lbl.configure(text=text))
+                payload = {"provider": provider, "model": model}
+                if api_key:
+                    payload["api_key"] = api_key
+                result = requests.post(
+                    f"{self.server_url}/api/lessons/{quote(lesson_id, safe='')}/analyze",
+                    json=payload,
+                    timeout=900,
+                )
+                if result.ok:
+                    processed += 1
+                    body = result.json()
+                    self._mirror_server_ai_stats(lesson_id, body.get("ai_stats"))
+                else:
+                    try:
+                        detail = result.json().get("detail")
+                    except (TypeError, ValueError):
+                        detail = result.text.strip()
+                    print(f"Skipping server lesson {lesson_id}: {detail or result.status_code}")
+
+            self._post_ui(lambda: self._on_ai_finished(processed, total, scope))
+        except Exception as exc:
+            message = f"Server AI backfill failed: {exc}"
+            print(message)
+            self._post_ui(lambda text=message: self._on_ai_failed(text))
+
+    def _post_ui(self, callback):
+        self._ui_queue.put(callback)
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                self._ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        except Exception as exc:
+            print(f"[WARN] Dashboard UI callback failed: {exc}")
+        try:
+            self.after(25, self._drain_ui_queue)
+        except Exception:
+            pass
+
+    def _mirror_server_ai_stats(self, lesson_id, ai_stats):
+        """Keep existing desktop lesson mirrors consistent with server analysis."""
+        if not isinstance(ai_stats, dict):
+            return
+        lessons_dir = os.path.join(self.profile_dir, "lessons")
+        if not os.path.isdir(lessons_dir):
+            return
+        for local_id in os.listdir(lessons_dir):
+            lesson_dir = os.path.join(lessons_dir, local_id)
+            if not os.path.isdir(lesson_dir):
+                continue
+            meta = {}
+            meta_path = os.path.join(lesson_dir, "meta.json")
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as handle:
+                        meta = json.load(handle) or {}
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    meta = {}
+            if local_id == lesson_id or meta.get("server_lesson_id") == lesson_id:
+                with open(os.path.join(lesson_dir, "ai_stats.json"), "w", encoding="utf-8") as handle:
+                    json.dump(ai_stats, handle, ensure_ascii=False, indent=2)
+
+    def _on_ai_failed(self, message):
+        self.ai_btn.configure(state="normal", text="✨ Compute Recent AI Metrics")
+        self.ai_backfill_btn.configure(state="normal", text="Backfill All AI Metrics")
+        self.status_lbl.configure(text=message)
 
     def _on_ai_finished(self, count, total, scope="recent"):
         self.ai_btn.configure(state="normal", text="✨ Compute Recent AI Metrics")
@@ -652,6 +950,7 @@ class DashboardFrame(ctk.CTkFrame):
         summary = {
             "lesson_count": len(os.listdir(lessons_dir)) if os.path.isdir(lessons_dir) else 0,
             "total_hours": total_recording_sec / 3600.0,
+            "student_speaking_sec": student_speaking_sec,
             "student_speaking_pct": (student_speaking_sec / total_recording_sec * 100) if total_recording_sec else 0,
             "global_wpm": (student_total_words / (student_speaking_sec / 60)) if student_speaking_sec > 30 else 0,
             "student_total_words": student_total_words,
@@ -748,6 +1047,8 @@ class DashboardFrame(ctk.CTkFrame):
         student_total_words = int(self._number_or_zero(summary.get("student_total_words")))
         avg_latency = self._number_or_none(summary.get("avg_latency_sec"))
         max_turn_duration = self._number_or_zero(summary.get("max_turn_duration_sec"))
+
+        self._render_goal_progress(summary)
 
         self.card_total_time.value_label.configure(text=f"{total_hours:.1f}")
         self.card_student_pct.value_label.configure(text=f"{pct:.1f}%")

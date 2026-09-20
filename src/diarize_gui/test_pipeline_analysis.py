@@ -32,6 +32,21 @@ class CapturingAnalysisRunner(DiarizationPipelineRunner):
 
 
 class PipelineAnalysisTests(unittest.TestCase):
+    def test_load_lesson_falls_back_to_mirrored_audio(self):
+        with tempfile.TemporaryDirectory() as root:
+            lesson_dir = Path(root)
+            (lesson_dir / "segments.json").write_text("[]", encoding="utf-8")
+            (lesson_dir / "audio.wav").write_bytes(b"RIFF-test")
+            (lesson_dir / "meta.json").write_text(
+                json.dumps({"source_audio_path": "/server/path/that/does/not/exist.wav"}),
+                encoding="utf-8",
+            )
+
+            runner = DiarizationPipelineRunner()
+            runner.load_lesson_artifacts(str(lesson_dir))
+
+            self.assertEqual(runner.last_audio_path, str(lesson_dir / "audio.wav"))
+
     def test_compute_ai_metrics_marks_student_scope_in_prompt_and_output(self):
         with tempfile.TemporaryDirectory() as root:
             lesson_dir = Path(root)

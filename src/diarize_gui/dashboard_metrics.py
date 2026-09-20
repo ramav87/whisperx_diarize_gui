@@ -8,6 +8,7 @@ from typing import Any
 
 from .metrics.context_adjusted import build_context_metrics, compute_automaticity_gap
 from .metrics.language_growth import compute_language_growth_metrics
+from .lesson_selection import ai_stats_complete
 
 
 def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[str, Any]:
@@ -189,6 +190,7 @@ def build_profile_dashboard(profile_id: str | None, lessons_dir: Path) -> dict[s
                 "context_metrics": context_metrics,
                 "language_metrics": language_metrics,
                 "analyzed": bool(ai_data),
+                "analysis_complete": ai_stats_complete(str(lesson_dir / "ai_stats.json")),
             }
         )
 

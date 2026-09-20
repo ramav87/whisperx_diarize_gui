@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diarize-gui"
-version = "0.1.0"
-description = "Simple Tkinter GUI for WhisperX transcription + diarization with recording on macOS (and others)."
+version = "0.2.0"
+description = "Desktop language-learning assistant for transcription, diarization, longitudinal metrics, and local AI feedback."
 authors = [
   { name = "Rama Vasudevan" },
 ]
@@ -36,8 +36,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://example.com/diarize-gui"
-Repository = "https://example.com/diarize-gui.git"
+Homepage = "https://github.com/ramav87/whisperx_diarize_gui"
+Repository = "https://github.com/ramav87/whisperx_diarize_gui.git"
 
 [project.scripts]
 diarize-gui = "diarize_gui.gui:main"

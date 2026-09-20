@@ -30,7 +30,10 @@ DEFAULT_MAX_CHARS = 120000
 DEFAULT_OLLAMA_ANALYSIS_MODEL = "gemma4:e4b"
 DEFAULT_OLLAMA_AI_METRICS_MAX_CHARS = 120000
 DEFAULT_OPENAI_AI_METRICS_MAX_CHARS = 120000
-DEFAULT_OLLAMA_CONTEXT_TOKENS = 49152
+# A 49K KV cache can terminate Ollama's model runner on a 24 GB Apple Silicon
+# machine before generation begins. 16K accommodates typical full lessons while
+# leaving headroom for the model weights, desktop app, and structured response.
+DEFAULT_OLLAMA_CONTEXT_TOKENS = 16384
 AI_METRICS_SCHEMA_VERSION = 2
 AI_METRICS_SCHEMA = {
     "type": "object",
@@ -1093,32 +1096,52 @@ class DiarizationPipelineRunner:
             target_url = api_url or "http://127.0.0.1:11435/api/generate"
             target_model = model or DEFAULT_OLLAMA_ANALYSIS_MODEL
 
-            payload = {
-                "model": target_model,
-                "prompt": combined_prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0,
-                    "seed": 42,
-                    "num_ctx": int(context_tokens or DEFAULT_OLLAMA_CONTEXT_TOKENS),
-                },
-            }
-            if response_format:
-                payload["format"] = response_format
-
             self._set_status(f"Calling Ollama ({target_model})...")
-            
+
             import requests
             try:
-                resp = requests.post(target_url, json=payload, timeout=600)
-                
-                # Custom Error Handling for 404 (Model Not Found)
-                if resp.status_code == 404:
-                    print(f"ERROR: Ollama returned 404. It likely cannot find model '{target_model}' or the URL '{target_url}' is wrong.")
-                    return f"Error: Model not found. Please run 'ollama pull {target_model}' in terminal."
-                    
-                resp.raise_for_status()
-                data = resp.json()
+                requested_context = int(context_tokens or DEFAULT_OLLAMA_CONTEXT_TOKENS)
+                retry_contexts = list(dict.fromkeys((requested_context, 8192, 4096)))
+                last_error = None
+                data = None
+                for attempt, current_context in enumerate(retry_contexts):
+                    payload = {
+                        "model": target_model,
+                        "prompt": combined_prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0,
+                            "seed": 42,
+                            "num_ctx": current_context,
+                        },
+                    }
+                    if response_format:
+                        payload["format"] = response_format
+                    resp = requests.post(target_url, json=payload, timeout=600)
+
+                    if resp.status_code == 404:
+                        return f"Error: Model '{target_model}' was not found in the app's Ollama model store."
+                    if resp.ok:
+                        data = resp.json()
+                        break
+
+                    try:
+                        detail = resp.json().get("error")
+                    except (TypeError, ValueError):
+                        detail = resp.text.strip()
+                    last_error = detail or f"HTTP {resp.status_code}"
+                    resource_failure = resp.status_code >= 500 and any(
+                        phrase in last_error.lower()
+                        for phrase in ("runner has unexpectedly stopped", "resource limitation", "out of memory")
+                    )
+                    if not resource_failure or attempt == len(retry_contexts) - 1:
+                        return f"Error: Ollama failed ({resp.status_code}): {last_error}"
+                    self._set_status(
+                        f"Ollama ran out of memory at {current_context:,} tokens; retrying with less context..."
+                    )
+
+                if data is None:
+                    return f"Error: Ollama failed: {last_error or 'unknown response'}"
 
                 text = data.get("response")
                 if not text:
@@ -1130,7 +1153,7 @@ class DiarizationPipelineRunner:
             except requests.exceptions.ConnectionError:
                 return "Error: Could not connect to Ollama. Is the app running? (Run 'ollama serve' in terminal)"
             except Exception as e:
-                return f"Error calling Ollama: {e}"
+                return f"Error: Ollama request failed: {e}"
             
         return "Error: Unknown provider"
 
@@ -1186,16 +1209,20 @@ class DiarizationPipelineRunner:
 
         # Option (2): use original audio path from meta, but only if it still exists
         # Support multiple historical key names to be robust:
-        audio_path = (
-            meta.get("source_audio_path")
-            or meta.get("source_audio")
-            or meta.get("last_audio_path")
-            or meta.get("audio_path")
+        # Prefer the explicit reassociation, but do not let a stale server-side
+        # or moved source path hide the durable audio mirrored into the lesson.
+        audio_candidates = (
+            meta.get("source_audio_path"),
+            meta.get("source_audio"),
+            meta.get("last_audio_path"),
+            meta.get("audio_path"),
+            os.path.join(lesson_dir, str(meta.get("saved_audio_filename") or "audio.wav")),
+            os.path.join(lesson_dir, "audio.wav"),
         )
-        if audio_path and os.path.isfile(audio_path):
-            self.last_audio_path = audio_path
-        else:
-            self.last_audio_path = None
+        self.last_audio_path = next(
+            (str(path) for path in audio_candidates if path and os.path.isfile(path)),
+            None,
+        )
 
         normalized_audio_path = (
             meta.get("normalized_audio_path")

@@ -1,8 +1,10 @@
-# Diarize — Lesson Intelligence
+# Language Learning Mobile Assistant (LLM)
 
-Diarize records or imports language lessons, transcribes them, separates speakers,
-and builds a longitudinal learning dashboard. Local AI analysis runs through
-Ollama; an OpenAI provider is optional.
+Language Learning Mobile Assistant records
+or imports language lessons, transcribes them, separates speakers, and builds a
+longitudinal learning dashboard. The desktop dashboard also tracks learner-only
+speaking time against a configurable hours-and-deadline goal. Local AI analysis
+runs through Ollama; an OpenAI provider is optional.
 
 ## Supported installations
 
@@ -19,13 +21,13 @@ Python 3.10 or 3.11 is recommended. The package requires Python 3.10 or newer.
 
 For a pre-built release:
 
-1. Open `DiarizeApp-macOS.dmg`.
-2. Drag `DiarizeApp.app` to Applications.
-3. Open Diarize and grant microphone access if you intend to record live audio.
+1. Open `Language-Learning-Mobile-Assistant-macOS.dmg`.
+2. Drag `Language Learning Mobile Assistant.app` to Applications.
+3. Open Language Learning Mobile Assistant and grant microphone access if you intend to record live audio.
 4. If macOS blocks an ad-hoc or locally built copy, Control-click the app, choose
    **Open**, and confirm. Public releases should be Developer ID signed and notarized.
 
-The app bundle includes Ollama, FFmpeg, the offline pyannote bundle, UI assets,
+The app bundle includes Ollama and its Apple MLX runtime, FFmpeg, the offline pyannote bundle, UI assets,
 and FluidAudio when it was present at build time. AI model weights are deliberately
 not embedded because they are several gigabytes. By default the app stores them
 on `/Volumes/XTRM-P/AI-models/DiarizeApp/models` when that drive is mounted, and
@@ -61,8 +63,10 @@ export HUGGINGFACE_TOKEN="your_hf_token_here"
 
 The build is platform-specific: create the macOS package on macOS using the same
 CPU architecture you intend to distribute. Before building, provide the ignored
-runtime resources `resources/ollama`, `resources/pyannote/`, and optionally
-`resources/fluidaudiocli`. A native FFmpeg must exist either at
+runtime resources `resources/pyannote/` and, optionally,
+`resources/fluidaudiocli`. Install the current Ollama macOS app; the build copies
+its executable and MLX runtime so supported local models work in the packaged app.
+A native FFmpeg must exist either at
 `resources/ffmpeg/ffmpeg` or on `PATH`.
 
 ```bash
@@ -74,8 +78,8 @@ bash build_app.sh
 The script validates its resources, builds with `diarize.spec`, applies an ad-hoc
 signature for local testing, and creates:
 
-- `dist/DiarizeApp.app`
-- `dist/DiarizeApp-macOS.dmg`
+- `dist/Language Learning Mobile Assistant.app`
+- `dist/Language-Learning-Mobile-Assistant-macOS.dmg`
 
 For external distribution, replace the ad-hoc signature with a Developer ID
 Application signature and notarize the app and disk image.
